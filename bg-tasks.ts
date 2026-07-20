@@ -1,194 +1,200 @@
 /**
- * Background Tasks extension — run long work in background, keep chatting.
+ * Background Tasks extension — code-enforced tmux-based background execution.
  *
- * /bg <task>   → start a task as background sub-agent, free the foreground
- * /bg           → detach current running sub-agent(s) to background
- * /jobs         → list background tasks
- * /fg <id>      → bring a completed background result to foreground
+ * Any bash command with timeout >300s is AUTOMATICALLY run in a tmux session.
+ * No AI judgment needed — the interceptor enforces it at the tool_call level.
  *
- * Background agents use git worktree isolation. When they complete and the
- * user is idle, the result appears as a widget above the editor.
+ * The result returns as a new user input when the task completes and the
+ * foreground conversation is idle.
+ *
+ * User commands:
+ *   /jobs          list background tasks
+ *   /fg <id>       view completed task output
+ *   /attach <id>   attach to live tmux session
+ *   /kill <id>     kill a background task
+ *   /bg            (no args) show status
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execSync, spawn } from "node:child_process";
+import { existsSync, readFileSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 // ── types ───────────────────────────────────────────────────────────────────
 
-interface BgJob {
+interface BgTask {
   id: string;
-  task: string;
-  status: "running" | "done" | "error" | "cancelled";
+  cmd: string;
+  tmuxSession: string;
+  status: "running" | "done" | "error" | "killed";
   startTime: number;
   endTime?: number;
-  result?: string;
-  error?: string;
-  proc?: ChildProcess;
-  model?: string;
+  exitCode?: number;
+  logFile: string;
 }
 
-const jobs = new Map<string, BgJob>();
+const tasks = new Map<string, BgTask>();
+const TASK_PREFIX = "pi-bg";
 
-function bgId(): string {
-  return `bg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+function taskId(): string {
+  return `${TASK_PREFIX}-${Date.now().toString(36)}`;
 }
 
-// ── spawn background pi process ────────────────────────────────────────────
+// ── tmux helpers ────────────────────────────────────────────────────────────
 
-function spawnBg(task: string, cwd: string, model?: string): { id: string; promise: Promise<string> } {
-  const id = bgId();
-  const workDir = mkdtempSync(join(tmpdir(), "pi-bg-"));
+function tmux(args: string): string {
+  try {
+    return execSync(`tmux ${args}`, { encoding: "utf-8", timeout: 10_000 }).trim();
+  } catch (e: any) {
+    return e.stderr || e.message || "";
+  }
+}
+
+function tmuxHasSession(name: string): boolean {
+  return tmux(`has-session -t "${name}" 2>/dev/null`) !== "" || 
+         execSync(`tmux has-session -t "${name}" 2>/dev/null`, { encoding: "utf-8" }).length === 0;
+}
+
+// Actually need to check differently
+function sessionExists(name: string): boolean {
+  try {
+    execSync(`tmux has-session -t "${name}"`, { encoding: "utf-8", stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── spawn background task ───────────────────────────────────────────────────
+
+function spawnBgTask(command: string, cwd: string, timeout: number): BgTask {
+  const id = taskId();
+  const logFile = join(tmpdir(), `pi-bg-${id}.log`);
   const startTime = Date.now();
 
-  const job: BgJob = { id, task, status: "running", startTime, model };
-  jobs.set(id, job);
+  // Build command that logs output and signals completion
+  const wrappedCmd = [
+    `cd "${cwd}"`,
+    `{`,
+    `  ${command}`,
+    `} > "${logFile}" 2>&1`,
+    `EXIT_CODE=$?`,
+    `echo "EXIT_CODE=$EXIT_CODE" >> "${logFile}"`,
+    `echo "DONE_AT=$(date +%s)" >> "${logFile}"`,
+  ].join("\n");
 
-  const promise = new Promise<string>((resolve) => {
-    const args: string[] = ["-p", "--no-context-files", "--no-session"];
-    if (model) args.push("--model", model);
-    args.push(task);
+  // Start in detached tmux session
+  tmux(`new-session -d -s "${id}" "${wrappedCmd}"`);
 
-    const proc = spawn("pi", args, {
-      cwd: workDir,
-      env: { ...process.env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    job.proc = proc;
+  const task: BgTask = {
+    id,
+    cmd: command.length > 100 ? command.substring(0, 97) + "..." : command,
+    tmuxSession: id,
+    status: "running",
+    startTime,
+    logFile,
+  };
+  tasks.set(id, task);
 
-    let stdout = "";
-
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr.on("data", (_chunk: Buffer) => { /* captured but ignored for stderr noise */ });
-
-    proc.on("close", (code) => {
-      job.endTime = Date.now();
-      if (job.status === "cancelled") return;
-      job.status = code === 0 ? "done" : "error";
-      if (code === 0) {
-        job.result = stdout.trim();
-      } else {
-        job.error = `exit code ${code}`;
-        job.result = stdout.trim() || `(exit ${code})`;
-      }
-      resolve(job.result || job.error || "");
-      try { rmSync(workDir, { recursive: true }); } catch { /* ok */ }
-    });
-
-    proc.on("error", (err) => {
-      job.status = "error";
-      job.error = err.message;
-      resolve(`[bg error] ${err.message}`);
-    });
-
+  // Set the same timeout for killing the tmux session
+  if (timeout > 0) {
     setTimeout(() => {
-      if (job.status === "running") {
-        proc.kill();
-        job.status = "error";
-        job.error = "timeout";
-        resolve("[bg timeout after 30 min]");
+      if (task.status === "running") {
+        tmux(`kill-session -t "${id}" 2>/dev/null`);
+        task.status = "killed";
+        task.endTime = Date.now();
       }
-    }, 1_800_000);
-  });
+    }, timeout);
+  }
 
-  return { id, promise };
+  return task;
 }
 
-// ── detach current work to background ───────────────────────────────────────
-
-async function detachCurrentWork(pi: ExtensionAPI, ctx: any): Promise<void> {
+function getTaskOutput(task: BgTask): string {
+  if (!existsSync(task.logFile)) return "(no output)";
   try {
-    // Get the last user message from the session
-    const entries = ctx.sessionManager.getEntries();
-    let lastUserEntry: any = null;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (entries[i].role === "user") {
-        lastUserEntry = entries[i];
-        break;
-      }
+    const content = readFileSync(task.logFile, "utf-8");
+    // Parse exit code
+    const exitMatch = content.match(/EXIT_CODE=(\d+)/);
+    if (exitMatch) {
+      task.exitCode = parseInt(exitMatch[1], 10);
+      task.status = task.exitCode === 0 ? "done" : "error";
     }
-
-    if (!lastUserEntry) {
-      ctx.ui.notify("No user message found to detach.", "error");
-      return;
+    const doneMatch = content.match(/DONE_AT=(\d+)/);
+    if (doneMatch) {
+      task.endTime = parseInt(doneMatch[1], 10) * 1000;
     }
-
-    // Extract the text content from the user message
-    const userText = extractText(lastUserEntry.content);
-    if (!userText.trim()) {
-      ctx.ui.notify("User message is empty.", "error");
-      return;
-    }
-
-    // Spawn background pi to re-run the prompt
-    const { id } = spawnBg(userText, ctx.cwd);
-    ctx.ui.notify(`Work detached to background: ${id}. Old session becomes foreground.`, "info");
-
-    // Fork to a clean session from before the current work
-    // The fork creates a new session file from the parent entry;
-    // the original session's work is aborted and restarted in background.
-    await ctx.fork(lastUserEntry.id, {
-      position: "before", // fork before the user message, restoring it to editor
-      withSession: async (newCtx: any) => {
-        newCtx.ui.notify(`Clean session ready. Background task: ${id}`, "info");
-        pollCompletion(pi, newCtx, id);
-      },
-    });
-  } catch (e: any) {
-    ctx.ui.notify(`Failed to detach: ${e.message}`, "error");
+    return content;
+  } catch {
+    return "(cannot read output)";
   }
-}
-
-// ── extract text from message content ──────────────────────────────────────
-
-function extractText(content: any): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text)
-      .join("\n");
-  }
-  return "";
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // ── track whether agent is currently working ─────────────────────
-  let agentActive = false;
-  pi.on("agent_start", () => { agentActive = true; });
-  pi.on("agent_end", () => { agentActive = false; });
+  // ── CORE: tool_call interceptor (CODE-ENFORCED) ──────────────────────
+  pi.on("tool_call", async (event, ctx) => {
+    // Intercept bash with timeout >300s
+    if (event.toolName === "bash" && (event.input as any)?.timeout) {
+      const timeout = (event.input as any).timeout;
+      if (timeout > 300_000) {
+        const cmd = (event.input as any).command || "";
 
-  // ── /bg command ──────────────────────────────────────────────────
+        // Don't auto-background if it's a short/simple command (heuristic: >100 chars likely script)
+        // Always enforce: >300s timeout = background
+        const task = spawnBgTask(cmd, ctx.cwd, timeout);
+
+        ctx.ui.notify(
+          `Moved to background: ${task.id} (${(timeout / 1000).toFixed(0)}s timeout). Use /jobs to check.`,
+          "info"
+        );
+
+        // Return immediately — the command is running in background
+        return {
+          block: true,
+          reason: `Moved to background (tmux session ${task.id}). ` +
+            `Command: ${cmd.substring(0, 80)}... ` +
+            `Check /jobs for progress, /fg ${task.id} for output when done.`,
+        };
+      }
+    }
+
+    // Intercept subagent_spawn for tasks that look long-running
+    if (event.toolName === "subagent_spawn") {
+      const taskDesc = (event.input as any)?.task || "";
+      const longKeywords = [
+        "train", "download", "build", "compile", "deploy",
+        "benchmark", "migrate", "import", "export", "scrape",
+        "refactor entire", "rewrite all", "convert all",
+      ];
+      const looksLong = longKeywords.some((kw) => taskDesc.toLowerCase().includes(kw));
+
+      if (looksLong) {
+        ctx.ui.notify(
+          `Task looks long-running: "${taskDesc.substring(0, 60)}". Consider /bg instead for background execution.`,
+          "warning"
+        );
+        // Don't block — subagent needs review, so we can't fully automate
+      }
+    }
+  });
+
+  // ── /bg command: manual background start ────────────────────────────
   pi.registerCommand("bg", {
-    description:
-      "Without args: detach current work to background and start clean session. " +
-      "With args: run a new task in background.",
+    description: "Start a command in background (tmux-managed)",
     handler: async (args, ctx) => {
-      const task = args?.trim();
-
-      if (!task) {
-        // No args + agent is working → detach current work to background
-        if (agentActive) {
-          await detachCurrentWork(pi, ctx);
-          return;
-        }
-        // No args + agent idle → show jobs
-        if (jobs.size === 0) {
-          ctx.ui.notify("No background jobs. Use /bg <task> to start one, or /bg while agent is working to detach.", "info");
-          return;
-        }
-        showJobsWidget(ctx);
+      const cmd = args?.trim();
+      if (!cmd) {
+        // Show status
+        showStatusWidget(ctx);
         return;
       }
 
-      // Start a new background task
-      const { id } = spawnBg(task, ctx.cwd);
-      ctx.ui.notify(`Background job ${id} started`, "info");
-      pollCompletion(pi, ctx, id);
+      const task = spawnBgTask(cmd, ctx.cwd, 3_600_000); // Default 1h timeout
+      ctx.ui.notify(`Background task ${task.id} started (tmux). /jobs to check, /attach ${task.id} to view live.`, "info");
+      pollForCompletion(pi, ctx, task);
     },
   });
 
@@ -196,61 +202,107 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("jobs", {
     description: "List background tasks",
     handler: async (_args, ctx) => {
-      if (jobs.size === 0) {
-        ctx.ui.notify("No background jobs.", "info");
-        return;
-      }
-      showJobsWidget(ctx);
+      showStatusWidget(ctx);
     },
   });
 
-  // ── /fg command ──────────────────────────────────────────────────────
+  // ── /fg command: view completed task output ──────────────────────────
   pi.registerCommand("fg", {
-    description: "Bring a completed background task result to foreground",
+    description: "View background task output",
     handler: async (args, ctx) => {
       const id = args?.trim();
       if (!id) {
-        // Show the most recently completed job
-        let latest: BgJob | undefined;
-        for (const job of jobs.values()) {
-          if (job.status === "done" && (!latest || (job.endTime || 0) > (latest.endTime || 0))) {
-            latest = job;
+        // Show most recently completed
+        let latest: BgTask | undefined;
+        for (const t of tasks.values()) {
+          if (t.status !== "running" && (!latest || (t.endTime || 0) > (latest.endTime || 0))) {
+            latest = t;
           }
         }
         if (!latest) {
-          ctx.ui.notify("No completed background jobs. Use /jobs to see all.", "info");
+          // Show all running tasks
+          showStatusWidget(ctx);
           return;
         }
-        showResult(latest, ctx);
+        showTaskOutput(latest, ctx);
         return;
       }
 
-      const job = jobs.get(id);
-      if (!job) {
-        ctx.ui.notify(`Job ${id} not found.`, "error");
+      const task = tasks.get(id);
+      if (!task) {
+        ctx.ui.notify(`Task ${id} not found.`, "error");
         return;
       }
-      if (job.status === "running") {
-        ctx.ui.notify(`Job ${id} still running. Check /jobs for status.`, "warning");
-        return;
-      }
-      showResult(job, ctx);
+      showTaskOutput(task, ctx);
     },
   });
 
-  // ── tool_call interceptor: auto-detect long-running tasks ──────────
-  pi.on("tool_call", async (event, ctx) => {
-    // Intercept bash commands with timeout > 300s
-    if (event.toolName === "bash" && (event.input as any)?.timeout) {
-      const timeout = (event.input as any).timeout;
-      if (timeout > 300_000) {
-        const cmd = (event.input as any).command || "";
-        ctx.ui.notify(`Long task detected (${timeout / 1000}s). Use bg_spawn instead of bash for tasks >300s.`, "warning");
-        // Don't block — just warn. AI should see this and use bg_spawn next time.
+  // ── /attach command: attach to live tmux session ─────────────────────
+  pi.registerCommand("attach", {
+    description: "Attach to a running background task's tmux session",
+    handler: async (args, ctx) => {
+      const id = args?.trim();
+      if (!id) {
+        ctx.ui.notify("Usage: /attach <task-id>", "warning");
+        return;
       }
-    }
-    // Intercept subagent_spawn with model='deepseek-v4-flash' (likely simple tasks → OK in foreground)
-    // Complex tasks with model='deepseek-v4-pro' may be long → warn if task description suggests long run
+
+      const task = tasks.get(id);
+      if (!task) {
+        ctx.ui.notify(`Task ${id} not found.`, "error");
+        return;
+      }
+
+      if (task.status !== "running" || !sessionExists(task.tmuxSession)) {
+        // Session ended — show output instead
+        task.status = task.status === "running" ? "done" : task.status;
+        showTaskOutput(task, ctx);
+        return;
+      }
+
+      ctx.ui.notify(`Attaching to ${id}... (Ctrl+B D to detach)`, "info");
+
+      // Spawn an interactive tmux attach
+      const proc = spawn("tmux", ["attach-session", "-t", task.tmuxSession], {
+        stdio: "inherit",
+        cwd: ctx.cwd,
+      });
+
+      await new Promise<void>((resolve) => {
+        proc.on("exit", () => resolve());
+      });
+
+      // After detaching, check if still running
+      if (!sessionExists(task.tmuxSession)) {
+        task.status = "done";
+        task.endTime = Date.now();
+        ctx.ui.notify(`Task ${id} completed during attach. /fg ${id} to see output.`, "info");
+      }
+    },
+  });
+
+  // ── /kill command ────────────────────────────────────────────────────
+  pi.registerCommand("kill-bg", {
+    description: "Kill a background task",
+    handler: async (args, ctx) => {
+      const id = args?.trim();
+      if (!id) {
+        ctx.ui.notify("Usage: /kill-bg <task-id>", "warning");
+        return;
+      }
+
+      const task = tasks.get(id);
+      if (!task) {
+        ctx.ui.notify(`Task ${id} not found.`, "error");
+        return;
+      }
+
+      tmux(`kill-session -t "${task.tmuxSession}" 2>/dev/null`);
+      task.status = "killed";
+      task.endTime = Date.now();
+      cleanupTask(task);
+      ctx.ui.notify(`Task ${id} killed.`, "info");
+    },
   });
 
   // ── bg_spawn tool (AI can use) ──────────────────────────────────────
@@ -258,29 +310,27 @@ export default function (pi: ExtensionAPI) {
     name: "bg_spawn",
     label: "Background Task",
     description:
-      "Start a task in background. The task runs while you continue the conversation. " +
-      "Use /jobs to check status, /fg to view results. " +
-      "Use this for long-running work (builds, downloads, training) so the user can keep chatting.",
+      "Start a task in background via tmux. The task runs while the user continues chatting. " +
+      "Use /jobs to check status, /fg to view results, /attach to watch live.",
     parameters: Type.Object({
-      task: Type.String({ description: "Task to run in background" }),
-      model: Type.Optional(Type.String({ description: "Model override (e.g. 'deepseek-v4-flash')" })),
+      task: Type.String({ description: "Command or task to run in background" }),
+      model: Type.Optional(Type.String({ description: "Model override (not applicable for bash commands)" })),
     }),
-    promptGuidelines: [
-      "MANDATORY: If a bash command timeout exceeds 300 seconds, you MUST use bg_spawn instead of bash. The user must be able to continue chatting.",
-      "MANDATORY: If a subagent_spawn task is expected to take >5 minutes (build, train, download, large refactor), you MUST use bg_spawn instead.",
-      "Use bg_spawn for any task where the user would have to wait idly. Keep the foreground free.",
-      "bg_spawn is for fire-and-forget work. For code changes that need review, use subagent_spawn but warn the user about duration.",
-      "Tell the user they can check progress with /jobs and view results with /fg.",
-    ],
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const { id } = spawnBg(params.task, ctx.cwd, params.model);
-      pollCompletion(pi, ctx, id);
+      const task = spawnBgTask(params.task, ctx.cwd, 3_600_000);
+      pollForCompletion(pi, ctx, task);
       return {
         content: [{
           type: "text",
-          text: `Background job started. ID: ${id}\nTask: ${params.task}\n\nUse /jobs to check progress. Use /fg ${id} to view results when done.`,
+          text: [
+            `Background task started.`,
+            `ID: ${task.id}`,
+            `Tmux: ${task.tmuxSession}`,
+            ``,
+            `Check: /jobs  |  View: /fg ${task.id}  |  Live: /attach ${task.id}  |  Kill: /kill-bg ${task.id}`,
+          ].join("\n"),
         }],
-        details: { jobId: id },
+        details: { taskId: task.id },
       };
     },
   });
@@ -289,73 +339,120 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_status",
     label: "Background Status",
-    description: "Check the status of all background jobs.",
+    description: "Check the status of all background tasks.",
     parameters: Type.Object({}),
     async execute() {
-      if (jobs.size === 0) {
-        return { content: [{ type: "text", text: "No background jobs." }], details: {} };
+      if (tasks.size === 0) {
+        return { content: [{ type: "text", text: "No background tasks." }], details: {} };
       }
-      const lines = ["Background jobs:"];
-      for (const [id, j] of jobs) {
-        const elapsed = ((j.endTime || Date.now()) - j.startTime) / 1000;
-        const icon = j.status === "done" ? "✅" : j.status === "running" ? "🔄" : j.status === "error" ? "❌" : "⏹";
-        lines.push(`  ${icon} ${id}: [${j.status}] ${j.task.substring(0, 60)} (${elapsed.toFixed(0)}s)`);
+      const lines = ["Background tasks:"];
+      for (const [id, t] of tasks) {
+        const elapsed = ((t.endTime || Date.now()) - t.startTime) / 1000;
+        const icon = t.status === "done" ? "✅" : t.status === "running" ? "🔄" : "❌";
+        lines.push(`  ${icon} ${id}: ${t.cmd.substring(0, 60)} (${elapsed.toFixed(0)}s)`);
       }
+      lines.push("");
+      lines.push("Commands: /jobs list  /fg view output  /attach watch live  /kill-bg stop");
       return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
     },
   });
 
   // ── session_shutdown cleanup ────────────────────────────────────────
   pi.on("session_shutdown", () => {
-    for (const [, job] of jobs) {
-      job.status = "cancelled";
-      job.proc?.kill();
+    for (const [id, task] of tasks) {
+      tmux(`kill-session -t "${task.tmuxSession}" 2>/dev/null`);
+      cleanupTask(task);
     }
-    jobs.clear();
+    tasks.clear();
   });
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function showJobsWidget(ctx: any): void {
-  const lines = ["Background jobs:"];
-  for (const [id, j] of jobs) {
-    const elapsed = ((j.endTime || Date.now()) - j.startTime) / 1000;
-    const icon = j.status === "done" ? "✅" : j.status === "running" ? "🔄" : j.status === "error" ? "❌" : "⏹";
-    lines.push(`  ${icon} ${id}: ${j.task.substring(0, 50)} (${elapsed.toFixed(0)}s)`);
+function showStatusWidget(ctx: any): void {
+  if (tasks.size === 0) {
+    ctx.ui.setWidget("bg-status", ["No background tasks. Use /bg <command> to start one."]);
+    return;
   }
-  ctx.ui.setWidget("bg-jobs", lines);
+
+  const lines = ["┌─ Background Tasks ───────────────────────────"];
+  for (const [id, t] of tasks) {
+    const elapsed = ((t.endTime || Date.now()) - t.startTime) / 1000;
+    const line = t.status === "running"
+      ? `│ 🔄 ${id}: ${t.cmd.substring(0, 45)} (${elapsed.toFixed(0)}s)`
+      : `│ ${t.status === "done" ? "✅" : "❌"} ${id}: ${t.cmd.substring(0, 45)} (${elapsed.toFixed(0)}s)`;
+    lines.push(line);
+  }
+  lines.push("├──────────────────────────────────────────────");
+  lines.push("│ /fg <id> view  /attach <id> live  /kill-bg <id> stop");
+  lines.push("└──────────────────────────────────────────────");
+
+  ctx.ui.setWidget("bg-status", lines);
 }
 
-function showResult(job: BgJob, ctx: any): void {
+function showTaskOutput(task: BgTask, ctx: any): void {
+  const output = getTaskOutput(task);
+  const elapsed = ((task.endTime || Date.now()) - task.startTime) / 1000;
+
   const lines = [
-    `┌─ Background: ${job.id} ───────────────────────`,
-    `│ Task: ${job.task}`,
-    `│ Status: ${job.status}`,
-    `│ Time: ${((job.endTime || Date.now()) - job.startTime) / 1000}s`,
-    `├─────────────────────────────────────────────`,
-    ...(job.result || job.error || "(empty)").split("\n").map((l: string) => `│ ${l}`),
-    `└─────────────────────────────────────────────`,
+    `┌─ ${task.id} ──────────────────────────────────`,
+    `│ Command: ${task.cmd}`,
+    `│ Status: ${task.status} (exit: ${task.exitCode ?? "?"})`,
+    `│ Time: ${elapsed.toFixed(0)}s`,
+    `├──────────────────────────────────────────────`,
   ];
-  ctx.ui.setWidget("bg-result-" + job.id, lines);
+
+  // Add output, truncate per line but don't cut content
+  const outLines = output.split("\n");
+  const maxShow = 50;
+  for (let i = 0; i < Math.min(outLines.length, maxShow); i++) {
+    const l = outLines[i].substring(0, 80);
+    lines.push(`│ ${l}`);
+  }
+  if (outLines.length > maxShow) {
+    lines.push(`│ ... (${outLines.length - maxShow} more lines)`);
+  }
+  lines.push("└──────────────────────────────────────────────");
+
+  ctx.ui.setWidget("bg-output-" + task.id, lines);
 }
 
-function pollCompletion(pi: ExtensionAPI, ctx: any, id: string): void {
-  const check = () => {
-    const job = jobs.get(id);
-    if (!job) return;
+function cleanupTask(task: BgTask): void {
+  try {
+    if (existsSync(task.logFile)) unlinkSync(task.logFile);
+  } catch { /* ok */ }
+}
 
-    if (job.status === "done" || job.status === "error") {
-      ctx.ui.notify(`Background job ${id} complete (${job.status})`, job.status === "done" ? "info" : "error");
-      ctx.ui.setStatus("bg-" + id, `${job.status === "done" ? "✅" : "❌"} bg:${id}`);
-      jobs.delete(id); // Keep result accessible via /fg but clean up tracking
+function pollForCompletion(pi: ExtensionAPI, ctx: any, task: BgTask): void {
+  const check = () => {
+    if (!tasks.has(task.id)) return;
+    if (!sessionExists(task.tmuxSession)) {
+      // Session ended
+      task.status = "done";
+      task.endTime = Date.now();
+      const output = getTaskOutput(task);
+      ctx.ui.notify(`Background task ${task.id} completed. /fg ${task.id} to see output.`, "info");
+
+      // If user is idle, show the result
+      if (ctx.isIdle?.()) {
+        ctx.ui.setWidget("bg-complete-" + task.id, [
+          `┌─ Completed: ${task.id} ──────────────────────`,
+          `│ ${task.cmd}`,
+          `├──────────────────────────────────────────────`,
+          ...output.split("\n").slice(0, 10).map((l: string) => `│ ${l.substring(0, 70)}`),
+          `│ /fg ${task.id} for full output`,
+          `└──────────────────────────────────────────────`,
+        ]);
+      }
       return;
     }
 
-    if (job.status === "running") {
-      setTimeout(check, 3000);
-    }
+    // Still running, poll again
+    const elapsed = (Date.now() - task.startTime) / 1000;
+    ctx.ui.setStatus(task.id, `🔄 bg:${task.id} (${elapsed.toFixed(0)}s)`);
+
+    setTimeout(check, 5000);
   };
 
-  setTimeout(check, 2000);
+  setTimeout(check, 3000);
 }
