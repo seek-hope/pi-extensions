@@ -238,6 +238,21 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── tool_call interceptor: auto-detect long-running tasks ──────────
+  pi.on("tool_call", async (event, ctx) => {
+    // Intercept bash commands with timeout > 300s
+    if (event.toolName === "bash" && (event.input as any)?.timeout) {
+      const timeout = (event.input as any).timeout;
+      if (timeout > 300_000) {
+        const cmd = (event.input as any).command || "";
+        ctx.ui.notify(`Long task detected (${timeout / 1000}s). Use bg_spawn instead of bash for tasks >300s.`, "warning");
+        // Don't block — just warn. AI should see this and use bg_spawn next time.
+      }
+    }
+    // Intercept subagent_spawn with model='deepseek-v4-flash' (likely simple tasks → OK in foreground)
+    // Complex tasks with model='deepseek-v4-pro' may be long → warn if task description suggests long run
+  });
+
   // ── bg_spawn tool (AI can use) ──────────────────────────────────────
   pi.registerTool({
     name: "bg_spawn",
@@ -251,11 +266,11 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(Type.String({ description: "Model override (e.g. 'deepseek-v4-flash')" })),
     }),
     promptGuidelines: [
-      "Use bg_spawn for long-running tasks (builds, downloads, data processing, training) so the user can continue chatting.",
-      "CRITICAL: If a bash command or sub-agent task is expected to take >300 seconds, use bg_spawn instead of running it in the foreground.",
-      "When using subagent_spawn for tasks expected to take >5 minutes, set a timeout and suggest the user check back with /jobs.",
+      "MANDATORY: If a bash command timeout exceeds 300 seconds, you MUST use bg_spawn instead of bash. The user must be able to continue chatting.",
+      "MANDATORY: If a subagent_spawn task is expected to take >5 minutes (build, train, download, large refactor), you MUST use bg_spawn instead.",
+      "Use bg_spawn for any task where the user would have to wait idly. Keep the foreground free.",
+      "bg_spawn is for fire-and-forget work. For code changes that need review, use subagent_spawn but warn the user about duration.",
       "Tell the user they can check progress with /jobs and view results with /fg.",
-      "For code changes that need review, use subagent_spawn instead — bg_spawn is for fire-and-forget work.",
     ],
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const { id } = spawnBg(params.task, ctx.cwd, params.model);
