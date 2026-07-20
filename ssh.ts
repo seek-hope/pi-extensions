@@ -47,6 +47,18 @@ function isConnected(key: string): boolean {
   }
 }
 
+function keyFromFilename(name: string): string {
+  // Reverse socketPath: user_hostname_port.sock → user@hostname:port
+  const raw = name.replace(".sock", "");
+  const idx1 = raw.indexOf("_");
+  const idx2 = raw.lastIndexOf("_");
+  if (idx1 < 0 || idx2 <= idx1) return raw; // can't parse, return as-is
+  const user = raw.substring(0, idx1);
+  const hostname = raw.substring(idx1 + 1, idx2);
+  const port = raw.substring(idx2 + 1);
+  return `${user}@${hostname}:${port}`;
+}
+
 // Recover connections from existing sockets on disk
 function syncFromDisk(): void {
   if (!existsSync(SOCKET_DIR)) return;
@@ -56,10 +68,11 @@ function syncFromDisk(): void {
       const sock = join(SOCKET_DIR, name);
       try {
         execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 3_000 });
-        const raw = name.replace(".sock", "");
-        // Only add if not already tracked
+        const key = keyFromFilename(name);
         if (![...connections.values()].some(c => c.socket === sock)) {
-          connections.set(raw, { key: raw, alias: raw, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+          // Extract user@hostname as alias for SSH calls
+          const [userHost] = key.split(":");
+          connections.set(key, { key, alias: userHost, socket: sock, startTime: Date.now(), lastUse: Date.now() });
         }
       } catch { /* socket not active */ }
     }
