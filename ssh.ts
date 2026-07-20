@@ -179,7 +179,7 @@ export default function (pi: ExtensionAPI) {
           await new Promise<void>((resolve) => {
             proc.on("exit", (code) => {
               if (code === 0 || hasActiveConnection(host)) {
-                ctx.ui.notify(`Connected to ${host}. Persistent session active (1h idle timeout).`, "info");
+                ctx.ui.notify(`Connected to ${host}. Persistent session active (2h idle timeout).`, "info");
               } else {
                 ctx.ui.notify(`Connection to ${host} failed (exit ${code}).`, "error");
               }
