@@ -166,7 +166,7 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   spawn("alacritty", ["-e", "bash", "-c",
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=2h ` +
-    `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
+    `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 -o MaxSessions=50 ` +
     `-o StrictHostKeyChecking=accept-new -fN ${sshTarget} && ` +
     `echo "Connected! You may close this window." || echo "Auth failed."; ` +
     `read -p 'Press Enter to close...'`
@@ -202,7 +202,7 @@ function runRemote(key: string, sock: string, alias: string, command: string, us
 
   ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
   const sshTarget = alias !== hostname ? alias : `-p ${port} ${user}@${hostname}`;
-  const result = sh(`ssh -o ControlPath="${sock}" -o ConnectTimeout=5 ${sshTarget} '${command.replace(/'/g, "'\\''")}'`, 120_000);
+  const result = sh(`ssh -o ControlPath="${sock}" -o ConnectTimeout=5 -o LogLevel=ERROR ${sshTarget} '${command.replace(/'/g, "'\\''")}'`, 120_000);
   ctx.ui.setStatus("ssh-" + key, "");
   connections.get(key)!.lastUse = Date.now();
 
@@ -304,7 +304,8 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const result = execSync(
-          `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 ${conn.sshTarget} '${cmd.replace(/'/g, "'\\''")}'`,
+          `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 ` +
+          `-o LogLevel=ERROR ${conn.sshTarget} '${cmd.replace(/'/g, "'\\''")}'`,
           { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
         );
         conn.lastUse = Date.now();
