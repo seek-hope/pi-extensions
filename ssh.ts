@@ -47,6 +47,25 @@ function isConnected(key: string): boolean {
   }
 }
 
+// Recover connections from existing sockets on disk
+function syncFromDisk(): void {
+  if (!existsSync(SOCKET_DIR)) return;
+  try {
+    for (const name of execSync(`ls "${SOCKET_DIR}" 2>/dev/null || true`, { encoding: "utf-8" }).split("\n")) {
+      if (!name.endsWith(".sock")) continue;
+      const sock = join(SOCKET_DIR, name);
+      try {
+        execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 3_000 });
+        const raw = name.replace(".sock", "");
+        // Only add if not already tracked
+        if (![...connections.values()].some(c => c.socket === sock)) {
+          connections.set(raw, { key: raw, alias: raw, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+        }
+      } catch { /* socket not active */ }
+    }
+  } catch { /* dir empty or error */ }
+}
+
 function sh(cmd: string, timeout = 60_000): string {
   try {
     return execSync(cmd, { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }).trim();
@@ -181,25 +200,10 @@ function runRemote(key: string, sock: string, alias: string, command: string, us
 // ── find connection for AI tool ────────────────────────────────────────────
 
 function findConnection(host: string): Connection | undefined {
+  syncFromDisk();
   const s = host.toLowerCase();
   for (const [, c] of connections) {
     if (c.key.toLowerCase().includes(s) || c.alias.toLowerCase().includes(s)) return c;
-  }
-  // Fallback: scan socket dir
-  if (existsSync(SOCKET_DIR)) {
-    for (const name of execSync(`ls "${SOCKET_DIR}" 2>/dev/null || true`, { encoding: "utf-8" }).split("\n")) {
-      if (!name.endsWith(".sock")) continue;
-      const sock = join(SOCKET_DIR, name);
-      try {
-        execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 3_000 });
-        // Extract key from filename: user_hostname_port.sock
-        const raw = name.replace(".sock", "").replace(/_/g, (m, i, str) => {
-          // Reconstruct: first _ is @, last _ before port is :, rest are .
-          return "@"; // simplified
-        });
-        return { key: raw, alias: raw, socket: sock, startTime: Date.now(), lastUse: Date.now() };
-      } catch { /* not running */ }
-    }
   }
   return undefined;
 }
@@ -298,6 +302,7 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({}),
     async execute() {
+      syncFromDisk();
       if (connections.size === 0) {
         return { content: [{ type: "text", text: "No active SSH connections. Use /ssh user@host to connect." }], details: {} };
       }
@@ -317,6 +322,7 @@ export default function (pi: ExtensionAPI) {
 // ── UI helpers ──────────────────────────────────────────────────────────────
 
 function showStatus(ctx: any): void {
+  syncFromDisk();
   if (connections.size === 0) { ctx.ui.notify("No active connections.", "info"); return; }
   const lines = ["SSH Connections:"];
   for (const [, c] of connections) {
