@@ -166,7 +166,7 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   spawn("alacritty", ["-e", "bash", "-c",
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=2h ` +
-    `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 -o MaxSessions=50 ` +
+    `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 -o MaxSessions=20 ` +
     `-o StrictHostKeyChecking=accept-new -fN ${sshTarget} && ` +
     `echo "Connected! You may close this window." || echo "Auth failed."; ` +
     `read -p 'Press Enter to close...'`
@@ -303,12 +303,14 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
+        // Use a dedicated multiplexed session; closes immediately after command
         const result = execSync(
           `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 ` +
           `-o LogLevel=ERROR ${conn.sshTarget} '${cmd.replace(/'/g, "'\\''")}'`,
           { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
         );
         conn.lastUse = Date.now();
+        // Give SSH a moment to fully close the multiplexed channel
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
