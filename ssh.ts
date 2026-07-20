@@ -261,7 +261,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH Execute",
-    description: "Run a command on a remote server through a persistent SSH connection.",
+    description:
+      "Run a command on a remote server through a persistent SSH connection. " +
+      "Short commands (<30s) use a shared persistent shell for speed. " +
+      "Long commands automatically spawn a separate session to avoid blocking.",
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
       "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
@@ -286,7 +289,18 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
-        const result = await shellExec(conn, cmd, timeout);
+        // Short commands (<30s expected): use persistent shell (fast, 1 session)
+        // Long commands (timeout >30s): use separate ssh process (don't block shell)
+        const isLong = timeout > 30_000;
+        let result: string;
+        if (isLong) {
+          result = execSync(
+            `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${conn.sshTarget} '${cmd.replace(/'/g, "'\\''")}'`,
+            { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
+          ).trim();
+        } else {
+          result = await shellExec(conn, cmd, timeout);
+        }
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (e: any) {
