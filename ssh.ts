@@ -139,7 +139,10 @@ function parseSshArgs(args: string): SshTarget | null {
 
   if (!hostname) return null;
 
-  // Resolve via SSH config: use the input as host alias
+  // Save original alias BEFORE resolving config
+  const alias = hostname;
+
+  // Resolve via SSH config
   const resolved = resolveSshConfig(hostname);
   if (resolved) {
     if (!user) user = resolved.user;
@@ -148,10 +151,10 @@ function parseSshArgs(args: string): SshTarget | null {
   }
 
   return {
-    alias: hostname,  // Original alias for SSH (SSH will resolve via config)
+    alias,  // Original alias for SSH Host pattern matching
     user: user || "root",
     hostname: resolved?.hostname || hostname,
-    port: port || resolved?.port || 22,
+    port: port || 22,
     command,
   };
 }
@@ -346,23 +349,28 @@ async function connectToHost(
   });
   proc.unref();
 
-  // Poll for the ControlMaster socket to appear
+  // Non-blocking: poll in background, update status line
   ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}...`);
 
-  for (let i = 0; i < 60; i++) {
-    await new Promise((r) => setTimeout(r, 2000));
+  let attempts = 0;
+  const maxAttempts = 10; // 20s total
+  const check = () => {
+    attempts++;
     if (isConnected(key)) {
       connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
       ctx.ui.setStatus("ssh-" + key, "");
       ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
       return;
     }
-    // Update status with elapsed time
-    ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}... (${i * 2}s)`);
-  }
-
-  ctx.ui.setStatus("ssh-" + key, "");
-  ctx.ui.notify(`Timeout waiting for ${user}@${hostname}. Check the terminal window.`, "error");
+    if (attempts < maxAttempts) {
+      ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}... (${attempts * 2}s)`);
+      setTimeout(check, 2000);
+    } else {
+      ctx.ui.setStatus("ssh-" + key, "");
+      ctx.ui.notify(`Timeout waiting for ${user}@${hostname}. Run /ssh status to check.`, "warning");
+    }
+  };
+  setTimeout(check, 2000);
 }
 
 async function runRemoteCommand(
