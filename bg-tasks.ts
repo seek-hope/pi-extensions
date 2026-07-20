@@ -96,30 +96,98 @@ function spawnBg(task: string, cwd: string, model?: string): { id: string; promi
   return { id, promise };
 }
 
+// ── detach current work to background ───────────────────────────────────────
+
+async function detachCurrentWork(pi: ExtensionAPI, ctx: any): Promise<void> {
+  try {
+    // Get the last user message from the session
+    const entries = ctx.sessionManager.getEntries();
+    let lastUserEntry: any = null;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].role === "user") {
+        lastUserEntry = entries[i];
+        break;
+      }
+    }
+
+    if (!lastUserEntry) {
+      ctx.ui.notify("No user message found to detach.", "error");
+      return;
+    }
+
+    // Extract the text content from the user message
+    const userText = extractText(lastUserEntry.content);
+    if (!userText.trim()) {
+      ctx.ui.notify("User message is empty.", "error");
+      return;
+    }
+
+    // Spawn background pi to re-run the prompt
+    const { id } = spawnBg(userText, ctx.cwd);
+    ctx.ui.notify(`Work detached to background: ${id}. Old session becomes foreground.`, "info");
+
+    // Fork to a clean session from before the current work
+    // The fork creates a new session file from the parent entry;
+    // the original session's work is aborted and restarted in background.
+    await ctx.fork(lastUserEntry.id, {
+      position: "before", // fork before the user message, restoring it to editor
+      withSession: async (newCtx: any) => {
+        newCtx.ui.notify(`Clean session ready. Background task: ${id}`, "info");
+        pollCompletion(pi, newCtx, id);
+      },
+    });
+  } catch (e: any) {
+    ctx.ui.notify(`Failed to detach: ${e.message}`, "error");
+  }
+}
+
+// ── extract text from message content ──────────────────────────────────────
+
+function extractText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+  }
+  return "";
+}
+
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // ── /bg command ──────────────────────────────────────────────────────
+  // ── track whether agent is currently working ─────────────────────
+  let agentActive = false;
+  pi.on("agent_start", () => { agentActive = true; });
+  pi.on("agent_end", () => { agentActive = false; });
+
+  // ── /bg command ──────────────────────────────────────────────────
   pi.registerCommand("bg", {
-    description: "Run a task in background or detach current work",
+    description:
+      "Without args: detach current work to background and start clean session. " +
+      "With args: run a new task in background.",
     handler: async (args, ctx) => {
       const task = args?.trim();
 
       if (!task) {
-        // No args: show running background jobs
+        // No args + agent is working → detach current work to background
+        if (agentActive) {
+          await detachCurrentWork(pi, ctx);
+          return;
+        }
+        // No args + agent idle → show jobs
         if (jobs.size === 0) {
-          ctx.ui.notify("No background jobs. Use /bg <task> to start one.", "info");
+          ctx.ui.notify("No background jobs. Use /bg <task> to start one, or /bg while agent is working to detach.", "info");
           return;
         }
         showJobsWidget(ctx);
         return;
       }
 
-      // Start a background task
+      // Start a new background task
       const { id } = spawnBg(task, ctx.cwd);
       ctx.ui.notify(`Background job ${id} started`, "info");
-
-      // Poll for completion and show result when idle
       pollCompletion(pi, ctx, id);
     },
   });
