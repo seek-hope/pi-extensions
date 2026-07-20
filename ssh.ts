@@ -175,20 +175,42 @@ export default function (pi: ExtensionAPI) {
   // Ensure socket directory exists
   if (!existsSync(SOCKET_DIR)) mkdirSync(SOCKET_DIR, { recursive: true });
 
-  // ── tool_call interceptor: BLOCK raw ssh, force ssh_exec ────────────
+  // ── tool_call interceptor: BLOCK any form of remote access ──────────
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName === "bash") {
       const cmd = ((event.input as any)?.command || "") as string;
-      // Detect ssh commands
-      const sshPattern = /(?:^|\n|;|\|\||&&)\s*ssh\s+/;
-      if (sshPattern.test(cmd)) {
+
+      // Block sshpass (always used to bypass SSH auth)
+      if (/\bsshpass\b/.test(cmd)) {
         return {
           block: true,
           reason:
-            "Raw SSH is blocked. Use ssh_exec(host, command) instead. " +
-            "It provides persistent connections and won't prompt for passwords. " +
+            "sshpass is blocked. Use ssh_exec(host, command) instead. " +
+            "It provides persistent connections without needing sshpass. " +
             "First ensure the user has connected: /ssh <host>",
         };
+      }
+
+      // Block ssh/scp/sftp/rsync targeting remote hosts
+      // Matches: ssh, scp, sftp, rsync with user@host or -p port patterns
+      const remotePatterns = [
+        /\bssh\s+(?:-[a-zA-Z]*\S*\s+)*\S*@\S+/,           // ssh user@host
+        /\bssh\s+(?:-[a-zA-Z]*\S*\s+)*\S+\s+[\"']?ssh\b/, // ssh host "ssh ..." (nested)
+        /\bscp\s+(?:-[a-zA-Z]*\S*\s+)*\S*@\S+/,           // scp user@host
+        /\bsftp\s+(?:-[a-zA-Z]*\S*\s+)*\S+@\S+/,          // sftp user@host
+        /\brsync\s+.*[\s:]\S+@\S+:/,                       // rsync ... user@host:
+        /\bssh\b.*\bConnectTimeout\b/,                      // ssh with options (bypass via timeout)
+      ];
+      for (const pattern of remotePatterns) {
+        if (pattern.test(cmd)) {
+          return {
+            block: true,
+            reason:
+              "Remote access commands (ssh/scp/sftp/rsync) are blocked. " +
+              "Use ssh_exec(host, command) for remote execution. " +
+              "If no connection exists, the user must run /ssh <host> first.",
+          };
+        }
       }
     }
   });
