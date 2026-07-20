@@ -23,8 +23,9 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       try {
         const apiKey = process.env.ANYSEARCH_API_KEY || "";
+        const num = params.numResults ?? 5;
 
-        const url = `${API_BASE}/v1/search?q=${encodeURIComponent(params.query)}&num=${params.numResults ?? 5}`;
+        const url = `${API_BASE}/v1/search`;
 
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -33,7 +34,17 @@ export default function (pi: ExtensionAPI) {
           headers["Authorization"] = `Bearer ${apiKey}`;
         }
 
-        const res = await fetch(url, { headers, signal: _signal });
+        const body = JSON.stringify({
+          query: params.query,
+          num,
+        });
+
+        const res = await fetch(url, {
+          method: "POST",
+          headers,
+          body,
+          signal: _signal,
+        });
 
         if (!res.ok) {
           const err = await res.text();
