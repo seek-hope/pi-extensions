@@ -128,7 +128,7 @@ export default function (pi: ExtensionAPI) {
             `    ControlPath ${SOCKET_DIR}/${alias}.sock`,
             `    ControlPersist 2h`,
             `    ServerAliveInterval 60`,
-            `    ServerAliveCountMax 3`,
+            `    ServerAliveCountMax 5`,
             "",
           ].join("\n");
 
