@@ -15,13 +15,11 @@
  * No ~/.ssh/config modifications. All connection state in memory.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { Container, Text, matchesKey, Key } from "@earendil-works/pi-tui";
 
 // ── connection state (in-memory only, no config file) ──────────────────────
 
@@ -256,85 +254,63 @@ async function connectToHost(
     return;
   }
 
-  // Collect password via pi TUI overlay (AI never sees it)
-  const password = await ctx.ui.custom<string>((tui, theme, _kb, done) => {
-    let input = "";
+  // Standard SSH — handles both password and private-key passphrase natively.
+  // We notify the user and let SSH handle authentication directly.
+  // After auth, ControlMaster persists the connection.
+  ctx.ui.notify(
+    `Opening SSH to ${user}@${hostname}:${port}. Enter password/passphrase when prompted.`,
+    "info"
+  );
+  ctx.ui.notify(
+    `(If using key auth, make sure your key is loaded: ssh-add ~/.ssh/id_ed25519)`,
+    "info"
+  );
 
-    const container = new Container();
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-    container.addChild(new Text(
-      theme.fg("accent", theme.bold(` SSH: ${user}@${hostname}:${port}`)), 1, 0
-    ));
-    container.addChild(new Text("", 0, 0));
-    container.addChild(new Text("Password (input hidden):", 1, 0));
-    container.addChild(new Text(theme.fg("dim", "  (Enter to submit, Esc to cancel)"), 1, 0));
-    container.addChild(new Text("", 0, 0));
+  // Use tmux to give SSH a clean terminal for interactive auth
+  const tmuxName = `pi-ssh-${user}@${hostname}`;
 
-    return {
-      render: (w: number) => {
-        const lines = container.render(w);
-        lines.push("  " + "●".repeat(input.length));
-        return lines;
-      },
-      invalidate: () => container.invalidate(),
-      handleInput: (data: string) => {
-        if (matchesKey(data, Key.escape)) { done(""); return; }
-        if (matchesKey(data, Key.enter)) { done(input); return; }
-        if (matchesKey(data, Key.backspace)) { input = input.slice(0, -1); }
-        else if (data.length === 1 && data.charCodeAt(0) >= 32) { input += data; }
-        tui.requestRender();
-      },
-    };
-  }, { overlay: true });
+  // Kill any stale session
+  try { execSync(`tmux kill-session -t "${tmuxName}" 2>/dev/null`); } catch { /* ok */ }
 
-  if (!password) {
-    ctx.ui.notify("Cancelled.", "warning");
-    return;
-  }
+  // Build SSH command with ControlMaster so socket persists after auth
+  const sshCmd = [
+    "ssh",
+    "-o", `ControlPath=${socket}`,
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPersist=2h",
+    "-o", "ServerAliveInterval=60",
+    "-o", "ServerAliveCountMax=5",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-p", String(port),
+    `${user}@${hostname}`,
+  ].join(" ");
 
-  ctx.ui.notify(`Connecting to ${user}@${hostname}:${port}...`, "info");
+  // Start SSH in a tmux session, then attach it so user can enter credentials
+  const proc = spawn("tmux", [
+    "new-session", "-s", tmuxName,
+    "bash", "-c",
+    // After SSH exits (auth done), signal completion
+    `${sshCmd}; tmux wait-for -S ssh-done-${tmuxName}`,
+  ], {
+    stdio: "inherit",
+    cwd: ctx.cwd,
+    detached: false,
+  });
 
-  try {
-    const sshProc = spawn(
-      "sshpass", ["-e", "ssh",
-        "-o", `ControlPath=${socket}`,
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ControlMaster=auto",
-        "-o", "ControlPersist=2h",
-        "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=5",
-        "-f", "-N",
-        "-p", String(port),
-        `${user}@${hostname}`,
-      ],
-      {
-        env: { ...process.env, SSHPASS: password },
-        stdio: "ignore",
+  await new Promise<void>((resolve) => {
+    proc.on("exit", () => {
+      // Clean up the tmux session
+      try { execSync(`tmux kill-session -t "${tmuxName}" 2>/dev/null`); } catch { /* ok */ }
+
+      if (isConnected(key)) {
+        connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
+        ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
+      } else {
+        ctx.ui.notify(`Auth failed or cancelled. Check credentials.`, "error");
       }
-    );
-
-    const exitCode = await new Promise<number>((resolve) => {
-      sshProc.on("exit", (code) => resolve(code ?? 1));
-      sshProc.on("error", () => resolve(1));
-      setTimeout(() => resolve(-1), 30_000);
+      resolve();
     });
-
-    await new Promise((r) => setTimeout(r, 1000));
-
-    if (exitCode === 0 || isConnected(key)) {
-      connections.set(key, {
-        host: key,
-        socket,
-        startTime: Date.now(),
-        lastUse: Date.now(),
-      });
-      ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
-    } else {
-      ctx.ui.notify(`Auth failed (exit ${exitCode}). Check password.`, "error");
-    }
-  } catch (e: any) {
-    ctx.ui.notify(`Connection failed: ${e.message || e}`, "error");
-  }
+  });
 }
 
 async function runRemoteCommand(
