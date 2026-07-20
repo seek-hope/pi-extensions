@@ -14,9 +14,10 @@ import { homedir } from "node:os";
 const SOCKET_DIR = join(homedir(), ".ssh", "pi-sockets");
 
 interface Connection {
-  key: string;         // "user@hostname:port" — canonical key
-  alias: string;       // original alias (for SSH Host pattern matching)
+  key: string;
+  alias: string;
   socket: string;
+  sshTarget: string;   // argument for ssh command (alias or "-p PORT user@host")
   startTime: number;
   lastUse: number;
 }
@@ -72,7 +73,7 @@ function syncFromDisk(): void {
         if (![...connections.values()].some(c => c.socket === sock)) {
           // Extract user@hostname as alias for SSH calls
           const [userHost] = key.split(":");
-          connections.set(key, { key, alias: userHost, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+          connections.set(key, { key, alias: userHost, socket: sock, startTime: Date.now(), lastUse: Date.now(), sshTarget: userHost });
         }
       } catch { /* socket not active */ }
     }
@@ -150,19 +151,24 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
 
   // Restore or connect
   if (isConnected(key)) {
-    connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+    connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now(), sshTarget });
     ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}.`, "info");
     return;
   }
 
   ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
 
+  // Build SSH target: use alias if it differs from hostname (SSH config), else user@hostname
+  const sshTarget = alias !== hostname
+    ? alias  // SSH config alias (includes port/identity via config)
+    : `-p ${port} ${user}@${hostname}`;  // Explicit port + user
+
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
   spawn("alacritty", ["-e", "bash", "-c",
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=2h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
-    `-o StrictHostKeyChecking=accept-new -fN ${alias} && ` +
+    `-o StrictHostKeyChecking=accept-new -fN ${sshTarget} && ` +
     `echo "Connected! You may close this window." || echo "Auth failed."; ` +
     `read -p 'Press Enter to close...'`
   ], { stdio: "ignore", detached: true }).unref();
@@ -173,7 +179,7 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   function poll() {
     tries++;
     if (isConnected(key)) {
-      connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+      connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now(), sshTarget });
       ctx.ui.setStatus("ssh-" + key, "");
       ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
       return;
@@ -192,11 +198,12 @@ function runRemote(key: string, sock: string, alias: string, command: string, us
     return;
   }
   if (!connections.has(key)) {
-    connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+    connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now(), sshTarget });
   }
 
   ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
-  const result = sh(`ssh -o ControlPath="${sock}" -o ConnectTimeout=5 "${alias}" '${command.replace(/'/g, "'\\''")}'`, 120_000);
+  const sshTarget = alias !== hostname ? alias : `-p ${port} ${user}@${hostname}`;
+  const result = sh(`ssh -o ControlPath="${sock}" -o ConnectTimeout=5 ${sshTarget} '${command.replace(/'/g, "'\\''")}'`, 120_000);
   ctx.ui.setStatus("ssh-" + key, "");
   connections.get(key)!.lastUse = Date.now();
 
@@ -292,7 +299,7 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const result = execSync(
-          `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 "${conn.alias}" '${cmd.replace(/'/g, "'\\''")}'`,
+          `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 ${conn.sshTarget} '${cmd.replace(/'/g, "'\\''")}'`,
           { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
         );
         conn.lastUse = Date.now();
