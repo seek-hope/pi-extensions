@@ -218,30 +218,36 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Authenticating...", "info");
 
           try {
-            // Start SSH in background with ControlMaster persistent connection
-            // Using SSHPASS env var (never on command line, never logged)
+            // Start SSH in background with ControlMaster
+            // ssh -N stays alive as the connection master; sshpass exits after auth
             const sshProc = spawn(
               "sshpass", ["-e", "ssh",
                 "-o", `ControlPath=${socket}`,
                 "-o", "StrictHostKeyChecking=accept-new",
-                "-N",
+                "-f",  // Go to background after authentication
+                "-N",  // No command (just keep connection)
                 host,
               ],
               {
                 env: { ...process.env, SSHPASS: password },
                 stdio: "ignore",
-                detached: true,
               }
             );
-            sshProc.unref();
 
-            // Wait briefly and check if connection was established
-            await new Promise((r) => setTimeout(r, 3000));
+            // Wait for sshpass+ssh to authenticate and exit
+            const exitCode = await new Promise<number>((resolve) => {
+              sshProc.on("exit", (code) => resolve(code ?? 1));
+              sshProc.on("error", () => resolve(1));
+              setTimeout(() => resolve(-1), 30_000); // 30s timeout
+            });
 
-            if (hasActiveConnection(host)) {
+            // Give ControlMaster a moment to set up the socket
+            await new Promise((r) => setTimeout(r, 1000));
+
+            if (exitCode === 0 || hasActiveConnection(host)) {
               ctx.ui.notify(`Connected to ${host}. Persistent session active (2h idle timeout).`, "info");
             } else {
-              ctx.ui.notify(`Connection to ${host} may have failed. Check password and try again.`, "error");
+              ctx.ui.notify(`Authentication failed for ${host} (exit ${exitCode}). Check password.`, "error");
             }
           } catch (e: any) {
             ctx.ui.notify(`Connection failed: ${e.message || e}`, "error");
