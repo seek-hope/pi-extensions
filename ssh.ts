@@ -126,7 +126,7 @@ export default function (pi: ExtensionAPI) {
             `    User ${user}`,
             `    ControlMaster auto`,
             `    ControlPath ${SOCKET_DIR}/${alias}.sock`,
-            `    ControlPersist 1h`,
+            `    ControlPersist 2h`,
             `    ServerAliveInterval 60`,
             `    ServerAliveCountMax 3`,
             "",
