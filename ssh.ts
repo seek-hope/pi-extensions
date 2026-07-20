@@ -175,6 +175,34 @@ export default function (pi: ExtensionAPI) {
   // Ensure socket directory exists
   if (!existsSync(SOCKET_DIR)) mkdirSync(SOCKET_DIR, { recursive: true });
 
+  // ── tool_call interceptor: force ssh_exec for remote commands ───────
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash") {
+      const cmd = ((event.input as any)?.command || "") as string;
+      // Detect ssh commands that should use ssh_exec
+      const sshPattern = /^\s*ssh\s+(?:-o\s+\S+\s+)*(?:-p\s+\d+\s+)?(?:\S+@)?\S+/;
+      if (sshPattern.test(cmd)) {
+        ctx.ui.notify(
+          "Use ssh_exec instead of raw ssh. It provides persistent connections and won't prompt for passwords. " +
+          "First ensure the user has connected: /ssh <host>",
+          "warning"
+        );
+        // Don't block — let the model learn. But the warning is persistent.
+      }
+      // Detect commands clearly targeting a known server
+      const knownHosts = ["lulab", "seetacloud", "autodl", "server", "lab"];
+      for (const host of knownHosts) {
+        if (cmd.includes(host) && !cmd.startsWith("ssh")) {
+          ctx.ui.notify(
+            `This looks like a command for ${host}. If it should run remotely, use ssh_exec after ensuring /ssh ${host} is connected.`,
+            "info"
+          );
+          break;
+        }
+      }
+    }
+  });
+
   // ── /ssh command ─────────────────────────────────────────────────────
   pi.registerCommand("ssh", {
     description:
@@ -224,7 +252,15 @@ export default function (pi: ExtensionAPI) {
     description:
       "Execute a command on a remote server via persistent SSH connection. " +
       "The user must have connected first via /ssh user@host. " +
-      "Credentials are handled via pi TUI — the AI never sees passwords.",
+      "Credentials are handled by the user interactively — the AI never sees passwords.",
+    promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
+    promptGuidelines: [
+      "MANDATORY: When the user asks you to run commands on a remote server (indicated by hostnames like 'lab', 'server', 'lulab', '4090', 'A800', IP addresses, or '/ssh' prefix), you MUST use ssh_exec instead of bash.",
+      "MANDATORY: Never use bash to run ssh commands directly (e.g., 'ssh root@host cmd'). Always use ssh_exec for remote execution.",
+      "MANDATORY: If no SSH connection exists, tell the user to run /ssh <host> first to open a persistent connection.",
+      "Use ssh_status to check which hosts are currently connected before running remote commands.",
+      "The SSH connection persists across pi sessions — if the user connected earlier, the connection is likely still active.",
+    ],
     parameters: Type.Object({
       host: Type.String({ description: "SSH host alias (configured via /ssh setup)" }),
       command: Type.String({ description: "Command to execute on the remote server" }),
@@ -273,6 +309,11 @@ export default function (pi: ExtensionAPI) {
     name: "ssh_status",
     label: "SSH Status",
     description: "Check which SSH hosts are configured and which have active persistent connections.",
+    promptSnippet: "Check active SSH connections before running remote commands.",
+    promptGuidelines: [
+      "Call ssh_status before running ssh_exec to verify the target host is connected.",
+      "If the host is not connected, tell the user: /ssh <host>",
+    ],
     parameters: Type.Object({}),
     async execute() {
       if (connections.size === 0) {
