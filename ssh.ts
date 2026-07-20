@@ -71,9 +71,12 @@ function syncFromDisk(): void {
         execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 3_000 });
         const key = keyFromFilename(name);
         if (![...connections.values()].some(c => c.socket === sock)) {
-          // Extract user@hostname as alias for SSH calls
-          const [userHost] = key.split(":");
-          connections.set(key, { key, alias: userHost, socket: sock, startTime: Date.now(), lastUse: Date.now(), sshTarget: userHost });
+          // Reconstruct SSH target from filename
+          const [userHost, portStr] = key.split(":");
+          const sshTarget = portStr && portStr !== "22"
+            ? `-p ${portStr} ${userHost}`
+            : userHost;
+          connections.set(key, { key, alias: userHost, socket: sock, startTime: Date.now(), lastUse: Date.now(), sshTarget });
         }
       } catch { /* socket not active */ }
     }
