@@ -253,6 +253,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
       "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
+      "MANDATORY: For long-running remote tasks (training, builds, downloads), wrap the command with nohup and redirect output: 'nohup CMD > /tmp/task.log 2>&1 & echo PID=$!'. Then use another ssh_exec to check progress via 'cat /tmp/task.log' or 'ps aux | grep PID'.",
       "Call ssh_status before running ssh_exec to verify the target host is connected.",
       "If no connection exists, tell the user: /ssh <host>",
     ],
