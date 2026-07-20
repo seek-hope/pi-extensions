@@ -143,22 +143,44 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
   }
 }
 
+// ── depth tracking ─────────────────────────────────────────────────────────
+
+const MAX_DEPTH = 5;
+
+function currentDepth(): number {
+  const d = parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10);
+  return isNaN(d) ? 0 : d;
+}
+
+function projectRoot(cwd: string): string {
+  return process.env.PI_SUBAGENT_ROOT || cwd;
+}
+
 // ── spawn sub-agent ─────────────────────────────────────────────────────────
 
 function spawnSubAgent(
   task: string,
-  projectRoot: string,
+  cwd: string,
   options?: {
     model?: string;
     tools?: string[];
     systemPrompt?: string;
   }
 ): { id: string; promise: Promise<string> } {
+  const depth = currentDepth();
+  if (depth >= MAX_DEPTH) {
+    const errMsg = `Sub-agent depth limit reached (depth=${depth}, max=${MAX_DEPTH}). Cannot spawn nested sub-agent.`;
+    return {
+      id: `sa-depth-limit-${Date.now()}`,
+      promise: Promise.resolve(`[Sub-agent denied] ${errMsg}`),
+    };
+  }
+
   const id = shortId();
   const startTime = Date.now();
 
-  // Ensure git repo and create worktree
-  const root = ensureGitRepo(projectRoot);
+  // Use original project root (set by top-level pi), not worktree cwd
+  const root = ensureGitRepo(projectRoot(cwd));
   let worktreePath: string;
   try {
     worktreePath = createWorktree(root, id);
@@ -197,7 +219,11 @@ function spawnSubAgent(
 
     const proc = spawn("pi", args, {
       cwd: worktreePath,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        PI_SUBAGENT_DEPTH: String(depth + 1),
+        PI_SUBAGENT_ROOT: root,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     agent.proc = proc;
