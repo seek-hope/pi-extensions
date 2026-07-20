@@ -397,8 +397,10 @@ async function connectToHost(
   alias: string, user: string, hostname: string, port: number,
   ctx: any, pi: ExtensionAPI
 ): Promise<void> {
+  // Socket exists from previous session → restore the in-memory record
   if (isConnected(key)) {
-    ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}.`, "info");
+    connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
+    ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}. Reusing persistent session.`, "info");
     return;
   }
 
@@ -474,6 +476,11 @@ async function runRemoteCommand(
   if (!isConnected(key)) {
     ctx.ui.notify(`No connection to ${user}@${hostname}:${port}. Connect first: /ssh ${user}@${hostname}`, "warning");
     return;
+  }
+
+  // Ensure in-memory record exists (may have been lost on restart)
+  if (!connections.has(key)) {
+    connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
   }
 
   ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
