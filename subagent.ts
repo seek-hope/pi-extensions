@@ -325,6 +325,14 @@ export default function (pi: ExtensionAPI) {
       "The sub-agent works independently; when done, its changes are committed to a branch. " +
       "Use subagent_review to inspect the diff, subagent_merge to accept, or subagent_reject to discard. " +
       "If the project has no git repo, one is created automatically.",
+    promptSnippet: "Spawn a sub-agent to handle a self-contained task in an isolated git worktree.",
+    promptGuidelines: [
+      "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
+      "Use subagent_spawn with model='gpt-4o-mini' for cheap, simple tasks like searching or reading files.",
+      "When a user asks for multiple independent changes, spawn a subagent for each one with subagent_parallel.",
+      "Always review sub-agent output with subagent_review before merging — never merge blindly.",
+      "After spawning, use subagent_wait to collect the result, then decide: subagent_merge or subagent_reject.",
+    ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
       model: Type.Optional(Type.String({ description: "Model override (e.g. 'gpt-4o-mini' for cheap tasks)" })),
@@ -590,6 +598,13 @@ export default function (pi: ExtensionAPI) {
       "Spawn multiple sub-agents in parallel git worktrees. " +
       "All work independently and commit to their own branches. " +
       "Returns all results. Review each with subagent_review before merging.",
+    promptSnippet: "Spawn multiple sub-agents in parallel for independent tasks — fan-out, then review.",
+    promptGuidelines: [
+      "Use subagent_parallel when the user asks for 3+ independent changes or searches.",
+      "Prefer subagent_parallel over sequential execution for independent tasks — it saves wall-clock time.",
+      "After all parallel sub-agents complete, review each result with subagent_review before merging.",
+      "For tasks that depend on each other, use subagent_chain instead.",
+    ],
     parameters: Type.Object({
       tasks: Type.String({ description: "JSON array of task strings" }),
       model: Type.Optional(Type.String({ description: "Model override" })),
@@ -654,6 +669,12 @@ export default function (pi: ExtensionAPI) {
     description:
       "Run sub-agents sequentially, each in its own worktree. " +
       "Each sub-agent receives the previous agent's output as context.",
+    promptSnippet: "Run sub-agents in sequence — each one builds on the previous output.",
+    promptGuidelines: [
+      "Use subagent_chain for multi-step pipelines: research → summarize, generate → review → refine.",
+      "Each step receives the previous step's output as context automatically.",
+      "Use subagent_chain when later steps depend on the output of earlier steps.",
+    ],
     parameters: Type.Object({
       tasks: Type.String({ description: "JSON array of task strings, executed in order" }),
       model: Type.Optional(Type.String({ description: "Model override" })),
