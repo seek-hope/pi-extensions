@@ -148,6 +148,7 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
 function connect(alias: string, user: string, hostname: string, port: number, ctx: any): void {
   const key = connKey(user, hostname, port);
   const sock = socketPath(key);
+  const sshTarget = alias !== hostname ? alias : `-p ${port} ${user}@${hostname}`;
 
   // Restore or connect
   if (isConnected(key)) {
@@ -157,11 +158,6 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   }
 
   ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
-
-  // Build SSH target: use alias if it differs from hostname (SSH config), else user@hostname
-  const sshTarget = alias !== hostname
-    ? alias  // SSH config alias (includes port/identity via config)
-    : `-p ${port} ${user}@${hostname}`;  // Explicit port + user
 
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
   spawn("alacritty", ["-e", "bash", "-c",
