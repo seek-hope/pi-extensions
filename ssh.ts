@@ -283,20 +283,59 @@ export default function (pi: ExtensionAPI) {
       const cmd = params.command;
       const timeout = Math.min(params.timeout || 60_000, 300_000);
 
-      // Find matching connection
+      // Flexible matching: find connection by any recognizable part
       let found: Connection | undefined;
       for (const [key, conn] of connections) {
-        if (conn.host === host || key === host || conn.host.includes(host) || key.includes(host)) {
+        // Extract components from stored key (user@hostname:port)
+        const [userHost, portStr] = conn.host.split(":");
+        const [user, connHost] = userHost.includes("@")
+          ? userHost.split("@")
+          : ["", userHost];
+
+        const search = host.toLowerCase();
+        if (
+          conn.host === search ||
+          key === search ||
+          conn.host.toLowerCase().includes(search) ||
+          connHost.toLowerCase().includes(search) ||
+          (user && user.toLowerCase().includes(search))
+        ) {
           found = conn;
           break;
         }
       }
 
-      if (!found || !isConnected(found.host)) {
+      // If not found by substring, try matching by socket existence
+      if (!found) {
+        for (const [key, conn] of connections) {
+          if (existsSync(conn.socket) && isConnected(key)) {
+            found = conn;
+            break;
+          }
+        }
+      }
+
+      if (!found) {
+        // List available connections in error
+        const available = [...connections.keys()].join(", ") || "none";
         return {
           content: [{
             type: "text",
-            text: `No active connection to "${host}". The user needs to run: /ssh ${host}`,
+            text: `No active SSH connection matching "${host}".\n` +
+              `Available connections: ${available}\n` +
+              `Connect first: /ssh <host>`,
+          }],
+          details: {},
+          isError: true,
+        };
+      }
+
+      if (!isConnected(found.host)) {
+        connections.delete(found.host);
+        return {
+          content: [{
+            type: "text",
+            text: `Connection to ${found.host} is stale. Reconnect with: /ssh ${found.host}`,
           }],
           details: {},
           isError: true,
@@ -304,8 +343,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
+        const [userHost] = found.host.split(":");
         const result = execSync(
-          `ssh -o ControlPath="${found.socket}" -o ConnectTimeout=5 "${found.host.split(":")[0]}" '${cmd.replace(/'/g, "'\\''")}'`,
+          `ssh -o ControlPath="${found.socket}" -o ConnectTimeout=5 "${userHost}" '${cmd.replace(/'/g, "'\\''")}'`,
           { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
         );
         found.lastUse = Date.now();
