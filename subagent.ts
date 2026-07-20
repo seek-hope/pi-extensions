@@ -210,7 +210,6 @@ function spawnSubAgent(
       "-p",
       "--no-context-files",
       "--no-session",
-      "--cwd", worktreePath,
     ];
     if (options?.model) args.push("--model", options.model);
     if (options?.tools) args.push("--tools", options.tools.join(","));
