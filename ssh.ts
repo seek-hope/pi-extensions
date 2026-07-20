@@ -55,13 +55,54 @@ function isConnected(key: string): boolean {
   }
 }
 
-// ── parse SSH args ─────────────────────────────────────────────────────────
+// ── parse SSH args + resolve via ssh config ────────────────────────────────
 
-function parseSshArgs(args: string): { user: string; hostname: string; port: number; command: string } | null {
+interface SshTarget {
+  alias: string;       // Original input (can be host alias from config)
+  user: string;
+  hostname: string;    // Resolved hostname (from config or input)
+  port: number;
+  command: string;
+}
+
+/** Resolve host config via ssh -G. Returns null if no match. */
+function resolveSshConfig(host: string): { user: string; hostname: string; port: number } | null {
+  try {
+    const out = execSync(`ssh -G "${host}"`, {
+      encoding: "utf-8", stdio: "pipe", timeout: 5_000,
+    });
+    const config: Record<string, string> = {};
+    for (const line of out.split("\n")) {
+      const idx = line.indexOf(" ");
+      if (idx > 0) config[line.substring(0, idx)] = line.substring(idx + 1);
+    }
+    // Only return if ssh -G resolved to a DIFFERENT hostname (config entry exists)
+    if (config["hostname"] && config["hostname"] !== host) {
+      return {
+        user: config["user"] || "root",
+        hostname: config["hostname"],
+        port: parseInt(config["port"] || "22", 10),
+      };
+    }
+    // Check if port was overridden
+    if (config["port"] && config["port"] !== "22") {
+      return {
+        user: config["user"] || "root",
+        hostname: host,
+        port: parseInt(config["port"], 10),
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseSshArgs(args: string): SshTarget | null {
   const parts = args.trim().split(/\s+/);
-  let user = "root";
+  let user = "";
   let hostname = "";
-  let port = 22;
+  let port = 0;
   let command = "";
   let i = 0;
 
@@ -71,27 +112,23 @@ function parseSshArgs(args: string): { user: string; hostname: string; port: num
       port = parseInt(parts[i + 1], 10);
       i += 2;
     } else if (p.startsWith("-")) {
-      // Skip unknown flags
       if (i + 1 < parts.length && !parts[i + 1].startsWith("-")) i += 2;
       else i += 1;
     } else if (p.includes("@")) {
-      // user@host or user@host:port
       const [u, h] = p.split("@");
       user = u;
       if (h.includes(":")) {
         const [hn, pt] = h.split(":");
         hostname = hn;
-        port = parseInt(pt, 10);
+        port = port || parseInt(pt, 10);
       } else {
         hostname = h;
       }
-      // Everything after is the command
       if (i + 1 < parts.length) {
         command = parts.slice(i + 1).join(" ");
       }
-      i = parts.length; // done parsing
+      i = parts.length;
     } else {
-      // Just a hostname (no @)
       hostname = p;
       if (i + 1 < parts.length) {
         command = parts.slice(i + 1).join(" ");
@@ -101,7 +138,22 @@ function parseSshArgs(args: string): { user: string; hostname: string; port: num
   }
 
   if (!hostname) return null;
-  return { user, hostname, port, command };
+
+  // Resolve via SSH config: use the input as host alias
+  const resolved = resolveSshConfig(hostname);
+  if (resolved) {
+    if (!user) user = resolved.user;
+    hostname = resolved.hostname;
+    if (!port) port = resolved.port;
+  }
+
+  return {
+    alias: hostname,  // Original alias for SSH (SSH will resolve via config)
+    user: user || "root",
+    hostname: resolved?.hostname || hostname,
+    port: port || resolved?.port || 22,
+    command,
+  };
 }
 
 // ── sh helper ───────────────────────────────────────────────────────────────
@@ -148,16 +200,16 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const { user, hostname, port, command } = parsed;
+      const { alias, user, hostname, port, command } = parsed;
       const key = connKey(user, hostname, port);
       const socket = getSocket(key);
 
       if (command) {
         // Execute command on remote
-        await runRemoteCommand(key, socket, command, user, hostname, port, ctx);
+        await runRemoteCommand(key, socket, command, alias, user, hostname, port, ctx);
       } else {
         // Connect (open persistent connection)
-        await connectToHost(key, socket, user, hostname, port, ctx, pi);
+        await connectToHost(key, socket, alias, user, hostname, port, ctx, pi);
       }
     },
   });
@@ -246,7 +298,7 @@ export default function (pi: ExtensionAPI) {
 
 async function connectToHost(
   key: string, socket: string,
-  user: string, hostname: string, port: number,
+  alias: string, user: string, hostname: string, port: number,
   ctx: any, pi: ExtensionAPI
 ): Promise<void> {
   if (isConnected(key)) {
@@ -261,7 +313,8 @@ async function connectToHost(
     "info"
   );
 
-  // Build the SSH command
+  // Build the SSH command — use alias so SSH resolves config (Host pattern matching)
+  const sshTarget = (alias !== hostname) ? alias : `${user}@${hostname}`;
   const sshArgs = [
     "-e", "bash", "-c",
     [
@@ -274,10 +327,8 @@ async function connectToHost(
       "-o", "ServerAliveInterval=60",
       "-o", "ServerAliveCountMax=5",
       "-o", "StrictHostKeyChecking=accept-new",
-      "-f",  // Go to background after authentication
-      "-N",  // No command, just keep connection
-      "-p", String(port),
-      `${user}@${hostname}`,
+      "-f", "-N",
+      sshTarget,
       "&&",
       "echo", `"Connected! You may close this window."`,
       "||",
@@ -316,7 +367,7 @@ async function connectToHost(
 
 async function runRemoteCommand(
   key: string, socket: string, command: string,
-  user: string, hostname: string, port: number,
+  alias: string, user: string, hostname: string, port: number,
   ctx: any
 ): Promise<void> {
   if (!isConnected(key)) {
@@ -327,7 +378,7 @@ async function runRemoteCommand(
   ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
 
   const result = sh(
-    `ssh -o ControlPath="${socket}" -o ConnectTimeout=5 "${user}@${hostname}" '${command.replace(/'/g, "'\\''")}'`,
+    `ssh -o ControlPath="${socket}" -o ConnectTimeout=5 "${alias}" '${command.replace(/'/g, "'\\''")}'`,
     120_000
   );
 
