@@ -1,42 +1,112 @@
 /**
- * SSH extension — persistent multiplexed connections for remote server operations.
+ * SSH extension — persistent multiplexed connections, standard SSH syntax.
  *
  * Security:
- *   - Passwords/private-key passphrases are entered interactively by the user
- *     via a terminal prompt — the AI NEVER sees credentials.
- *   - SSH ControlMaster multiplexes sessions: one authentication → many commands.
+ *   - Passwords are collected via pi TUI overlay — the AI NEVER sees credentials.
+ *   - ControlMaster multiplexes sessions: one authentication → many commands.
  *
- * Efficiency:
- *   - ControlPersist keeps the connection alive for 1 hour.
- *   - All commands reuse the same TCP connection (no repeated handshakes).
+ * Usage (same as standard ssh):
+ *   /ssh root@host                        connect to host:22
+ *   /ssh -p 50159 root@host               connect to host:50159
+ *   /ssh root@host "ls /data"             run command via persistent connection
+ *   /ssh status                           show active connections
+ *   /ssh close root@host                  close connection to host
  *
- * Commands:
- *   /ssh setup <host> <hostname> [user]  — configure a persistent host
- *   /ssh connect <host>                  — open persistent connection
- *   /ssh <host> <command>                — run command via persistent connection
- *   /ssh status                          — show active connections
- *   /ssh close <host>                    — close persistent connection
+ * No ~/.ssh/config modifications. All connection state in memory.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { Container, Text, matchesKey, Key } from "@earendil-works/pi-tui";
 
-// ── config ──────────────────────────────────────────────────────────────────
+// ── connection state (in-memory only, no config file) ──────────────────────
 
-const SSH_DIR = join(homedir(), ".ssh");
-const SOCKET_DIR = join(SSH_DIR, "sockets");
-const CONFIG_FILE = join(SSH_DIR, "config");
-const PI_MARKER = "# [pi-ssh-managed]";
+const SOCKET_DIR = join(homedir(), ".ssh", "pi-sockets");
 
-// Ensure socket directory exists
-if (!existsSync(SOCKET_DIR)) mkdirSync(SOCKET_DIR, { recursive: true });
+interface Connection {
+  host: string;       // "root@host:port"
+  socket: string;     // path to ControlMaster socket
+  startTime: number;
+  lastUse: number;
+}
 
-// ── helpers ─────────────────────────────────────────────────────────────────
+const connections = new Map<string, Connection>();
+
+function connKey(user: string, hostname: string, port: number): string {
+  return `${user}@${hostname}:${port}`;
+}
+
+function getSocket(key: string): string {
+  return join(SOCKET_DIR, `${key.replace(/[@:]/g, "_")}.sock`);
+}
+
+function isConnected(key: string): boolean {
+  const socket = getSocket(key);
+  if (!existsSync(socket)) return false;
+  try {
+    execSync(`ssh -O check -o ControlPath="${socket}" dummy 2>&1`, {
+      encoding: "utf-8", stdio: "pipe", timeout: 5_000,
+    });
+    return true;
+  } catch (e: any) {
+    return e.stdout?.includes("Master running") || e.stderr?.includes("Master running") || false;
+  }
+}
+
+// ── parse SSH args ─────────────────────────────────────────────────────────
+
+function parseSshArgs(args: string): { user: string; hostname: string; port: number; command: string } | null {
+  const parts = args.trim().split(/\s+/);
+  let user = "root";
+  let hostname = "";
+  let port = 22;
+  let command = "";
+  let i = 0;
+
+  while (i < parts.length) {
+    const p = parts[i];
+    if (p === "-p" && i + 1 < parts.length) {
+      port = parseInt(parts[i + 1], 10);
+      i += 2;
+    } else if (p.startsWith("-")) {
+      // Skip unknown flags
+      if (i + 1 < parts.length && !parts[i + 1].startsWith("-")) i += 2;
+      else i += 1;
+    } else if (p.includes("@")) {
+      // user@host or user@host:port
+      const [u, h] = p.split("@");
+      user = u;
+      if (h.includes(":")) {
+        const [hn, pt] = h.split(":");
+        hostname = hn;
+        port = parseInt(pt, 10);
+      } else {
+        hostname = h;
+      }
+      // Everything after is the command
+      if (i + 1 < parts.length) {
+        command = parts.slice(i + 1).join(" ");
+      }
+      i = parts.length; // done parsing
+    } else {
+      // Just a hostname (no @)
+      hostname = p;
+      if (i + 1 < parts.length) {
+        command = parts.slice(i + 1).join(" ");
+      }
+      i = parts.length;
+    }
+  }
+
+  if (!hostname) return null;
+  return { user, hostname, port, command };
+}
+
+// ── sh helper ───────────────────────────────────────────────────────────────
 
 function sh(cmd: string, timeout = 30_000): string {
   try {
@@ -46,297 +116,62 @@ function sh(cmd: string, timeout = 30_000): string {
   }
 }
 
-interface SshHost {
-  alias: string;
-  hostname: string;
-  user: string;
-}
-
-function parseSshConfig(): SshHost[] {
-  const hosts: SshHost[] = [];
-  if (!existsSync(CONFIG_FILE)) return hosts;
-
-  const content = readFileSync(CONFIG_FILE, "utf-8");
-  const lines = content.split("\n");
-  let current: Partial<SshHost> = {};
-  let inPiBlock = false;
-
-  for (const line of lines) {
-    if (line.trim() === PI_MARKER) {
-      inPiBlock = true;
-      continue;
-    }
-    if (inPiBlock && line.trim().startsWith("Host ") && current.alias) {
-      if (current.hostname && current.user) {
-        hosts.push(current as SshHost);
-      }
-      current = {};
-    }
-    if (inPiBlock) {
-      const hostMatch = line.trim().match(/^Host\s+(.+)/);
-      if (hostMatch) {
-        if (current.alias && current.hostname) {
-          hosts.push(current as SshHost);
-        }
-        current = { alias: hostMatch[1] };
-      }
-      const hnMatch = line.trim().match(/^\s*HostName\s+(.+)/);
-      if (hnMatch) current.hostname = hnMatch[1];
-      const userMatch = line.trim().match(/^\s*User\s+(.+)/);
-      if (userMatch) current.user = userMatch[1];
-    }
-  }
-  if (current.alias && current.hostname && current.user) {
-    hosts.push(current as SshHost);
-  }
-  return hosts;
-}
-
-function hasActiveConnection(host: string): boolean {
-  const socket = join(SOCKET_DIR, `${host}.sock`);
-  if (!existsSync(socket)) return false;
-  const out = sh(`ssh -O check -o ControlPath="${socket}" "${host}" 2>&1`);
-  return out.includes("Master running");
-}
-
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // ── /ssh command ──────────────────────────────────────────────────────
+  // Ensure socket directory exists
+  if (!existsSync(SOCKET_DIR)) mkdirSync(SOCKET_DIR, { recursive: true });
+
+  // ── /ssh command ─────────────────────────────────────────────────────
   pi.registerCommand("ssh", {
-    description: "Manage persistent SSH connections. /ssh <host> <cmd> to run remotely.",
+    description:
+      "SSH with persistent connections. Same syntax as standard ssh. " +
+      "/ssh -p PORT user@host [command]",
     handler: async (args, ctx) => {
-      const parts = (args || "").trim().split(/\s+/);
-      const subcmd = parts[0];
-      const rest = parts.slice(1);
+      if (!args || !args.trim()) {
+        ctx.ui.notify("Usage: /ssh [-p PORT] user@host [command]  |  /ssh status  |  /ssh close user@host", "warning");
+        return;
+      }
 
-      switch (subcmd) {
-        case "setup": {
-          if (rest.length < 2) {
-            ctx.ui.notify("Usage: /ssh setup <alias> <hostname> [user]", "warning");
-            return;
-          }
-          const alias = rest[0];
-          const hostname = rest[1];
-          const user = rest[2] || "root";
+      // Special subcommands
+      if (args.trim() === "status" || args.trim().startsWith("status ")) {
+        showStatus(ctx);
+        return;
+      }
+      if (args.trim().startsWith("close ")) {
+        const target = args.trim().slice(6).trim();
+        closeConnection(target, ctx);
+        return;
+      }
 
-          // Add to ~/.ssh/config with ControlMaster
-          const block = [
-            PI_MARKER,
-            `Host ${alias}`,
-            `    HostName ${hostname}`,
-            `    User ${user}`,
-            `    ControlMaster auto`,
-            `    ControlPath ${SOCKET_DIR}/${alias}.sock`,
-            `    ControlPersist 2h`,
-            `    ServerAliveInterval 60`,
-            `    ServerAliveCountMax 5`,
-            "",
-          ].join("\n");
+      const parsed = parseSshArgs(args);
+      if (!parsed) {
+        ctx.ui.notify("Invalid SSH syntax. Usage: /ssh [-p PORT] user@host [command]", "error");
+        return;
+      }
 
-          // Check if already configured
-          const existing = existsSync(CONFIG_FILE) ? readFileSync(CONFIG_FILE, "utf-8") : "";
-          if (existing.includes(`Host ${alias}`) && existing.includes(PI_MARKER)) {
-            ctx.ui.notify(`Host ${alias} already configured. Use /ssh connect ${alias}.`, "info");
-            return;
-          }
+      const { user, hostname, port, command } = parsed;
+      const key = connKey(user, hostname, port);
+      const socket = getSocket(key);
 
-          appendFileSync(CONFIG_FILE, "\n" + block);
-          ctx.ui.notify(`Host ${alias} configured (${user}@${hostname}). /ssh connect ${alias} to open connection.`, "info");
-          return;
-        }
-
-        case "connect": {
-          if (rest.length < 1) {
-            ctx.ui.notify("Usage: /ssh connect <alias>", "warning");
-            return;
-          }
-          const host = rest[0];
-          const hosts = parseSshConfig();
-          const cfg = hosts.find((h) => h.alias === host);
-
-          if (!cfg) {
-            ctx.ui.notify(`Host ${host} not configured. Use /ssh setup ${host} <hostname> [user] first.`, "error");
-            return;
-          }
-
-          if (hasActiveConnection(host)) {
-            ctx.ui.notify(`Already connected to ${host}.`, "info");
-            return;
-          }
-
-          ctx.ui.notify(`Connecting to ${host} (${cfg.user}@${cfg.hostname})...`, "info");
-
-          const socket = join(SOCKET_DIR, `${host}.sock`);
-
-          // Collect password securely via pi TUI component (AI never sees it)
-          const password = await ctx.ui.custom<string>((tui, theme, _kb, done) => {
-            let input = "";
-
-            const container = new Container();
-            container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-            container.addChild(new Text(theme.fg("accent", theme.bold(` SSH: ${cfg.user}@${cfg.hostname}:${cfg.hostname?.includes(":") ? "" : "50159"}`)), 1, 0));
-            container.addChild(new Text("", 0, 0));
-            container.addChild(new Text("Password (input hidden):", 1, 0));
-            container.addChild(new Text(theme.fg("dim", "  (type password and press Enter, Esc to cancel)"), 1, 0));
-            container.addChild(new Text("", 0, 0));
-
-            const asterisks = () => "  " + "●".repeat(input.length);
-
-            return {
-              render: (w: number) => {
-                const lines = container.render(w);
-                lines.push(asterisks());
-                return lines;
-              },
-              invalidate: () => container.invalidate(),
-              handleInput: (data: string) => {
-                if (matchesKey(data, Key.escape)) {
-                  done(""); // Cancelled
-                  return;
-                }
-                if (matchesKey(data, Key.enter)) {
-                  done(input); // Submit
-                  return;
-                }
-                if (matchesKey(data, Key.backspace)) {
-                  input = input.slice(0, -1);
-                } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
-                  input += data;
-                }
-                tui.requestRender();
-              },
-            };
-          }, { overlay: true });
-
-          if (!password) {
-            ctx.ui.notify("Connection cancelled.", "warning");
-            return;
-          }
-
-          // Use sshpass with the collected password (via env, not command line)
-          ctx.ui.notify("Authenticating...", "info");
-
-          try {
-            // Start SSH in background with ControlMaster
-            // ssh -N stays alive as the connection master; sshpass exits after auth
-            const sshProc = spawn(
-              "sshpass", ["-e", "ssh",
-                "-o", `ControlPath=${socket}`,
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-f",  // Go to background after authentication
-                "-N",  // No command (just keep connection)
-                host,
-              ],
-              {
-                env: { ...process.env, SSHPASS: password },
-                stdio: "ignore",
-              }
-            );
-
-            // Wait for sshpass+ssh to authenticate and exit
-            const exitCode = await new Promise<number>((resolve) => {
-              sshProc.on("exit", (code) => resolve(code ?? 1));
-              sshProc.on("error", () => resolve(1));
-              setTimeout(() => resolve(-1), 30_000); // 30s timeout
-            });
-
-            // Give ControlMaster a moment to set up the socket
-            await new Promise((r) => setTimeout(r, 1000));
-
-            if (exitCode === 0 || hasActiveConnection(host)) {
-              ctx.ui.notify(`Connected to ${host}. Persistent session active (2h idle timeout).`, "info");
-            } else {
-              ctx.ui.notify(`Authentication failed for ${host} (exit ${exitCode}). Check password.`, "error");
-            }
-          } catch (e: any) {
-            ctx.ui.notify(`Connection failed: ${e.message || e}`, "error");
-          }
-          return;
-        }
-
-        case "status": {
-          const hosts = parseSshConfig();
-          if (hosts.length === 0) {
-            ctx.ui.notify("No SSH hosts configured. Use /ssh setup <alias> <hostname> [user].", "info");
-            return;
-          }
-
-          const lines = ["SSH Connections:"];
-          for (const h of hosts) {
-            const active = hasActiveConnection(h.alias);
-            lines.push(`  ${active ? "🟢" : "⚫"} ${h.alias}: ${h.user}@${h.hostname} ${active ? "(connected)" : ""}`);
-          }
-
-          // Also list active tmux SSH sessions
-          const tmuxSessions = sh("tmux list-sessions 2>/dev/null | grep pi-bg || true");
-          if (tmuxSessions) {
-            lines.push("");
-            lines.push("Background tasks (tmux):");
-            for (const l of tmuxSessions.split("\n")) {
-              if (l.trim()) lines.push(`  ${l}`);
-            }
-          }
-
-          ctx.ui.setWidget("ssh-status", lines.map((l) => `│ ${l}`));
-          return;
-        }
-
-        case "close": {
-          if (rest.length < 1) {
-            ctx.ui.notify("Usage: /ssh close <alias>", "warning");
-            return;
-          }
-          const host = rest[0];
-          if (!hasActiveConnection(host)) {
-            ctx.ui.notify(`No active connection to ${host}.`, "info");
-            return;
-          }
-
-          sh(`ssh -O exit -o ControlPath="${SOCKET_DIR}/${host}.sock" "${host}" 2>/dev/null`);
-          ctx.ui.notify(`Connection to ${host} closed.`, "info");
-          return;
-        }
-
-        default: {
-          // Treat as: /ssh <host> <command...>
-          const host = subcmd;
-          const command = rest.join(" ");
-          if (!command) {
-            ctx.ui.notify("Usage: /ssh <host> <command>", "warning");
-            return;
-          }
-
-          const hosts = parseSshConfig();
-          if (!hosts.find((h) => h.alias === host)) {
-            ctx.ui.notify(`Host ${host} not configured. /ssh setup ${host} <hostname> [user]`, "error");
-            return;
-          }
-
-          if (!hasActiveConnection(host)) {
-            ctx.ui.notify(`No active connection to ${host}. Run /ssh connect ${host} first.`, "warning");
-            return;
-          }
-
-          const result = sh(`ssh -o ControlPath="${SOCKET_DIR}/${host}.sock" "${host}" '${command.replace(/'/g, "'\\''")}'`, 120_000);
-          ctx.ui.setWidget("ssh-result-" + host, [
-            `┌─ ${host}: ${command.substring(0, 50)} ──────`,
-            ...result.split("\n").slice(0, 40).map((l: string) => `│ ${l.substring(0, 80)}`),
-            `└─────────────────────────────────────────`,
-          ]);
-        }
+      if (command) {
+        // Execute command on remote
+        await runRemoteCommand(key, socket, command, user, hostname, port, ctx);
+      } else {
+        // Connect (open persistent connection)
+        await connectToHost(key, socket, user, hostname, port, ctx, pi);
       }
     },
   });
 
-  // ── ssh_exec tool (AI can use) ────────────────────────────────────────
+  // ── ssh_exec tool (AI can use) ──────────────────────────────────────
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH Execute",
     description:
       "Execute a command on a remote server via persistent SSH connection. " +
-      "The user must have set up the host with /ssh setup and /ssh connect first. " +
-      "Credentials are handled by the user interactively — the AI never sees passwords.",
+      "The user must have connected first via /ssh user@host. " +
+      "Credentials are handled via pi TUI — the AI never sees passwords.",
     parameters: Type.Object({
       host: Type.String({ description: "SSH host alias (configured via /ssh setup)" }),
       command: Type.String({ description: "Command to execute on the remote server" }),
@@ -347,12 +182,20 @@ export default function (pi: ExtensionAPI) {
       const cmd = params.command;
       const timeout = Math.min(params.timeout || 60_000, 300_000);
 
-      const socket = join(SOCKET_DIR, `${host}.sock`);
-      if (!existsSync(socket)) {
+      // Find matching connection
+      let found: Connection | undefined;
+      for (const [key, conn] of connections) {
+        if (conn.host === host || key === host || conn.host.includes(host) || key.includes(host)) {
+          found = conn;
+          break;
+        }
+      }
+
+      if (!found || !isConnected(found.host)) {
         return {
           content: [{
             type: "text",
-            text: `No persistent connection to ${host}. The user needs to run: /ssh connect ${host}`,
+            text: `No active connection to "${host}". The user needs to run: /ssh ${host}`,
           }],
           details: {},
           isError: true,
@@ -361,22 +204,12 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const result = execSync(
-          `ssh -o ControlPath="${socket}" -o ConnectTimeout=5 "${host}" '${cmd.replace(/'/g, "'\\''")}'`,
+          `ssh -o ControlPath="${found.socket}" -o ConnectTimeout=5 "${found.host.split(":")[0]}" '${cmd.replace(/'/g, "'\\''")}'`,
           { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
         );
+        found.lastUse = Date.now();
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (e: any) {
-        // Check if connection died
-        if (e.stderr?.includes("Connection refused") || e.stderr?.includes("No such file")) {
-          return {
-            content: [{
-              type: "text",
-              text: `SSH connection to ${host} lost. The user needs to run: /ssh connect ${host}\n\nError: ${e.stderr || e.message}`,
-            }],
-            details: {},
-            isError: true,
-          };
-        }
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
       }
     },
@@ -389,31 +222,188 @@ export default function (pi: ExtensionAPI) {
     description: "Check which SSH hosts are configured and which have active persistent connections.",
     parameters: Type.Object({}),
     async execute() {
-      const hosts = parseSshConfig();
-      if (hosts.length === 0) {
+      if (connections.size === 0) {
         return {
-          content: [{ type: "text", text: "No SSH hosts configured. Use /ssh setup <alias> <hostname> [user]." }],
+          content: [{ type: "text", text: "No SSH connections. Use /ssh user@host to connect." }],
           details: {},
         };
       }
-
-      const lines = ["SSH Hosts:"];
-      for (const h of hosts) {
-        const active = hasActiveConnection(h.alias);
-        lines.push(`  ${active ? "🟢" : "⚫"} ${h.alias}: ${h.user}@${h.hostname} ${active ? "(connected)" : "(disconnected)"}`);
+      const lines = ["Active SSH connections:"];
+      for (const [key, c] of connections) {
+        const active = isConnected(key);
+        const elapsed = ((Date.now() - c.startTime) / 60000).toFixed(0);
+        lines.push(`  ${active ? "🟢" : "⚫"} ${c.host} (${elapsed} min)`);
       }
-      lines.push("");
-      lines.push("Connect: /ssh connect <alias>");
-      lines.push("Execute: /ssh <alias> <command>");
-      lines.push("Close:   /ssh close <alias>");
-
       return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
     },
   });
 
-  // ── session_shutdown cleanup ────────────────────────────────────────
+  // ── session_shutdown (keep connections alive across sessions) ────────
   pi.on("session_shutdown", () => {
-    // Don't close SSH connections — they're persistent across sessions
-    // ControlPersist 1h handles idle timeout
+    // Don't close connections — they persist across pi sessions
   });
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+async function connectToHost(
+  key: string, socket: string,
+  user: string, hostname: string, port: number,
+  ctx: any, pi: ExtensionAPI
+): Promise<void> {
+  if (isConnected(key)) {
+    ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}.`, "info");
+    return;
+  }
+
+  // Collect password via pi TUI overlay (AI never sees it)
+  const password = await ctx.ui.custom<string>((tui, theme, _kb, done) => {
+    let input = "";
+
+    const container = new Container();
+    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new Text(
+      theme.fg("accent", theme.bold(` SSH: ${user}@${hostname}:${port}`)), 1, 0
+    ));
+    container.addChild(new Text("", 0, 0));
+    container.addChild(new Text("Password (input hidden):", 1, 0));
+    container.addChild(new Text(theme.fg("dim", "  (Enter to submit, Esc to cancel)"), 1, 0));
+    container.addChild(new Text("", 0, 0));
+
+    return {
+      render: (w: number) => {
+        const lines = container.render(w);
+        lines.push("  " + "●".repeat(input.length));
+        return lines;
+      },
+      invalidate: () => container.invalidate(),
+      handleInput: (data: string) => {
+        if (matchesKey(data, Key.escape)) { done(""); return; }
+        if (matchesKey(data, Key.enter)) { done(input); return; }
+        if (matchesKey(data, Key.backspace)) { input = input.slice(0, -1); }
+        else if (data.length === 1 && data.charCodeAt(0) >= 32) { input += data; }
+        tui.requestRender();
+      },
+    };
+  }, { overlay: true });
+
+  if (!password) {
+    ctx.ui.notify("Cancelled.", "warning");
+    return;
+  }
+
+  ctx.ui.notify(`Connecting to ${user}@${hostname}:${port}...`, "info");
+
+  try {
+    const sshProc = spawn(
+      "sshpass", ["-e", "ssh",
+        "-o", `ControlPath=${socket}`,
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=2h",
+        "-o", "ServerAliveInterval=60",
+        "-o", "ServerAliveCountMax=5",
+        "-f", "-N",
+        "-p", String(port),
+        `${user}@${hostname}`,
+      ],
+      {
+        env: { ...process.env, SSHPASS: password },
+        stdio: "ignore",
+      }
+    );
+
+    const exitCode = await new Promise<number>((resolve) => {
+      sshProc.on("exit", (code) => resolve(code ?? 1));
+      sshProc.on("error", () => resolve(1));
+      setTimeout(() => resolve(-1), 30_000);
+    });
+
+    await new Promise((r) => setTimeout(r, 1000));
+
+    if (exitCode === 0 || isConnected(key)) {
+      connections.set(key, {
+        host: key,
+        socket,
+        startTime: Date.now(),
+        lastUse: Date.now(),
+      });
+      ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
+    } else {
+      ctx.ui.notify(`Auth failed (exit ${exitCode}). Check password.`, "error");
+    }
+  } catch (e: any) {
+    ctx.ui.notify(`Connection failed: ${e.message || e}`, "error");
+  }
+}
+
+async function runRemoteCommand(
+  key: string, socket: string, command: string,
+  user: string, hostname: string, port: number,
+  ctx: any
+): Promise<void> {
+  if (!isConnected(key)) {
+    ctx.ui.notify(`No connection to ${user}@${hostname}:${port}. Connect first: /ssh ${user}@${hostname}`, "warning");
+    return;
+  }
+
+  ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
+
+  const result = sh(
+    `ssh -o ControlPath="${socket}" -o ConnectTimeout=5 "${user}@${hostname}" '${command.replace(/'/g, "'\\''")}'`,
+    120_000
+  );
+
+  ctx.ui.setStatus("ssh-" + key, "");
+
+  connections.get(key)!.lastUse = Date.now();
+
+  ctx.ui.setWidget("ssh-result", [
+    `┌─ ${user}@${hostname}:${port} ─────────────────────`,
+    `│ ${command.substring(0, 60)}`,
+    `├──────────────────────────────────────────`,
+    ...result.split("\n").slice(0, 40).map((l: string) => `│ ${l.substring(0, 80)}`),
+    result.split("\n").length > 40 ? `│ ... (${result.split("\n").length - 40} more lines)` : "",
+    `└──────────────────────────────────────────`,
+  ].filter(Boolean));
+}
+
+function showStatus(ctx: any): void {
+  if (connections.size === 0) {
+    ctx.ui.notify("No active SSH connections.", "info");
+    return;
+  }
+
+  const lines = ["SSH Connections:"];
+  for (const [key, c] of connections) {
+    const active = isConnected(key);
+    const elapsed = ((Date.now() - c.startTime) / 60000).toFixed(0);
+    lines.push(`  ${active ? "🟢" : "⚫"} ${c.host} (${elapsed} min)`);
+  }
+  lines.push("");
+  lines.push("Close: /ssh close <user@host>");
+
+  ctx.ui.setWidget("ssh-status", lines.map((l) => `│ ${l}`));
+}
+
+function closeConnection(target: string, ctx: any): void {
+  // Find matching connection
+  let found: string | undefined;
+  for (const [key, conn] of connections) {
+    if (conn.host.includes(target) || key.includes(target) || conn.host === target) {
+      found = key;
+      break;
+    }
+  }
+
+  if (!found) {
+    ctx.ui.notify(`No connection matching "${target}". /ssh status to see active connections.`, "error");
+    return;
+  }
+
+  const conn = connections.get(found)!;
+  sh(`ssh -O exit -o ControlPath="${conn.socket}" dummy 2>/dev/null`);
+  try { rmSync(conn.socket); } catch { /* ok */ }
+  connections.delete(found);
+  ctx.ui.notify(`Closed connection to ${conn.host}.`, "info");
 }
