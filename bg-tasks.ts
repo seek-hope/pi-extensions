@@ -252,6 +252,8 @@ export default function (pi: ExtensionAPI) {
     }),
     promptGuidelines: [
       "Use bg_spawn for long-running tasks (builds, downloads, data processing, training) so the user can continue chatting.",
+      "CRITICAL: If a bash command or sub-agent task is expected to take >300 seconds, use bg_spawn instead of running it in the foreground.",
+      "When using subagent_spawn for tasks expected to take >5 minutes, set a timeout and suggest the user check back with /jobs.",
       "Tell the user they can check progress with /jobs and view results with /fg.",
       "For code changes that need review, use subagent_spawn instead — bg_spawn is for fire-and-forget work.",
     ],
