@@ -163,25 +163,38 @@ export default function (pi: ExtensionAPI) {
             return;
           }
 
-          ctx.ui.notify(`Connecting to ${host} (${cfg.user}@${cfg.hostname})... Enter password/passphrase when prompted.`, "info");
+          ctx.ui.notify(`Connecting to ${host} (${cfg.user}@${cfg.hostname})...`, "info");
+          ctx.ui.notify(`A tmux window will open. Enter your password, then detach with Ctrl+B D.`, "info");
 
-          // Open connection in foreground so user can enter password
-          // Use -N (no command) and -f (background after auth) for ControlPersist
-          const proc = spawn("ssh", [
-            "-o", `ControlPath=${SOCKET_DIR}/${host}.sock`,
-            "-N", // Don't execute remote command
+          // Use tmux for interactive password entry — pi's TUI can't share the terminal directly
+          const socket = join(SOCKET_DIR, `${host}.sock`);
+          const tmuxSession = `ssh-connect-${host}`;
+
+          // Kill any existing connect session
+          sh(`tmux kill-session -t "${tmuxSession}" 2>/dev/null`);
+
+          // Start SSH in a named tmux session. The user will see the password prompt.
+          const proc = spawn("tmux", [
+            "new-session", "-s", tmuxSession,
+            "ssh",
+            "-o", `ControlPath=${socket}`,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-N",
             host,
           ], {
-            stdio: "inherit", // Let user interact with password prompt
+            stdio: "inherit",
             cwd: ctx.cwd,
           });
 
           await new Promise<void>((resolve) => {
             proc.on("exit", (code) => {
+              // Clean up the tmux session
+              sh(`tmux kill-session -t "${tmuxSession}" 2>/dev/null`);
+
               if (code === 0 || hasActiveConnection(host)) {
                 ctx.ui.notify(`Connected to ${host}. Persistent session active (2h idle timeout).`, "info");
               } else {
-                ctx.ui.notify(`Connection to ${host} failed (exit ${code}).`, "error");
+                ctx.ui.notify(`Connection to ${host} failed (exit ${code}). Check password and try again.`, "error");
               }
               resolve();
             });
