@@ -72,8 +72,8 @@ export default function (pi: ExtensionAPI) {
       })),
     }),
     async execute(_id, params, _signal) {
+      const file = `${tmpdir()}/pi-screenshot-${randomUUID()}.png`;
       try {
-        const file = `${tmpdir()}/pi-screenshot-${randomUUID()}.png`;
         if (params.region) {
           const [x, y, w, h] = params.region.split(",").map(Number);
           sh(`grim -g "${x},${y} ${w}x${h}" "${file}"`);
@@ -86,8 +86,6 @@ export default function (pi: ExtensionAPI) {
         }
 
         const data = readFileSync(file);
-        unlinkSync(file);
-
         const base64 = data.toString("base64");
         return {
           content: [
@@ -98,6 +96,9 @@ export default function (pi: ExtensionAPI) {
         };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Screenshot failed: ${e.message}` }], details: {}, isError: true };
+      } finally {
+        // Always clean up temp file
+        try { unlinkSync(file); } catch { /* already gone */ }
       }
     },
   });
