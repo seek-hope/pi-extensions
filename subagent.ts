@@ -786,6 +786,68 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── subagent_explore (Claude Code Explore agent pattern) ───────────────
+  pi.registerTool({
+    name: "subagent_explore",
+    label: "Explore Agent",
+    description:
+      "Spawn a read-only exploration sub-agent optimized for searching, reading, and analyzing code. " +
+      "Uses deepseek-v4-flash by default for cost efficiency. " +
+      "The agent has only read tools — it cannot modify files. " +
+      "Use this for code discovery, dependency analysis, and research tasks.",
+    promptSnippet: "Explore codebase with a read-only agent (v4-flash, cheap).",
+    promptGuidelines: [
+      "Use subagent_explore for code discovery, searching across multiple files, and understanding codebase structure.",
+      "The explore agent is read-only — it's safe for any exploration task.",
+      "Prefer subagent_explore over reading many files yourself — it keeps the main context clean.",
+    ],
+    parameters: Type.Object({
+      task: Type.String({ description: "Exploration task: what to search for or understand" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const { id, promise } = spawnSubAgent(params.task, ctx.cwd, {
+        model: "deepseek-v4-flash",
+        tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
+        systemPrompt: "You are an exploration agent. You can ONLY read and search — you CANNOT write, edit, or delete anything. Focus on finding information quickly and reporting it concisely.",
+      });
+      const result = await promise;
+      subAgents.delete(id);
+      return { content: [{ type: "text", text: result }], details: { subagentId: id } };
+    },
+  });
+
+  // ── subagent_plan (Claude Code / Codex Plan Mode pattern) ──────────────
+  pi.registerTool({
+    name: "subagent_plan",
+    label: "Plan Agent",
+    description:
+      "Spawn a planning sub-agent that explores the codebase, designs an approach, and returns a step-by-step plan WITHOUT making any changes. " +
+      "Use this before large refactors or complex implementations to get a reviewed plan first.",
+    promptSnippet: "Design an implementation plan without modifying code.",
+    promptGuidelines: [
+      "Use subagent_plan before large changes: let it explore and design, then review the plan before implementing.",
+      "The plan agent is read-only — it proposes a plan but does not execute it.",
+      "After reviewing the plan, use subagent_spawn or subagent_parallel to execute each step.",
+    ],
+    parameters: Type.Object({
+      task: Type.String({ description: "Planning task: what should be designed" }),
+      criteria: Type.Optional(Type.String({ description: "Specific requirements to consider in the plan" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const fullTask = params.criteria
+        ? `${params.task}\n\nRequirements:\n${params.criteria}\n\nIMPORTANT: Do NOT modify any files. Produce a detailed step-by-step plan only.`
+        : `${params.task}\n\nIMPORTANT: Do NOT modify any files. Produce a detailed step-by-step plan only.`;
+      const { id, promise } = spawnSubAgent(fullTask, ctx.cwd, {
+        model: "deepseek-v4-flash",
+        tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
+        systemPrompt: "You are a planning agent. You explore the codebase to understand the current state, then design a step-by-step implementation plan. You do NOT modify any files — you only READ and PLAN. Your output should be a clear, actionable plan.",
+      });
+      const result = await promise;
+      subAgents.delete(id);
+      return { content: [{ type: "text", text: `=== Plan ===\n\n${result}` }], details: { subagentId: id } };
+    },
+  });
+
   // ── subagent_refine (NEW) ──────────────────────────────────────────────
   pi.registerTool({
     name: "subagent_refine",

@@ -251,6 +251,17 @@ export default function (pi: ExtensionAPI) {
   // ── session_start: restore running task awareness ─────────────────────
   pi.on("session_start", () => syncTasks());
 
+  // ── tool_call: notify when bash tasks complete ────────────────────────
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName !== "bash") return;
+    // Check if this was a long-running command (>5s)
+    const elapsed = (event.details as any)?.elapsed;
+    if (elapsed && elapsed > 5000) {
+      ctx.ui.setStatus("last-bash", `✅ bash done (${(elapsed / 1000).toFixed(0)}s)`);
+      setTimeout(() => ctx.ui.setStatus("last-bash", ""), 5000);
+    }
+  });
+
   // ── session_shutdown: DON'T kill tasks — they survive in tmux ─────────
   pi.on("session_shutdown", () => {
     // Tasks persist across sessions. Don't kill them.
