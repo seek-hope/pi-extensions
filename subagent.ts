@@ -328,14 +328,14 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Spawn a sub-agent to handle a self-contained task in an isolated git worktree.",
     promptGuidelines: [
       "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
-      "Use subagent_spawn with model='gpt-4o-mini' for cheap, simple tasks like searching or reading files.",
+      "Use subagent_spawn with model='deepseek-v4-flash' for cheap, simple tasks like searching or reading files.",
       "When a user asks for multiple independent changes, spawn a subagent for each one with subagent_parallel.",
       "Always review sub-agent output with subagent_review before merging — never merge blindly.",
       "After spawning, use subagent_wait to collect the result, then decide: subagent_merge or subagent_reject.",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
-      model: Type.Optional(Type.String({ description: "Model override (e.g. 'gpt-4o-mini' for cheap tasks)" })),
+      model: Type.Optional(Type.String({ description: "Model override (e.g. 'deepseek-v4-flash' for cheap tasks)" })),
       tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
       systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt" })),
     }),
