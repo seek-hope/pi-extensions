@@ -18,11 +18,13 @@
  *   /ssh close <host>                    — close persistent connection
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { Container, Text, matchesKey, Key } from "@earendil-works/pi-tui";
 
 // ── config ──────────────────────────────────────────────────────────────────
 
@@ -164,41 +166,86 @@ export default function (pi: ExtensionAPI) {
           }
 
           ctx.ui.notify(`Connecting to ${host} (${cfg.user}@${cfg.hostname})...`, "info");
-          ctx.ui.notify(`A tmux window will open. Enter your password, then detach with Ctrl+B D.`, "info");
 
-          // Use tmux for interactive password entry — pi's TUI can't share the terminal directly
           const socket = join(SOCKET_DIR, `${host}.sock`);
-          const tmuxSession = `ssh-connect-${host}`;
 
-          // Kill any existing connect session
-          sh(`tmux kill-session -t "${tmuxSession}" 2>/dev/null`);
+          // Collect password securely via pi TUI component (AI never sees it)
+          const password = await ctx.ui.custom<string>((tui, theme, _kb, done) => {
+            let input = "";
 
-          // Start SSH in a named tmux session. The user will see the password prompt.
-          const proc = spawn("tmux", [
-            "new-session", "-s", tmuxSession,
-            "ssh",
-            "-o", `ControlPath=${socket}`,
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-N",
-            host,
-          ], {
-            stdio: "inherit",
-            cwd: ctx.cwd,
-          });
+            const container = new Container();
+            container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+            container.addChild(new Text(theme.fg("accent", theme.bold(` SSH: ${cfg.user}@${cfg.hostname}:${cfg.hostname?.includes(":") ? "" : "50159"}`)), 1, 0));
+            container.addChild(new Text("", 0, 0));
+            container.addChild(new Text("Password (input hidden):", 1, 0));
+            container.addChild(new Text(theme.fg("dim", "  (type password and press Enter, Esc to cancel)"), 1, 0));
+            container.addChild(new Text("", 0, 0));
 
-          await new Promise<void>((resolve) => {
-            proc.on("exit", (code) => {
-              // Clean up the tmux session
-              sh(`tmux kill-session -t "${tmuxSession}" 2>/dev/null`);
+            const asterisks = () => "  " + "●".repeat(input.length);
 
-              if (code === 0 || hasActiveConnection(host)) {
-                ctx.ui.notify(`Connected to ${host}. Persistent session active (2h idle timeout).`, "info");
-              } else {
-                ctx.ui.notify(`Connection to ${host} failed (exit ${code}). Check password and try again.`, "error");
+            return {
+              render: (w: number) => {
+                const lines = container.render(w);
+                lines.push(asterisks());
+                return lines;
+              },
+              invalidate: () => container.invalidate(),
+              handleInput: (data: string) => {
+                if (matchesKey(data, Key.escape)) {
+                  done(""); // Cancelled
+                  return;
+                }
+                if (matchesKey(data, Key.enter)) {
+                  done(input); // Submit
+                  return;
+                }
+                if (matchesKey(data, Key.backspace)) {
+                  input = input.slice(0, -1);
+                } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+                  input += data;
+                }
+                tui.requestRender();
+              },
+            };
+          }, { overlay: true });
+
+          if (!password) {
+            ctx.ui.notify("Connection cancelled.", "warning");
+            return;
+          }
+
+          // Use sshpass with the collected password (via env, not command line)
+          ctx.ui.notify("Authenticating...", "info");
+
+          try {
+            // Start SSH in background with ControlMaster persistent connection
+            // Using SSHPASS env var (never on command line, never logged)
+            const sshProc = spawn(
+              "sshpass", ["-e", "ssh",
+                "-o", `ControlPath=${socket}`,
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-N",
+                host,
+              ],
+              {
+                env: { ...process.env, SSHPASS: password },
+                stdio: "ignore",
+                detached: true,
               }
-              resolve();
-            });
-          });
+            );
+            sshProc.unref();
+
+            // Wait briefly and check if connection was established
+            await new Promise((r) => setTimeout(r, 3000));
+
+            if (hasActiveConnection(host)) {
+              ctx.ui.notify(`Connected to ${host}. Persistent session active (2h idle timeout).`, "info");
+            } else {
+              ctx.ui.notify(`Connection to ${host} may have failed. Check password and try again.`, "error");
+            }
+          } catch (e: any) {
+            ctx.ui.notify(`Connection failed: ${e.message || e}`, "error");
+          }
           return;
         }
 
