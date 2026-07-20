@@ -237,9 +237,15 @@ export default function (pi: ExtensionAPI) {
     if (/\bsshpass\b/.test(cmd)) {
       return { block: true, reason: "sshpass blocked. Use ssh_exec(host, command). First: /ssh <host>" };
     }
-    // Block ssh/scp/sftp/rsync to remote (user@host pattern only)
-    if (/\b(?:ssh|scp|sftp|rsync)\b.*\S+@\S+/.test(cmd)) {
-      return { block: true, reason: "Remote ssh blocked. Use ssh_exec(host, command). First: /ssh <host>" };
+    // Block only when the remote target is the SSH argument (within first ~10 words)
+    const words = cmd.split(/\s+/);
+    const sshIdx = words.findIndex(w => /^(?:ssh|sshpass|scp|sftp|rsync)$/.test(w));
+    if (sshIdx >= 0) {
+      // Check the next few words for user@host pattern
+      const nearby = words.slice(sshIdx, sshIdx + 12).join(" ");
+      if (/\S+@\S+/.test(nearby)) {
+        return { block: true, reason: "Remote ssh blocked. Use ssh_exec(host, command). First: /ssh <host>" };
+      }
     }
   });
 
