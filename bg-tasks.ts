@@ -142,8 +142,16 @@ export default function (pi: ExtensionAPI) {
       if (timeout > 300_000) {
         const cmd = (event.input as any).command || "";
 
-        // Don't auto-background if it's a short/simple command (heuristic: >100 chars likely script)
-        // Always enforce: >300s timeout = background
+        // Don't auto-background remote SSH commands — ssh extension handles those
+        if (/\b(?:sshpass|ssh|scp|sftp|rsync)\b.*\S+@\S+/.test(cmd)) {
+          return {
+            block: true,
+            reason: "Remote SSH over bg is not allowed. Use ssh_exec(host, command) for remote execution. " +
+              "If the command is long-running, use a shorter ssh_exec call to trigger the remote work, " +
+              "then ssh_exec can run it via tmux/nohup on the remote server directly.",
+          };
+        }
+
         const task = spawnBgTask(cmd, ctx.cwd, timeout);
 
         ctx.ui.notify(
