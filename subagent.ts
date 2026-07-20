@@ -245,6 +245,49 @@ function spawnSubAgent(
   return { id, promise };
 }
 
+// ── refine summary helper ──────────────────────────────────────────────────
+
+function buildRefineSummary(
+  id: string,
+  ag: SubAgent,
+  iterations: { iter: number; reviewerResult: string; fixerResult: string; issuesFound: number; clean: boolean }[],
+  passed: boolean
+): string {
+  const lines = [
+    `┌─ Refine: Sub-agent ${id} ──────────────────────`,
+    `│ Branch: ${ag.branch}`,
+    `│ Iterations: ${iterations.length}`,
+    `│ Result: ${passed ? "✅ ALL CLEAN" : "⚠ MAX ITERATIONS REACHED"}`,
+    `│`,
+  ];
+
+  for (const it of iterations) {
+    lines.push(`│ Iteration ${it.iter}:`);
+    lines.push(`│   Reviewer found ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXING"}`);
+    if (!it.clean && it.fixerResult) {
+      lines.push(`│   Fixer applied corrections`);
+    }
+  }
+
+  if (passed) {
+    lines.push(`│`);
+    lines.push(`│ Ready to merge. Use subagent_merge("${id}").`);
+  } else {
+    const last = iterations[iterations.length - 1];
+    lines.push(`│`);
+    lines.push(`│ ${last.issuesFound} issue(s) remain after ${iterations.length} iterations.`);
+    lines.push(`│ Manual review recommended before merge.`);
+    lines.push(`│`);
+    lines.push(`│ Last reviewer output:`);
+    for (const l of last.reviewerResult.split("\n").slice(0, 20)) {
+      lines.push(`│   ${l}`);
+    }
+  }
+
+  lines.push(`└──────────────────────────────────────────────`);
+  return lines.join("\n");
+}
+
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -304,6 +347,7 @@ export default function (pi: ExtensionAPI) {
             "│ AI tools:",
             "│   subagent_spawn     — spawn one",
             "│   subagent_wait      — wait for result",
+            "│   subagent_refine    — review→fix→re-review until clean",
             "│   subagent_review    — inspect git diff",
             "│   subagent_merge     — merge branch → main",
             "│   subagent_reject    — delete branch + worktree",
@@ -331,7 +375,7 @@ export default function (pi: ExtensionAPI) {
       "Use subagent_spawn with model='deepseek-v4-flash' for cheap, simple tasks like searching or reading files.",
       "When a user asks for multiple independent changes, spawn a subagent for each one with subagent_parallel.",
       "Always review sub-agent output with subagent_review before merging — never merge blindly.",
-      "After spawning, use subagent_wait to collect the result, then decide: subagent_merge or subagent_reject.",
+      "After spawning, use subagent_wait to collect the result, then subagent_refine to auto-polish, then decide: subagent_merge or subagent_reject.",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
@@ -602,7 +646,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use subagent_parallel when the user asks for 3+ independent changes or searches.",
       "Prefer subagent_parallel over sequential execution for independent tasks — it saves wall-clock time.",
-      "After all parallel sub-agents complete, review each result with subagent_review before merging.",
+      "After all parallel sub-agents complete, use subagent_refine on each to auto-polish, then review with subagent_review before merging.",
       "For tasks that depend on each other, use subagent_chain instead.",
     ],
     parameters: Type.Object({
@@ -714,6 +758,121 @@ export default function (pi: ExtensionAPI) {
       ];
 
       return { content: [{ type: "text", text: summary.join("\n") }], details: { steps: tasks.length } };
+    },
+  });
+
+  // ── subagent_refine (NEW) ──────────────────────────────────────────────
+  pi.registerTool({
+    name: "subagent_refine",
+    label: "Refine Sub-agent",
+    description:
+      "Review a completed sub-agent's work, auto-fix issues, and re-review " +
+      "in a loop until no problems remain or max iterations is reached. " +
+      "The reviewer (deepseek-v4-pro) inspects the diff; the fixer (deepseek-v4-flash) " +
+      "applies corrections on the same branch. Each iteration produces a new commit. " +
+      "Returns the final diff and a summary of all fix iterations.",
+    promptSnippet: "Review → fix → re-review loop until clean. Auto-iterate.",
+    promptGuidelines: [
+      "Use subagent_refine after subagent_wait returns done, to auto-polish the result before merging.",
+      "The refine loop runs: reviewer inspects the diff → fixer corrects issues → re-review → repeat until clean.",
+      "If maxIterations is reached and issues remain, the tool reports remaining issues for manual resolution.",
+      "The reviewer uses v4-pro for deep analysis; the fixer uses v4-flash for fast corrections.",
+    ],
+    parameters: Type.Object({
+      id: Type.String({ description: "Sub-agent ID to refine" }),
+      criteria: Type.Optional(Type.String({ description: "Custom review criteria. Default: check for bugs, style, correctness, merge conflicts, and incomplete work." })),
+      maxIterations: Type.Optional(Type.Number({ description: "Max review-fix iterations (default: 3, max: 5)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const ag = subAgents.get(params.id);
+      if (!ag) {
+        return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
+      }
+      if (ag.status === "running") {
+        return { content: [{ type: "text", text: `Sub-agent ${params.id} still running. Wait for completion first.` }], details: {} };
+      }
+
+      const maxIter = Math.min(params.maxIterations || 3, 5);
+      const criteria = params.criteria ||
+        "Check for: bugs, logic errors, security issues, style violations, incomplete implementation, " +
+        "missing edge cases, merge conflicts markers, broken imports, and code that does not compile.";
+
+      const iterations: { iter: number; reviewerResult: string; fixerResult: string; issuesFound: number; clean: boolean }[] = [];
+
+      for (let i = 1; i <= maxIter; i++) {
+        // Step 1: Review
+        const reviewTask = [
+          `Review the git diff of branch ${ag.branch}.`,
+          `Review criteria: ${criteria}`,
+          ``,
+          `IMPORTANT: Respond in this exact format:`,
+          `FOUND: <number of distinct issues found, 0 if none>`,
+          `CLEAN: <true|false>  (true if no issues at all, the work is ready to merge)`,
+          `ISSUES:`,
+          `- <specific issue 1 with file path and line reference>`,
+          `- <specific issue 2 with file path and line reference>`,
+          `...`,
+          ``,
+          `If CLEAN is true, just write "CLEAN: true" and nothing else.`,
+          `Be strict and thorough. Every issue must reference a concrete file and line.`,
+        ].join("\n");
+
+        const { promise: reviewPromise } = spawnSubAgent(reviewTask, ctx.cwd, {
+          model: "deepseek-v4-pro",
+        });
+        const reviewerOutput = await reviewPromise;
+
+        // Parse reviewer output
+        const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
+        const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
+        const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
+        const issuesCount = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
+
+        iterations.push({
+          iter: i,
+          reviewerResult: reviewerOutput.substring(0, 3000),
+          fixerResult: "",
+          issuesFound: issuesCount,
+          clean: isClean,
+        });
+
+        if (isClean || issuesCount === 0) {
+          // Done!
+          const summary = buildRefineSummary(params.id, ag, iterations, true);
+          return { content: [{ type: "text", text: summary }], details: { iterations: i, clean: true } };
+        }
+
+        // Step 2: Fix
+        const fixTask = [
+          `You are fixing issues found during code review on branch ${ag.branch}.`,
+          ``,
+          `Review found ${issuesCount} issue(s):`,
+          reviewerOutput.substring(0, 4000),
+          ``,
+          `Your task: Fix ALL the issues listed above.`,
+          `- Work in the current directory (this is the worktree for branch ${ag.branch})`,
+          `- Make concrete edits to the files`,
+          `- After fixing, verify your changes are correct`,
+          `- Do NOT commit — commits are handled automatically`,
+          `- Be thorough: every issue listed above must be addressed`,
+        ].join("\n");
+
+        const { promise: fixPromise } = spawnSubAgent(fixTask, ctx.cwd, {
+          model: "deepseek-v4-flash",
+        });
+        const fixerOutput = await fixPromise;
+
+        // Commit the fixes
+        const fixHash = commitWorktree(ag.worktreePath, params.id, `fix iteration ${i}: ${issuesCount} issue(s)`);
+        iterations[iterations.length - 1].fixerResult = fixerOutput.substring(0, 2000) + (fixHash ? `\nCommit: ${fixHash}` : "");
+
+        // Update agent commit hash
+        ag.commitHash = fixHash || ag.commitHash;
+      }
+
+      // Max iterations reached
+      const summary = buildRefineSummary(params.id, ag, iterations, false);
+      return { content: [{ type: "text", text: summary }], details: { iterations: maxIter, clean: false, remainingIssues: true } };
     },
   });
 
