@@ -1,18 +1,8 @@
 /**
  * SSH extension — persistent multiplexed connections, standard SSH syntax.
  *
- * Security:
- *   - Passwords are collected via pi TUI overlay — the AI NEVER sees credentials.
- *   - ControlMaster multiplexes sessions: one authentication → many commands.
- *
- * Usage (same as standard ssh):
- *   /ssh root@host                        connect to host:22
- *   /ssh -p 50159 root@host               connect to host:50159
- *   /ssh root@host "ls /data"             run command via persistent connection
- *   /ssh status                           show active connections
- *   /ssh close root@host                  close connection to host
- *
- * No ~/.ssh/config modifications. All connection state in memory.
+ * Security: passwords/passphrases entered interactively via separate terminal.
+ * Connection state: ControlMaster sockets on disk, metadata in memory.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -21,75 +11,65 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-// ── connection state (in-memory only, no config file) ──────────────────────
-
 const SOCKET_DIR = join(homedir(), ".ssh", "pi-sockets");
 
 interface Connection {
-  host: string;       // "root@host:port"
-  socket: string;     // path to ControlMaster socket
+  key: string;         // "user@hostname:port" — canonical key
+  alias: string;       // original alias (for SSH Host pattern matching)
+  socket: string;
   startTime: number;
   lastUse: number;
 }
 
 const connections = new Map<string, Connection>();
 
+// ── helpers ─────────────────────────────────────────────────────────────────
+
 function connKey(user: string, hostname: string, port: number): string {
   return `${user}@${hostname}:${port}`;
 }
 
-function getSocket(key: string): string {
-  return join(SOCKET_DIR, `${key.replace(/[@:]/g, "_")}.sock`);
+function socketPath(key: string): string {
+  // Replace @ and : with _, keep dots for hostnames
+  return join(SOCKET_DIR, key.replace(/[@:]/g, "_") + ".sock");
 }
 
 function isConnected(key: string): boolean {
-  const socket = getSocket(key);
-  if (!existsSync(socket)) return false;
+  const sock = socketPath(key);
+  if (!existsSync(sock)) return false;
   try {
-    execSync(`ssh -O check -o ControlPath="${socket}" dummy 2>&1`, {
+    execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, {
       encoding: "utf-8", stdio: "pipe", timeout: 5_000,
     });
     return true;
   } catch (e: any) {
-    return e.stdout?.includes("Master running") || e.stderr?.includes("Master running") || false;
+    return /master running/i.test(e.stdout || "") || /master running/i.test(e.stderr || "");
   }
 }
 
-// ── parse SSH args + resolve via ssh config ────────────────────────────────
-
-interface SshTarget {
-  alias: string;       // Original input (can be host alias from config)
-  user: string;
-  hostname: string;    // Resolved hostname (from config or input)
-  port: number;
-  command: string;
+function sh(cmd: string, timeout = 60_000): string {
+  try {
+    return execSync(cmd, { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }).trim();
+  } catch (e: any) {
+    return e.stderr || e.message || "";
+  }
 }
 
-/** Resolve host config via ssh -G. Returns null if no match. */
 function resolveSshConfig(host: string): { user: string; hostname: string; port: number } | null {
   try {
-    const out = execSync(`ssh -G "${host}"`, {
+    const out = execSync(`ssh -G "${host}" 2>/dev/null`, {
       encoding: "utf-8", stdio: "pipe", timeout: 5_000,
     });
-    const config: Record<string, string> = {};
+    const cfg: Record<string, string> = {};
     for (const line of out.split("\n")) {
-      const idx = line.indexOf(" ");
-      if (idx > 0) config[line.substring(0, idx)] = line.substring(idx + 1);
+      const s = line.indexOf(" ");
+      if (s > 0) cfg[line.substring(0, s)] = line.substring(s + 1);
     }
-    // Only return if ssh -G resolved to a DIFFERENT hostname (config entry exists)
-    if (config["hostname"] && config["hostname"] !== host) {
+    if (cfg["hostname"] && cfg["hostname"] !== host) {
       return {
-        user: config["user"] || "root",
-        hostname: config["hostname"],
-        port: parseInt(config["port"] || "22", 10),
-      };
-    }
-    // Check if port was overridden
-    if (config["port"] && config["port"] !== "22") {
-      return {
-        user: config["user"] || "root",
-        hostname: host,
-        port: parseInt(config["port"], 10),
+        user: cfg["user"] || "root",
+        hostname: cfg["hostname"],
+        port: parseInt(cfg["port"] || "22", 10),
       };
     }
     return null;
@@ -98,180 +78,182 @@ function resolveSshConfig(host: string): { user: string; hostname: string; port:
   }
 }
 
-function parseSshArgs(args: string): SshTarget | null {
+function parseArgs(args: string): { alias: string; user: string; hostname: string; port: number; command: string } | null {
   const parts = args.trim().split(/\s+/);
-  let user = "";
-  let hostname = "";
-  let port = 0;
-  let command = "";
-  let i = 0;
+  let user = "", hostname = "", port = 0, command = "", i = 0;
 
   while (i < parts.length) {
     const p = parts[i];
-    if (p === "-p" && i + 1 < parts.length) {
-      port = parseInt(parts[i + 1], 10);
-      i += 2;
-    } else if (p.startsWith("-")) {
-      if (i + 1 < parts.length && !parts[i + 1].startsWith("-")) i += 2;
-      else i += 1;
-    } else if (p.includes("@")) {
-      const [u, h] = p.split("@");
-      user = u;
-      if (h.includes(":")) {
-        const [hn, pt] = h.split(":");
-        hostname = hn;
-        port = port || parseInt(pt, 10);
-      } else {
-        hostname = h;
-      }
-      if (i + 1 < parts.length) {
-        command = parts.slice(i + 1).join(" ");
-      }
+    if (p === "-p" && i + 1 < parts.length) { port = parseInt(parts[i + 1]); i += 2; }
+    else if (p.startsWith("-")) { i += (i + 1 < parts.length && !parts[i + 1].startsWith("-")) ? 2 : 1; }
+    else if (p.includes("@")) {
+      const [u, h] = p.split("@"); user = u;
+      if (h.includes(":")) { const [hn, pt] = h.split(":"); hostname = hn; port = port || parseInt(pt); }
+      else hostname = h;
+      if (i + 1 < parts.length) command = parts.slice(i + 1).join(" ");
       i = parts.length;
     } else {
       hostname = p;
-      if (i + 1 < parts.length) {
-        command = parts.slice(i + 1).join(" ");
-      }
+      if (i + 1 < parts.length) command = parts.slice(i + 1).join(" ");
       i = parts.length;
     }
   }
-
   if (!hostname) return null;
 
-  // Save original alias BEFORE resolving config
   const alias = hostname;
-
-  // Resolve via SSH config
   const resolved = resolveSshConfig(hostname);
   if (resolved) {
     if (!user) user = resolved.user;
     hostname = resolved.hostname;
     if (!port) port = resolved.port;
   }
-
-  return {
-    alias,  // Original alias for SSH Host pattern matching
-    user: user || "root",
-    hostname: resolved?.hostname || hostname,
-    port: port || 22,
-    command,
-  };
+  return { alias, user: user || "root", hostname, port: port || 22, command };
 }
 
-// ── sh helper ───────────────────────────────────────────────────────────────
+// ── connect ─────────────────────────────────────────────────────────────────
 
-function sh(cmd: string, timeout = 30_000): string {
-  try {
-    return execSync(cmd, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout }).trim();
-  } catch (e: any) {
-    return e.stderr || e.message || "";
+function connect(alias: string, user: string, hostname: string, port: number, ctx: any): void {
+  const key = connKey(user, hostname, port);
+  const sock = socketPath(key);
+
+  // Restore or connect
+  if (isConnected(key)) {
+    connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+    ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}.`, "info");
+    return;
   }
+
+  ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
+
+  const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
+  spawn("alacritty", ["-e", "bash", "-c",
+    `echo "Connecting to ${displayHost}..."; ` +
+    `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=2h ` +
+    `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
+    `-o StrictHostKeyChecking=accept-new -fN ${alias} && ` +
+    `echo "Connected! You may close this window." || echo "Auth failed."; ` +
+    `read -p 'Press Enter to close...'`
+  ], { stdio: "ignore", detached: true }).unref();
+
+  ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}...`);
+
+  let tries = 0;
+  function poll() {
+    tries++;
+    if (isConnected(key)) {
+      connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+      ctx.ui.setStatus("ssh-" + key, "");
+      ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
+      return;
+    }
+    if (tries < 10) { ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}... (${tries * 2}s)`); setTimeout(poll, 2000); }
+    else { ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify(`Timeout. Run /ssh status to check.`, "warning"); }
+  }
+  setTimeout(poll, 2000);
+}
+
+// ── execute remote command ─────────────────────────────────────────────────
+
+function runRemote(key: string, sock: string, alias: string, command: string, user: string, hostname: string, port: number, ctx: any): void {
+  if (!isConnected(key)) {
+    ctx.ui.notify(`No connection to ${user}@${hostname}:${port}. /ssh ${alias} first.`, "warning");
+    return;
+  }
+  if (!connections.has(key)) {
+    connections.set(key, { key, alias, socket: sock, startTime: Date.now(), lastUse: Date.now() });
+  }
+
+  ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
+  const result = sh(`ssh -o ControlPath="${sock}" -o ConnectTimeout=5 "${alias}" '${command.replace(/'/g, "'\\''")}'`, 120_000);
+  ctx.ui.setStatus("ssh-" + key, "");
+  connections.get(key)!.lastUse = Date.now();
+
+  ctx.ui.setWidget("ssh-result", [
+    `┌─ ${user}@${hostname}:${port} ─────────────────────`,
+    `│ ${command.substring(0, 60)}`,
+    `├──────────────────────────────────────────`,
+    ...result.split("\n").slice(0, 40).map((l: string) => `│ ${l.substring(0, 80)}`),
+    result.split("\n").length > 40 ? `│ ...` : "",
+    `└──────────────────────────────────────────`,
+  ].filter(Boolean));
+}
+
+// ── find connection for AI tool ────────────────────────────────────────────
+
+function findConnection(host: string): Connection | undefined {
+  const s = host.toLowerCase();
+  for (const [, c] of connections) {
+    if (c.key.toLowerCase().includes(s) || c.alias.toLowerCase().includes(s)) return c;
+  }
+  // Fallback: scan socket dir
+  if (existsSync(SOCKET_DIR)) {
+    for (const name of execSync(`ls "${SOCKET_DIR}" 2>/dev/null || true`, { encoding: "utf-8" }).split("\n")) {
+      if (!name.endsWith(".sock")) continue;
+      const sock = join(SOCKET_DIR, name);
+      try {
+        execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 3_000 });
+        // Extract key from filename: user_hostname_port.sock
+        const raw = name.replace(".sock", "").replace(/_/g, (m, i, str) => {
+          // Reconstruct: first _ is @, last _ before port is :, rest are .
+          return "@"; // simplified
+        });
+        return { key: raw, alias: raw, socket: sock, startTime: Date.now(), lastUse: Date.now() };
+      } catch { /* not running */ }
+    }
+  }
+  return undefined;
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // Ensure socket directory exists
   if (!existsSync(SOCKET_DIR)) mkdirSync(SOCKET_DIR, { recursive: true });
 
-  // ── tool_call interceptor: BLOCK any form of remote access ──────────
+  // ── interceptor: block raw remote ssh ────────────────────────────────
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName === "bash") {
-      const cmd = ((event.input as any)?.command || "") as string;
+    if (event.toolName !== "bash") return;
+    const cmd = ((event.input as any)?.command || "") as string;
 
-      // Block sshpass (always used to bypass SSH auth)
-      if (/\bsshpass\b/.test(cmd)) {
-        return {
-          block: true,
-          reason:
-            "sshpass is blocked. Use ssh_exec(host, command) instead. " +
-            "It provides persistent connections without needing sshpass. " +
-            "First ensure the user has connected: /ssh <host>",
-        };
-      }
-
-      // Block ssh/scp/sftp/rsync targeting remote hosts
-      // Matches: ssh, scp, sftp, rsync with user@host or -p port patterns
-      const remotePatterns = [
-        /\bssh\s+(?:-[a-zA-Z]*\S*\s+)*\S*@\S+/,           // ssh user@host
-        /\bssh\s+(?:-[a-zA-Z]*\S*\s+)*\S+\s+[\"']?ssh\b/, // ssh host "ssh ..." (nested)
-        /\bscp\s+(?:-[a-zA-Z]*\S*\s+)*\S*@\S+/,           // scp user@host
-        /\bsftp\s+(?:-[a-zA-Z]*\S*\s+)*\S+@\S+/,          // sftp user@host
-        /\brsync\s+.*[\s:]\S+@\S+:/,                       // rsync ... user@host:
-        /\bssh\b.*\bConnectTimeout\b/,                      // ssh with options (bypass via timeout)
-      ];
-      for (const pattern of remotePatterns) {
-        if (pattern.test(cmd)) {
-          return {
-            block: true,
-            reason:
-              "Remote access commands (ssh/scp/sftp/rsync) are blocked. " +
-              "Use ssh_exec(host, command) for remote execution. " +
-              "If no connection exists, the user must run /ssh <host> first.",
-          };
-        }
-      }
+    if (/\bsshpass\b/.test(cmd)) {
+      return { block: true, reason: "sshpass blocked. Use ssh_exec(host, command). First: /ssh <host>" };
+    }
+    // Block ssh/scp/sftp/rsync to remote (user@host pattern only)
+    if (/\b(?:ssh|scp|sftp|rsync)\b.*\S+@\S+/.test(cmd)) {
+      return { block: true, reason: "Remote ssh blocked. Use ssh_exec(host, command). First: /ssh <host>" };
     }
   });
 
   // ── /ssh command ─────────────────────────────────────────────────────
   pi.registerCommand("ssh", {
-    description:
-      "SSH with persistent connections. Same syntax as standard ssh. " +
-      "/ssh -p PORT user@host [command]",
+    description: "SSH with persistent connections. /ssh [-p PORT] user@host [command]  |  status  |  close <host>",
     handler: async (args, ctx) => {
-      if (!args || !args.trim()) {
-        ctx.ui.notify("Usage: /ssh [-p PORT] user@host [command]  |  /ssh status  |  /ssh close user@host", "warning");
-        return;
-      }
+      if (!args?.trim()) { ctx.ui.notify("Usage: /ssh [-p PORT] user@host [command]", "warning"); return; }
+      if (args.trim() === "status") { showStatus(ctx); return; }
+      if (args.trim().startsWith("close ")) { closeConn(args.trim().slice(6).trim(), ctx); return; }
 
-      // Special subcommands
-      if (args.trim() === "status" || args.trim().startsWith("status ")) {
-        showStatus(ctx);
-        return;
-      }
-      if (args.trim().startsWith("close ")) {
-        const target = args.trim().slice(6).trim();
-        closeConnection(target, ctx);
-        return;
-      }
+      const p = parseArgs(args);
+      if (!p) { ctx.ui.notify("Invalid syntax.", "error"); return; }
 
-      const parsed = parseSshArgs(args);
-      if (!parsed) {
-        ctx.ui.notify("Invalid SSH syntax. Usage: /ssh [-p PORT] user@host [command]", "error");
-        return;
-      }
-
-      const { alias, user, hostname, port, command } = parsed;
-      const key = connKey(user, hostname, port);
-      const socket = getSocket(key);
-
-      if (command) {
-        // Execute command on remote
-        await runRemoteCommand(key, socket, command, alias, user, hostname, port, ctx);
+      const key = connKey(p.user, p.hostname, p.port);
+      if (p.command) {
+        runRemote(key, socketPath(key), p.alias, p.command, p.user, p.hostname, p.port, ctx);
       } else {
-        // Connect (open persistent connection)
-        await connectToHost(key, socket, alias, user, hostname, port, ctx, pi);
+        connect(p.alias, p.user, p.hostname, p.port, ctx);
       }
     },
   });
 
-  // ── ssh_exec tool (AI can use) ──────────────────────────────────────
+  // ── ssh_exec tool ────────────────────────────────────────────────────
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH Execute",
-    description:
-      "Execute a command on a remote server via persistent SSH connection. " +
-      "The user must have connected first via /ssh user@host. " +
-      "Credentials are handled by the user interactively — the AI never sees passwords.",
+    description: "Execute a command on a remote server via persistent SSH connection. Credentials are handled by the user interactively — the AI never sees passwords.",
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
-      "MANDATORY: When the user asks you to run commands on a remote server, you MUST use ssh_exec instead of bash.",
-      "MANDATORY: Never use bash to run ssh commands directly (e.g., 'ssh user@host cmd'). Always use ssh_exec for remote execution.",
-      "MANDATORY: If no SSH connection exists, tell the user to run /ssh <host> first to open a persistent connection.",
-      "Use ssh_status to check which hosts are currently connected before running remote commands.",
-      "The SSH connection persists across pi sessions — if the user connected earlier, the connection is likely still active.",
+      "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
+      "MANDATORY: Never use bash to run ssh commands directly. Always use ssh_exec for remote execution.",
+      "MANDATORY: If no SSH connection exists, tell the user to run /ssh <host> first.",
+      "Call ssh_status before running ssh_exec to verify the target host is connected.",
     ],
     parameters: Type.Object({
       host: Type.String({ description: "SSH host alias (configured via /ssh setup)" }),
@@ -279,76 +261,24 @@ export default function (pi: ExtensionAPI) {
       timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 60000)" })),
     }),
     async execute(_id, params, _signal) {
-      const host = params.host;
-      const cmd = params.command;
+      const host = params.host, cmd = params.command;
       const timeout = Math.min(params.timeout || 60_000, 300_000);
 
-      // Flexible matching: find connection by any recognizable part
-      let found: Connection | undefined;
-      for (const [key, conn] of connections) {
-        // Extract components from stored key (user@hostname:port)
-        const [userHost, portStr] = conn.host.split(":");
-        const [user, connHost] = userHost.includes("@")
-          ? userHost.split("@")
-          : ["", userHost];
-
-        const search = host.toLowerCase();
-        if (
-          conn.host === search ||
-          key === search ||
-          conn.host.toLowerCase().includes(search) ||
-          connHost.toLowerCase().includes(search) ||
-          (user && user.toLowerCase().includes(search))
-        ) {
-          found = conn;
-          break;
-        }
+      let conn = findConnection(host);
+      if (!conn) {
+        return { content: [{ type: "text", text: `No active connection matching "${host}". Connect: /ssh ${host}` }], details: {}, isError: true };
       }
-
-      // If not found by substring, try matching by socket existence
-      if (!found) {
-        for (const [key, conn] of connections) {
-          if (existsSync(conn.socket) && isConnected(key)) {
-            found = conn;
-            break;
-          }
-        }
-      }
-
-      if (!found) {
-        // List available connections in error
-        const available = [...connections.keys()].join(", ") || "none";
-        return {
-          content: [{
-            type: "text",
-            text: `No active SSH connection matching "${host}".\n` +
-              `Available connections: ${available}\n` +
-              `Connect first: /ssh <host>`,
-          }],
-          details: {},
-          isError: true,
-        };
-      }
-
-      if (!isConnected(found.host)) {
-        connections.delete(found.host);
-        return {
-          content: [{
-            type: "text",
-            text: `Connection to ${found.host} is stale. Reconnect with: /ssh ${found.host}`,
-          }],
-          details: {},
-          isError: true,
-        };
+      if (!isConnected(conn.key)) {
+        connections.delete(conn.key);
+        return { content: [{ type: "text", text: `Connection to ${conn.key} is stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
 
       try {
-        const [userHost] = found.host.split(":");
         const result = execSync(
-          `ssh -o ControlPath="${found.socket}" -o ConnectTimeout=5 "${userHost}" '${cmd.replace(/'/g, "'\\''")}'`,
+          `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 "${conn.alias}" '${cmd.replace(/'/g, "'\\''")}'`,
           { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }
         );
-        found.lastUse = Date.now();
+        conn.lastUse = Date.now();
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
@@ -369,177 +299,42 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute() {
       if (connections.size === 0) {
-        return {
-          content: [{ type: "text", text: "No SSH connections. Use /ssh user@host to connect." }],
-          details: {},
-        };
+        return { content: [{ type: "text", text: "No active SSH connections. Use /ssh user@host to connect." }], details: {} };
       }
       const lines = ["Active SSH connections:"];
-      for (const [key, c] of connections) {
-        const active = isConnected(key);
+      for (const [, c] of connections) {
+        const active = isConnected(c.key);
         const elapsed = ((Date.now() - c.startTime) / 60000).toFixed(0);
-        lines.push(`  ${active ? "🟢" : "⚫"} ${c.host} (${elapsed} min)`);
+        lines.push(`  ${active ? "🟢" : "⚫"} ${c.key} (${elapsed} min)`);
       }
       return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
     },
   });
 
-  // ── session_shutdown (keep connections alive across sessions) ────────
-  pi.on("session_shutdown", () => {
-    // Don't close connections — they persist across pi sessions
-  });
+  pi.on("session_shutdown", () => { /* keep connections alive */ });
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
-async function connectToHost(
-  key: string, socket: string,
-  alias: string, user: string, hostname: string, port: number,
-  ctx: any, pi: ExtensionAPI
-): Promise<void> {
-  // Socket exists from previous session → restore the in-memory record
-  if (isConnected(key)) {
-    connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
-    ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}. Reusing persistent session.`, "info");
-    return;
-  }
-
-  // Open SSH in a separate terminal window so the user can enter
-  // password or private-key passphrase natively.
-  ctx.ui.notify(
-    `Opening SSH to ${user}@${hostname}:${port} in new terminal...`,
-    "info"
-  );
-
-  // Build the SSH command — use alias so SSH resolves config (Host pattern matching)
-  const sshTarget = (alias !== hostname) ? alias : `${user}@${hostname}`;
-  const sshArgs = [
-    "-e", "bash", "-c",
-    [
-      "echo", `"Connecting to ${user}@${hostname}:${port}..."`,
-      "&&",
-      "ssh",
-      "-o", `ControlPath=${socket}`,
-      "-o", "ControlMaster=auto",
-      "-o", "ControlPersist=2h",
-      "-o", "ServerAliveInterval=60",
-      "-o", "ServerAliveCountMax=5",
-      "-o", "StrictHostKeyChecking=accept-new",
-      "-f", "-N",
-      sshTarget,
-      "&&",
-      "echo", `"Connected! You may close this window."`,
-      "||",
-      "echo", `"Authentication failed. Check credentials and try again."`,
-      ";",
-      "read -p 'Press Enter to close...'",
-    ].join(" "),
-  ];
-
-  // Spawn in a new alacritty window
-  const proc = spawn("alacritty", sshArgs, {
-    stdio: "ignore",
-    detached: true,
-    cwd: ctx.cwd,
-  });
-  proc.unref();
-
-  // Non-blocking: poll in background, update status line
-  ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}...`);
-
-  let attempts = 0;
-  const maxAttempts = 10; // 20s total
-  const check = () => {
-    attempts++;
-    if (isConnected(key)) {
-      connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
-      ctx.ui.setStatus("ssh-" + key, "");
-      ctx.ui.notify(`Connected to ${user}@${hostname}:${port}.`, "info");
-      return;
-    }
-    if (attempts < maxAttempts) {
-      ctx.ui.setStatus("ssh-" + key, `Waiting for ${user}@${hostname}... (${attempts * 2}s)`);
-      setTimeout(check, 2000);
-    } else {
-      ctx.ui.setStatus("ssh-" + key, "");
-      ctx.ui.notify(`Timeout waiting for ${user}@${hostname}. Run /ssh status to check.`, "warning");
-    }
-  };
-  setTimeout(check, 2000);
-}
-
-async function runRemoteCommand(
-  key: string, socket: string, command: string,
-  alias: string, user: string, hostname: string, port: number,
-  ctx: any
-): Promise<void> {
-  if (!isConnected(key)) {
-    ctx.ui.notify(`No connection to ${user}@${hostname}:${port}. Connect first: /ssh ${user}@${hostname}`, "warning");
-    return;
-  }
-
-  // Ensure in-memory record exists (may have been lost on restart)
-  if (!connections.has(key)) {
-    connections.set(key, { host: key, socket, startTime: Date.now(), lastUse: Date.now() });
-  }
-
-  ctx.ui.setStatus("ssh-" + key, `running on ${user}@${hostname}...`);
-
-  const result = sh(
-    `ssh -o ControlPath="${socket}" -o ConnectTimeout=5 "${alias}" '${command.replace(/'/g, "'\\''")}'`,
-    120_000
-  );
-
-  ctx.ui.setStatus("ssh-" + key, "");
-
-  connections.get(key)!.lastUse = Date.now();
-
-  ctx.ui.setWidget("ssh-result", [
-    `┌─ ${user}@${hostname}:${port} ─────────────────────`,
-    `│ ${command.substring(0, 60)}`,
-    `├──────────────────────────────────────────`,
-    ...result.split("\n").slice(0, 40).map((l: string) => `│ ${l.substring(0, 80)}`),
-    result.split("\n").length > 40 ? `│ ... (${result.split("\n").length - 40} more lines)` : "",
-    `└──────────────────────────────────────────`,
-  ].filter(Boolean));
-}
+// ── UI helpers ──────────────────────────────────────────────────────────────
 
 function showStatus(ctx: any): void {
-  if (connections.size === 0) {
-    ctx.ui.notify("No active SSH connections.", "info");
-    return;
-  }
-
+  if (connections.size === 0) { ctx.ui.notify("No active connections.", "info"); return; }
   const lines = ["SSH Connections:"];
-  for (const [key, c] of connections) {
-    const active = isConnected(key);
-    const elapsed = ((Date.now() - c.startTime) / 60000).toFixed(0);
-    lines.push(`  ${active ? "🟢" : "⚫"} ${c.host} (${elapsed} min)`);
+  for (const [, c] of connections) {
+    const active = isConnected(c.key);
+    lines.push(`  ${active ? "🟢" : "⚫"} ${c.key} (${((Date.now() - c.startTime) / 60000).toFixed(0)} min)`);
   }
-  lines.push("");
-  lines.push("Close: /ssh close <user@host>");
-
   ctx.ui.setWidget("ssh-status", lines.map((l) => `│ ${l}`));
 }
 
-function closeConnection(target: string, ctx: any): void {
-  // Find matching connection
-  let found: string | undefined;
-  for (const [key, conn] of connections) {
-    if (conn.host.includes(target) || key.includes(target) || conn.host === target) {
-      found = key;
-      break;
+function closeConn(target: string, ctx: any): void {
+  for (const [key, c] of connections) {
+    if (c.key.includes(target) || c.alias.includes(target)) {
+      const r = sh(`ssh -O exit -o ControlPath="${c.socket}" x 2>/dev/null`);
+      try { rmSync(c.socket); } catch { /* ok */ }
+      connections.delete(key);
+      ctx.ui.notify(`Closed ${c.key}.`, "info");
+      return;
     }
   }
-
-  if (!found) {
-    ctx.ui.notify(`No connection matching "${target}". /ssh status to see active connections.`, "error");
-    return;
-  }
-
-  const conn = connections.get(found)!;
-  sh(`ssh -O exit -o ControlPath="${conn.socket}" dummy 2>/dev/null`);
-  try { rmSync(conn.socket); } catch { /* ok */ }
-  connections.delete(found);
-  ctx.ui.notify(`Closed connection to ${conn.host}.`, "info");
+  ctx.ui.notify(`No connection matching "${target}".`, "error");
 }
