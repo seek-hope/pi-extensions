@@ -34,6 +34,7 @@ interface Check {
   exists: (cwd: string) => boolean;
   init: (cwd: string) => { ok: boolean; out: string };
   description: string;
+  skipInHome?: boolean;
 }
 
 // ── check definitions ──────────────────────────────────────────────────────
@@ -54,6 +55,7 @@ const checks: Check[] = [
       return { ok: true, out: `git init done.\n${r2.out}\n${r3.out}` };
     },
     description: "Version control",
+    skipInHome: true,  // Don't auto-init git in home directory
   },
   {
     name: "CodeGraph",
@@ -91,6 +93,7 @@ export default function (pi: ExtensionAPI) {
 
     for (const check of checks) {
       if (!check.exists(cwd)) {
+        if (check.skipInHome && cwd === process.env.HOME) continue;
         missing.push(check);
       }
     }
@@ -133,6 +136,10 @@ export default function (pi: ExtensionAPI) {
       let allOk = true;
 
       for (const check of checks) {
+        if (check.skipInHome && ctx.cwd === process.env.HOME) {
+          lines.push(`${check.icon} ${check.name}: ⏭ skipped (home directory)`);
+          continue;
+        }
         if (check.exists(ctx.cwd)) {
           lines.push(`${check.icon} ${check.name}: ✅ enabled`);
         } else {
