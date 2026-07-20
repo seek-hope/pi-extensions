@@ -44,6 +44,7 @@ export default function (pi: ExtensionAPI) {
         "pyright",
         "context7",
         "@huggingface/inference",
+        "doc-relay",
       ];
       for (const pkg of npmTools) {
         results.push(`--- ${pkg} ---`);
