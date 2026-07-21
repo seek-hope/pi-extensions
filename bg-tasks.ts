@@ -156,11 +156,10 @@ function pollCompletion(id: string): void {
     const task = tasks.get(id);
     if (!task || task.status !== "running") return;
     try {
-      try {
-        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
-        // Still running
-        updateTaskWidget();
-        setTimeout(check, 5000);
+      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+      // Still running
+      updateTaskWidget();
+      setTimeout(check, 5000);
     } catch {
       // Session ended — atomically get output and update status
       const current = tasks.get(id);
