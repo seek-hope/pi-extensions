@@ -35,6 +35,18 @@ function shortId(): string {
   return `sa-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+// Read default/cheap model from pi settings
+let _defaultModel: string | undefined;
+let _cheapModel: string | undefined;
+try {
+  const { readFileSync } = require("fs");
+  const { join } = require("path");
+  const { homedir } = require("os");
+  const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf-8"));
+  _defaultModel = cfg.defaultModel;
+  _cheapModel = _defaultModel?.replace(/pro/i, "flash") || _defaultModel;
+} catch { /* use defaults */ }
+
 function branchName(id: string): string {
   return `pi/subagent/${id}`;
 }
@@ -401,7 +413,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Spawn a sub-agent to handle a self-contained task in an isolated git worktree.",
     promptGuidelines: [
       "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
-      "Use subagent_spawn with model='deepseek-v4-flash' for cheap, simple tasks like searching or reading files.",
+      "Use subagent_spawn with the cheaper model variant for simple tasks like searching or reading files.",
       "When a user asks for multiple independent changes, spawn a subagent for each one with subagent_parallel.",
       "Always review sub-agent output with subagent_review before merging — never merge blindly.",
       "After spawning (spawn, explore, plan), use subagent_wait to collect the result, then subagent_review/reject/merge.",
@@ -409,7 +421,7 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
-      model: Type.Optional(Type.String({ description: "Model override (e.g. 'deepseek-v4-flash' for cheap tasks)" })),
+      model: Type.Optional(Type.String({ description: "Model override (e.g. use the cheaper model variant for simple tasks)" })),
       tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
       systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt" })),
     }),
@@ -797,10 +809,10 @@ export default function (pi: ExtensionAPI) {
     label: "Explore Agent",
     description:
       "Spawn a read-only exploration sub-agent optimized for searching, reading, and analyzing code. " +
-      "Uses deepseek-v4-flash by default for cost efficiency. " +
+      "Uses the cheaper model by default for cost efficiency. " +
       "The agent has only read tools — it cannot modify files. " +
       "Use this for code discovery, dependency analysis, and research tasks.",
-    promptSnippet: "Explore codebase with a read-only agent (v4-flash, cheap).",
+    promptSnippet: "Explore codebase with a read-only agent (cheap, fast).",
     promptGuidelines: [
       "Use subagent_explore for code discovery, searching across multiple files, and understanding codebase structure.",
       "The explore agent is read-only — it's safe for any exploration task.",
@@ -811,7 +823,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const { id, promise } = spawnSubAgent(params.task, ctx.cwd, {
-        model: "deepseek-v4-flash",
+        model: _cheapModel || "deepseek-v4-flash",
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are an exploration agent. You can ONLY read and search — you CANNOT write, edit, or delete anything. Focus on finding information quickly and reporting it concisely.",
       });
@@ -849,7 +861,7 @@ export default function (pi: ExtensionAPI) {
         ? `${params.task}\n\nRequirements:\n${params.criteria}\n\nIMPORTANT: Do NOT modify any files. Produce a detailed step-by-step plan only.`
         : `${params.task}\n\nIMPORTANT: Do NOT modify any files. Produce a detailed step-by-step plan only.`;
       const { id, promise } = spawnSubAgent(fullTask, ctx.cwd, {
-        model: "deepseek-v4-flash",
+        model: _cheapModel || "deepseek-v4-flash",
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are a planning agent. You explore the codebase to understand the current state, then design a step-by-step implementation plan. You do NOT modify any files — you only READ and PLAN. Your output should be a clear, actionable plan.",
       });
@@ -872,15 +884,15 @@ export default function (pi: ExtensionAPI) {
     description:
       "Review a completed sub-agent's work, auto-fix issues, and re-review " +
       "in a loop until no problems remain or max iterations is reached. " +
-      "The reviewer (deepseek-v4-pro) inspects the diff; the fixer (deepseek-v4-flash) " +
-      "applies corrections on the same branch. Each iteration produces a new commit. " +
+      "The reviewer inspects the diff; the fixer applies corrections on the same branch. " +
+      "Each iteration produces a new commit. " +
       "Returns the final diff and a summary of all fix iterations.",
     promptSnippet: "Review → fix → re-review loop until clean. Auto-iterate.",
     promptGuidelines: [
       "Use subagent_refine after subagent_wait returns done, to auto-polish the result before merging.",
       "The refine loop runs: reviewer inspects the diff → fixer corrects issues → re-review → repeat until clean.",
       "If maxIterations is reached and issues remain, the tool reports remaining issues for manual resolution.",
-      "The reviewer uses v4-pro for deep analysis; the fixer uses v4-flash for fast corrections.",
+      "The reviewer uses the main model for deep analysis; the fixer uses the cheaper model for fast corrections.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Sub-agent ID to refine" }),
@@ -898,8 +910,7 @@ export default function (pi: ExtensionAPI) {
 
       const maxIter = Math.min(params.maxIterations || 3, 5);
       const criteria = params.criteria ||
-        "Check for: bugs, logic errors, security issues, style violations, incomplete implementation, " +
-        "missing edge cases, merge conflicts markers, broken imports, and code that does not compile.";
+        "Review the code thoroughly. Consider correctness, security, performance, style, edge cases, and completeness.";
 
       const iterations: { iter: number; reviewerResult: string; fixerResult: string; issuesFound: number; clean: boolean }[] = [];
 
@@ -922,7 +933,7 @@ export default function (pi: ExtensionAPI) {
         ].join("\n");
 
         const { promise: reviewPromise } = spawnSubAgent(reviewTask, ctx.cwd, {
-          model: "deepseek-v4-pro",
+          model: _defaultModel || "deepseek-v4-pro",
         });
         const reviewerOutput = await reviewPromise;
 
@@ -962,7 +973,7 @@ export default function (pi: ExtensionAPI) {
         ].join("\n");
 
         const { promise: fixPromise } = spawnSubAgent(fixTask, ctx.cwd, {
-          model: "deepseek-v4-flash",
+          model: _cheapModel || "deepseek-v4-flash",
         });
         const fixerOutput = await fixPromise;
 
@@ -988,18 +999,18 @@ export default function (pi: ExtensionAPI) {
       "Run an iterative review→fix→review loop with fresh-eye protocol. " +
       "Each reviewer is a fresh sub-agent with no knowledge of previous rounds — " +
       "this ensures objective, unbiased reviews. " +
-      "Both reviewer and fixer use the main model (v4-pro) for complex audit tasks. " +
+      "Both reviewer and fixer use the main model for complex audit tasks. " +
       "Use this for security audits, code quality reviews, compliance checks.",
     promptSnippet: "Fresh-eye review loop: each round gets a clean-slate reviewer for unbiased audits.",
     promptGuidelines: [
       "Use subagent_audit for thorough, unbiased code audits. The fresh-eye protocol prevents reviewer bias across rounds.",
       "Each review round spawns a new sub-agent with NO context from previous rounds — only the current code state.",
-      "The fixer also runs on v4-pro since audit fixes require deep understanding.",
+      "The fixer also runs on the main model since audit fixes require deep understanding.",
       "After the audit loop, review the final diff with subagent_review before merging.",
     ],
     parameters: Type.Object({
       target: Type.String({ description: "What to audit: a sub-agent ID (to review its work), a file path, or a description of the code to review" }),
-      criteria: Type.String({ description: "Review criteria: what to check for (e.g. 'security vulnerabilities', 'code quality', 'SQL injection, XSS, auth bypass')" }),
+      criteria: Type.String({ description: "Review criteria: what to check for" }),
       maxRounds: Type.Optional(Type.Number({ description: "Max review rounds (default: 5, max: 5)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1041,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
         ].join("\n");
 
         const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewPrompt, ctx.cwd, {
-          model: "deepseek-v4-pro",
+          model: _defaultModel || "deepseek-v4-pro",
           systemPrompt: "You are a thorough, unbiased code reviewer. Approach each review with completely fresh eyes. Do not assume anything — verify everything. Be strict and precise.",
         });
         const reviewerOutput = await reviewPromise;
@@ -1085,7 +1096,7 @@ export default function (pi: ExtensionAPI) {
         ].join("\n");
 
         const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixPrompt, ctx.cwd, {
-          model: "deepseek-v4-pro",
+          model: _defaultModel || "deepseek-v4-pro",
         });
         const fixerOutput = await fixPromise;
         subAgents.delete(fixerId);
