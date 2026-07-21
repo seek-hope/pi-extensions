@@ -80,16 +80,16 @@ function ydotoolOK(): boolean {
   } catch { return false; }
 }
 
-/** Retry a ydotool action up to maxRetries times with delay */
-function ydotoolRetry(action: string, maxRetries = 3, delayMs = 200): void {
+/** Retry a ydotool action up to attempts times (default: 3 total) */
+function ydotoolRetry(action: string, attempts = 3, delayMs = 200): void {
   let lastErr: any;
-  for (let i = 0; i < maxRetries; i++) {
+  for (let i = 0; i < attempts; i++) {
     try {
       sudoSh(action, 5_000);
       return;
-    } catch (e) { lastErr = e; if (i < maxRetries - 1) { const _sleep = spawnSync("sleep", [(delayMs / 1000).toString()], { timeout: delayMs + 500 }); } }
+    } catch (e) { lastErr = e; if (i < attempts - 1) { const _sleep = spawnSync("sleep", [(delayMs / 1000).toString()], { timeout: delayMs + 500 }); } }
   }
-  throw lastErr || new Error(`ydotool failed after ${maxRetries} retries`);
+  throw lastErr || new Error(`ydotool failed after ${attempts} attempts`);
 }
 
 /** Move mouse and verify position (retry if not at target) */
@@ -104,7 +104,7 @@ function moveToVerified(x: number, y: number, bound: { width: number; height: nu
       const pos = getCursorPos();
       // Accept if within 5px tolerance
       if (Math.abs(pos.x - cx) <= 5 && Math.abs(pos.y - cy) <= 5) return;
-      if (attempt === 2) return; // Last attempt — accept anyway
+      if (attempt === 2) return; // 3rd attempt — accept anyway
     } catch (e) { lastErr = e; }
   }
   throw lastErr || new Error(`Failed to move to (${cx}, ${cy})`);
@@ -344,7 +344,7 @@ export default function (pi: ExtensionAPI) {
         const dir = params.amount > 0 ? 4 : 5; // 4=up, 5=down
         const count = Math.min(Math.abs(params.amount), 20); // Cap at 20 for sanity
         for (let i = 0; i < count; i++) {
-          ydotoolRetry(`ydotool click ${dir}`, 2, 50);
+          ydotoolRetry(`ydotool click ${dir}`, 3, 50);
         }
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Scrolled ${params.amount > 0 ? "up" : "down"} ${count} at (${pos.x}, ${pos.y})` }], details: { amount: params.amount, ...pos } };
