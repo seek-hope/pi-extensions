@@ -46,6 +46,11 @@ function saveTasks(tasks: Map<string, Task>): void {
 }
 
 const tasks = loadTasks();
+let _pi: ExtensionAPI | null = null;
+
+function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): void {
+  try { _pi?.ui?.notify?.(msg, type); } catch { /* ignore */ }
+}
 
 // ── spawn background task ──────────────────────────────────────────────────
 
@@ -69,6 +74,9 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   writeFileSync(scriptFile, script);
 
   execSync(`tmux new-session -d -s "${id}" "bash ${scriptFile} ; rm -f ${scriptFile}" 2>/dev/null`, { timeout: 10_000 });
+
+  // Poll for completion and notify
+  pollCompletion(id);
 
   if (timeout > 0) {
     setTimeout(() => {
@@ -110,18 +118,43 @@ function killTask(id: string): boolean {
   return true;
 }
 
+function pollCompletion(id: string): void {
+  const check = () => {
+    const task = tasks.get(id);
+    if (!task || task.status !== "running") return;
+    try {
+      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 3_000 });
+      // Still running — check again in 3s
+      setTimeout(check, 3000);
+    } catch {
+      // Session ended
+      const output = getTaskOutput(task);
+      tasks.set(id, task);
+      saveTasks(tasks);
+      const emoji = task.status === "done" ? "✅" : "❌";
+      notifyUser(`${emoji} Background task ${id} completed (${task.status})`, task.status === "done" ? "info" : "error");
+    }
+  };
+  setTimeout(check, 3000);
+}
+
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  _pi = pi;
+
   // Sync running tasks with actual tmux sessions on startup
   function syncTasks(): void {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
       try {
         execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+        // Still running — resume polling
+        pollCompletion(id);
       } catch {
         // Session gone — check log for exit code
-        getTaskOutput(task); // updates status
+        getTaskOutput(task);
+        saveTasks(tasks);
       }
     }
   }
