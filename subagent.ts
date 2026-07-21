@@ -961,6 +961,7 @@ export default function (pi: ExtensionAPI) {
 
         const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewTask, ctx.cwd, {
           model: _defaultModel || "deepseek-v4-pro",
+          tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"], // read-only
         });
         const reviewerOutput = await reviewPromise;
         subAgents.delete(reviewerId);
@@ -1003,6 +1004,7 @@ export default function (pi: ExtensionAPI) {
 
         const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixTask, ctx.cwd, {
           model: _cheapModel || "deepseek-v4-flash",
+          tools: ["read", "edit", "write", "bash", "serena_search_pattern"], // edit-only, no subagent
         });
         const fixerOutput = await fixPromise;
         // Merge fixer's work back to the original agent's branch
@@ -1087,6 +1089,7 @@ export default function (pi: ExtensionAPI) {
         const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewPrompt, ctx.cwd, {
           model: _defaultModel || "deepseek-v4-pro",
           systemPrompt: "You are a thorough, unbiased code reviewer. Approach each review with completely fresh eyes. Do not assume anything — verify everything. Be strict and precise.",
+          tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"], // read-only
         });
         const reviewerOutput = await reviewPromise;
         subAgents.delete(reviewerId);
@@ -1131,6 +1134,7 @@ export default function (pi: ExtensionAPI) {
 
         const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixPrompt, ctx.cwd, {
           model: _defaultModel || "deepseek-v4-pro",
+          tools: ["read", "edit", "write", "bash", "serena_search_pattern"], // edit-only, no subagent
         });
         const fixerOutput = await fixPromise;
         // Merge fixer's work to target branch
