@@ -158,12 +158,8 @@ function ensureShell(conn: Connection): void {
   conn.buf = "";
   conn.reqId = 0;
 
-  conn.proc = spawn("ssh", [
-    "-o", `ControlPath=${conn.socket}`,
-    "-o", "ConnectTimeout=5",
-    "-o", "LogLevel=ERROR",
-    ...conn.sshTarget.split(" "),
-  ], {
+  const args = `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${conn.sshTarget}`.split(" ");
+  conn.proc = spawn(args[0], args.slice(1), {
     stdio: ["pipe", "pipe", "pipe"],  // Capture stderr too
   });
 
@@ -217,8 +213,11 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     // Pass command directly via stdin — the shell reads lines and executes them
     // Don't wrap in quotes (that would treat semicolons literally)
     // Use a heredoc-like approach: write command, then echo the marker
-    // Note: write() returning false means backpressure (buffered), not failure
-    conn.proc.stdin.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
+    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
+    if (!wrote) {
+      conn.pending.delete(reqId);
+      reject(new Error("SSH stdin closed"));
+    }
     setTimeout(() => {
       if (conn.pending.has(reqId)) {
         conn.pending.delete(reqId);
@@ -244,10 +243,6 @@ function isConnected(key: string): boolean {
   catch { return false; }
 }
 
-function resolveTerminal(): string {
-  return process.env.TERMINAL || process.env.X_TERM_EMULATOR || "x-terminal-emulator";
-}
-
 function connect(alias: string, user: string, hostname: string, port: number, ctx: any): void {
   const key = connKey(user, hostname, port);
   const sock = socketPath(key);
@@ -259,8 +254,7 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   }
   ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
-  const terminal = resolveTerminal();
-  spawn(terminal, ["-e", "bash", "-c",
+  spawn("alacritty", ["-e", "bash", "-c",
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=12h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
@@ -332,17 +326,6 @@ function closeConn(target: string, ctx: any): void {
   ctx.ui.notify(`No connection matching "${target}".`, "error");
 }
 
-/** Build an scp target string from a connection and remote path. */
-function buildScpTarget(conn: Connection, remotePath: string): string {
-  const [userAtHost, portStr] = conn.key.split(":");
-  const hostname = userAtHost?.split("@")[1] || "";
-  if (conn.alias !== hostname) {
-    // SSH config alias — scp can use the alias directly
-    return `${conn.alias}:${remotePath}`;
-  }
-  return `-P ${portStr} ${userAtHost}:${remotePath}`;
-}
-
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -354,7 +337,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "bash") return;
     const cmd = ((event.input as any)?.command || "") as string;
-    if (!cmd || /\bsshpass\b/.test(cmd)) {
+    if (/\bsshpass\b/.test(cmd)) {
       return { block: true, reason: "sshpass blocked. Use ssh_exec or scp_to_remote/scp_from_remote." };
     }
     const words = cmd.split(/\s+/);
@@ -405,9 +388,6 @@ export default function (pi: ExtensionAPI) {
       background: Type.Optional(Type.Boolean({ description: "Run in background via nohup on remote. Returns log path immediately (default: false)" })),
     }),
     async execute(_id, params, _signal) {
-      if (!params.host?.trim()) {
-        return { content: [{ type: "text", text: "Host is required. Use ssh_status to list available connections." }], details: {}, isError: true };
-      }
       syncFromDisk();
       const conn = findConnection(params.host);
       if (!conn) {
@@ -464,15 +444,14 @@ export default function (pi: ExtensionAPI) {
       remotePath: Type.String({ description: "Remote destination path (e.g. '/data/file.pt' or '/data/')" }),
     }),
     async execute(_id, params, _signal) {
-      if (!params.host?.trim() || !params.localPath) {
-        return { content: [{ type: "text", text: "Both host and localPath are required." }], details: {}, isError: true };
-      }
       syncFromDisk();
       const conn = findConnection(params.host);
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
-        const target = buildScpTarget(conn, params.remotePath);
+        const target = conn.alias !== conn.key.split(":")[0]?.split("@")[1]
+          ? `${conn.alias}:${params.remotePath}`  // SSH config alias
+          : `-P ${conn.key.split(":")[1]} ${conn.key.split(":")[0]}:${params.remotePath}`;
         const scpArgs = [
           "-o", `ControlPath=${conn.socket}`,
           "-o", "ConnectTimeout=5",
@@ -503,15 +482,14 @@ export default function (pi: ExtensionAPI) {
       localPath: Type.String({ description: "Local destination path" }),
     }),
     async execute(_id, params, _signal) {
-      if (!params.host?.trim() || !params.remotePath) {
-        return { content: [{ type: "text", text: "Both host and remotePath are required." }], details: {}, isError: true };
-      }
       syncFromDisk();
       const conn = findConnection(params.host);
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
-        const target = buildScpTarget(conn, params.remotePath);
+        const target = conn.alias !== conn.key.split(":")[0]?.split("@")[1]
+          ? `${conn.alias}:${params.remotePath}`
+          : `-P ${conn.key.split(":")[1]} ${conn.key.split(":")[0]}:${params.remotePath}`;
         const scpArgs = [
           "-o", `ControlPath=${conn.socket}`,
           "-o", "ConnectTimeout=5",
@@ -574,8 +552,7 @@ function runRemote(alias: string, user: string, hostname: string, port: number, 
   const key = connKey(user, hostname, port);
   if (!isConnected(key)) { ctx.ui.notify(`No connection. /ssh ${alias} first.`, "warning"); return; }
   if (!connections.has(key)) addConn(key, alias, socketPath(key), targetStr(alias, user, hostname, port));
-  const conn = connections.get(key);
-  if (!conn) { ctx.ui.notify(`Connection lost.`, "error"); return; }
+  const conn = connections.get(key)!;
   ctx.ui.setStatus("ssh-" + key, `running...`);
   shellExec(conn, command, 120_000).then(result => {
     ctx.ui.setStatus("ssh-" + key, "");

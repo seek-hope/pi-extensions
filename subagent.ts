@@ -7,7 +7,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, spawnSync, ChildProcess } from "node:child_process";
+import { spawn, ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -17,7 +17,6 @@ interface SubAgent {
   id: string;
   branch: string;
   worktreePath: string;
-  cwd: string; // the original repo root used to spawn this agent
   task: string;
   status: "running" | "done" | "error" | "cancelled" | "merged" | "rejected";
   startTime: number;
@@ -55,28 +54,21 @@ function branchName(id: string): string {
 // ── git helpers ─────────────────────────────────────────────────────────────
 
 function git(args: string[], cwd: string): string {
-  // Use spawnSync with args array — no shell, no injection risk
-  const result = spawnSync("git", args, {
+  const { execSync } = require("child_process");
+  const escaped = args.map(a => `'${a.replace(/'/g, "'\\''")}'`);
+  return execSync(["git", ...escaped].join(" "), {
     cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
     timeout: 30_000,
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    const err = new Error((result.stderr || "").trim() || `git exited with code ${result.status}`);
-    (err as any).stderr = result.stderr || "";
-    throw err;
-  }
-  return (result.stdout || "").trim();
 }
 
 function gitQuiet(args: string[], cwd: string): string {
   try {
     return git(args, cwd);
   } catch (e: any) {
-    return e?.stderr || e?.message || "";
+    return e.stderr || e.message || "";
   }
 }
 
@@ -262,7 +254,6 @@ function spawnSubAgent(
     id,
     branch: branchName(id),
     worktreePath,
-    cwd: root,
     task,
     status: "running",
     startTime,
@@ -788,10 +779,8 @@ export default function (pi: ExtensionAPI) {
         });
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
-        for (const r of batchResults) {
-          subAgents.delete(r.id);
-          cleanupWorktree(ctx.cwd, r.id, true);
-        }
+        for (const r of batchResults) subAgents.delete(r.id);
+        cleanupWorktree(ctx.cwd, r.id, true);
       }
 
       const summary = [
@@ -1173,15 +1162,12 @@ export default function (pi: ExtensionAPI) {
           tools: ["read", "edit", "write", "bash", "serena_search_pattern"], // edit-only, no subagent
         });
         const fixerOutput = await fixPromise;
-        // Merge fixer's work to target branch (only if we have a branch to merge into)
-        if (targetBranch) {
-          try {
-            const prevBranch = git(["rev-parse", "--abbrev-ref", "HEAD"], ctx.cwd);
-            git(["checkout", targetBranch], ctx.cwd);
-            git(["merge", "--no-edit", branchName(fixerId)], ctx.cwd);
-            git(["checkout", prevBranch], ctx.cwd);
-          } catch { /* best effort */ }
-        }
+        // Merge fixer's work to target branch
+        try {
+          git(["checkout", targetBranch || "-"], ctx.cwd);
+          git(["merge", "--no-edit", branchName(fixerId)], ctx.cwd);
+          git(["checkout", "-"], ctx.cwd);
+        } catch { /* best effort */ }
         subAgents.delete(fixerId);
         cleanupWorktree(ctx.cwd, fixerId, true);
 
