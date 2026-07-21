@@ -115,7 +115,25 @@ function killTask(id: string): boolean {
   task.status = "killed";
   task.endTime = Date.now();
   saveTasks(tasks);
+  updateTaskWidget();
   return true;
+}
+
+function updateTaskWidget(): void {
+  try {
+    const running: string[] = [];
+    for (const [id, t] of tasks) {
+      if (t.status === "running") {
+        const elapsed = ((Date.now() - t.startTime) / 60000).toFixed(0);
+        running.push(`🔄 ${id}: ${t.description.substring(0, 40)} (${elapsed}m)`);
+      }
+    }
+    if (running.length > 0) {
+      _pi?.ui?.setWidget?.("bg-tasks", running.map(l => `│ ${l}`));
+    } else {
+      _pi?.ui?.setWidget?.("bg-tasks", undefined);
+    }
+  } catch { /* best effort */ }
 }
 
 function pollCompletion(id: string): void {
@@ -123,8 +141,9 @@ function pollCompletion(id: string): void {
     const task = tasks.get(id);
     if (!task || task.status !== "running") return;
     try {
-      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 3_000 });
-      // Still running — check again in 3s
+      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+      // Still running
+      updateTaskWidget();
       setTimeout(check, 5000);
     } catch {
       // Session ended
@@ -132,6 +151,7 @@ function pollCompletion(id: string): void {
       tasks.set(id, task);
       saveTasks(tasks);
       const emoji = task.status === "done" ? "✅" : "❌";
+      updateTaskWidget();
       notifyUser(`${emoji} Background task ${id} completed (${task.status})`, task.status === "done" ? "info" : "error");
       // Send result as new user input so AI can process it
       try {

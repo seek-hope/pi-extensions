@@ -43,6 +43,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
         unchanged++;
         // Log stopped growing for 15s → task likely done
         if (unchanged >= 5) {
+          try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
           const output = await shellExec(conn, `cat ${logPath} 2>/dev/null`, 15_000);
           if (_sshPi) {
             _sshPi.sendUserMessage([
@@ -56,6 +57,8 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       } else {
         lastSize = size;
         unchanged = 0;
+        // Update widget so model knows task is still running
+        try { _sshPi?.ui?.setStatus?.("ssh-bg", `🔄 SSH bg task running on ${host}`); } catch { /* ok */ }
       }
       setTimeout(check, 5000);
     } catch { setTimeout(check, 5000); }
