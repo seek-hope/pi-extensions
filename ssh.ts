@@ -28,6 +28,40 @@ interface Connection {
 }
 
 const connections = new Map<string, Connection>();
+let _sshPi: ExtensionAPI | null = null;
+
+// Poll remote background task and inject result when done
+function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: string): void {
+  let lastSize = 0;
+  let unchanged = 0;
+
+  async function check() {
+    try {
+      const result = await shellExec(conn, `wc -c < ${logPath} 2>/dev/null || echo 0`, 10_000);
+      const size = parseInt(result.trim(), 10) || 0;
+      if (size === lastSize) {
+        unchanged++;
+        // Log stopped growing for 15s → task likely done
+        if (unchanged >= 5) {
+          const output = await shellExec(conn, `cat ${logPath} 2>/dev/null`, 15_000);
+          if (_sshPi) {
+            _sshPi.sendUserMessage([
+              { type: "text", text: `[SSH background task completed on ${host}]` },
+              { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+              { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
+            ], { deliverAs: "followUp" });
+          }
+          return;
+        }
+      } else {
+        lastSize = size;
+        unchanged = 0;
+      }
+      setTimeout(check, 5000);
+    } catch { setTimeout(check, 5000); }
+  }
+  setTimeout(check, 3000);
+}
 
 function connKey(user: string, hostname: string, port: number): string {
   return `${user}@${hostname}:${port}`;
@@ -248,6 +282,8 @@ function closeConn(target: string, ctx: any): void {
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  _sshPi = pi;
+
   if (!existsSync(SOCKET_DIR)) mkdirSync(SOCKET_DIR, { recursive: true });
 
   // ── interceptor: block raw remote ssh ────────────────────────────────
@@ -325,6 +361,10 @@ export default function (pi: ExtensionAPI) {
           const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
           const result = await shellExec(conn, bgCmd, 15000);
           conn.lastUse = Date.now();
+
+          // Poll remote log and inject result when done
+          pollRemoteTask(conn, logPath, params.command, params.host);
+
           return {
             content: [{
               type: "text",
