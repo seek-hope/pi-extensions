@@ -196,7 +196,6 @@ export default function (pi: ExtensionAPI) {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
       try {
-      try {
         execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
         // Still running — resume polling
         pollCompletion(id);
