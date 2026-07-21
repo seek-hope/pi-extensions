@@ -980,6 +980,139 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── subagent_audit (fresh-eye review loop) ───────────────────────────
+  pi.registerTool({
+    name: "subagent_audit",
+    label: "Audit Loop",
+    description:
+      "Run an iterative review→fix→review loop with fresh-eye protocol. " +
+      "Each reviewer is a fresh sub-agent with no knowledge of previous rounds — " +
+      "this ensures objective, unbiased reviews. " +
+      "Both reviewer and fixer use the main model (v4-pro) for complex audit tasks. " +
+      "Use this for security audits, code quality reviews, compliance checks.",
+    promptSnippet: "Fresh-eye review loop: each round gets a clean-slate reviewer for unbiased audits.",
+    promptGuidelines: [
+      "Use subagent_audit for thorough, unbiased code audits. The fresh-eye protocol prevents reviewer bias across rounds.",
+      "Each review round spawns a new sub-agent with NO context from previous rounds — only the current code state.",
+      "The fixer also runs on v4-pro since audit fixes require deep understanding.",
+      "After the audit loop, review the final diff with subagent_review before merging.",
+    ],
+    parameters: Type.Object({
+      target: Type.String({ description: "What to audit: a sub-agent ID (to review its work), a file path, or a description of the code to review" }),
+      criteria: Type.String({ description: "Review criteria: what to check for (e.g. 'security vulnerabilities', 'code quality', 'SQL injection, XSS, auth bypass')" }),
+      maxRounds: Type.Optional(Type.Number({ description: "Max review rounds (default: 3, max: 5)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const maxRounds = Math.min(params.maxRounds || 3, 5);
+      const criteria = params.criteria;
+      const target = params.target;
+      const rounds: { round: number; issuesFound: number; reviewerResult: string; fixerResult: string; clean: boolean }[] = [];
+
+      // Determine if target is a sub-agent ID or a direct file/code description
+      let targetDesc = target;
+      let targetBranch: string | undefined;
+      const existingAgent = subAgents.get(target);
+      if (existingAgent && existingAgent.status !== "running") {
+        targetBranch = existingAgent.branch;
+        targetDesc = `branch ${targetBranch} (task: ${existingAgent.task})`;
+      }
+
+      for (let r = 1; r <= maxRounds; r++) {
+        // ── Review phase (fresh-eye: no context from previous rounds) ──
+        const reviewPrompt = [
+          `Review the following code for: ${criteria}`,
+          ``,
+          `Target: ${targetDesc}`,
+          ``,
+          `IMPORTANT — Fresh Eye Protocol:`,
+          `- You are reviewing the code as it exists RIGHT NOW.`,
+          `- Do NOT assume previous issues have been fixed.`,
+          `- Do NOT assume previous reviews were correct.`,
+          `- Evaluate the code with completely fresh eyes.`,
+          ``,
+          `RESPONSE FORMAT:`,
+          `FOUND: <number of distinct issues, 0 if none>`,
+          `CLEAN: <true|false>`,
+          `ISSUES:`,
+          `- <specific issue with file path and line>`,
+          `- ...`,
+          ``,
+          `If CLEAN is true, just write "CLEAN: true" with a brief note confirming the code passes review.`,
+        ].join("\n");
+
+        const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewPrompt, ctx.cwd, {
+          model: "deepseek-v4-pro",
+          systemPrompt: "You are a thorough, unbiased code reviewer. Approach each review with completely fresh eyes. Do not assume anything — verify everything. Be strict and precise.",
+        });
+        const reviewerOutput = await reviewPromise;
+        subAgents.delete(reviewerId);
+
+        const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
+        const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
+        const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
+        const issuesFound = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
+
+        rounds.push({ round: r, issuesFound, reviewerResult: reviewerOutput.substring(0, 3000), fixerResult: "", clean: isClean });
+
+        if (isClean || issuesFound === 0) {
+          const summary = [
+            `┌─ Audit Complete ─────────────────────────────`,
+            `│ Target: ${targetDesc}`,
+            `│ Criteria: ${criteria}`,
+            `│ Rounds: ${r}`,
+            `│ Result: ✅ ALL CLEAN`,
+            `│`,
+          ];
+          for (const round of rounds) {
+            summary.push(`│ Round ${round.round}: ${round.issuesFound} issue(s) → ${round.clean ? "CLEAN" : "FIXED"}`);
+          }
+          summary.push(`└──────────────────────────────────────────────`);
+          return { content: [{ type: "text", text: summary.join("\n") }], details: { rounds: r, clean: true } };
+        }
+
+        // ── Fix phase ──────────────────────────────────────────────────
+        const fixPrompt = [
+          `Fix the following ${issuesFound} issue(s) found during code audit:`,
+          ``,
+          `Criteria: ${criteria}`,
+          `Target: ${targetDesc}`,
+          ``,
+          `Issues found by the reviewer:`,
+          reviewerOutput.substring(0, 4000),
+          ``,
+          `Fix ALL the issues listed above. Be thorough — every issue must be addressed.`,
+          `Work in the current directory and make concrete edits to the files.`,
+        ].join("\n");
+
+        const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixPrompt, ctx.cwd, {
+          model: "deepseek-v4-pro",
+        });
+        const fixerOutput = await fixPromise;
+        subAgents.delete(fixerId);
+
+        rounds[rounds.length - 1].fixerResult = fixerOutput.substring(0, 2000);
+      }
+
+      // Max rounds reached
+      const lastRound = rounds[rounds.length - 1];
+      const summary = [
+        `┌─ Audit: Max Rounds Reached ──────────────────`,
+        `│ Target: ${targetDesc}`,
+        `│ Criteria: ${criteria}`,
+        `│ Rounds: ${maxRounds}`,
+        `│ Result: ⚠ ${lastRound.issuesFound} issue(s) remain`,
+        `│`,
+      ];
+      for (const round of rounds) {
+        summary.push(`│ Round ${round.round}: ${round.issuesFound} issue(s) → ${round.clean ? "CLEAN" : "FIXED"}`);
+      }
+      summary.push(`│`);
+      summary.push(`│ Manual review recommended before proceeding.`);
+      summary.push(`└──────────────────────────────────────────────`);
+      return { content: [{ type: "text", text: summary.join("\n") }], details: { rounds: maxRounds, clean: false } };
+    },
+  });
+
   // ── subagent_list / subagent_cancel ────────────────────────────────────
   pi.registerTool({
     name: "subagent_list",
