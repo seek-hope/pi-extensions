@@ -210,9 +210,10 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       task: Type.String({ description: "Command or task to run in background" }),
       model: Type.Optional(Type.String({ description: "Model override (not applicable for bash commands)" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max runtime in ms (default: 3600000 = 60 min)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const task = spawnTask(params.task, ctx.cwd, 1_800_000); // 30 min default
+      const task = spawnTask(params.task, ctx.cwd, params.timeoutMs || 3_600_000); // default 60 min
       return {
         content: [{
           type: "text",
