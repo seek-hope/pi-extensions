@@ -125,7 +125,7 @@ function pollCompletion(id: string): void {
     try {
       execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 3_000 });
       // Still running — check again in 3s
-      setTimeout(check, 3000);
+      setTimeout(check, 5000);
     } catch {
       // Session ended
       const output = getTaskOutput(task);
@@ -146,7 +146,7 @@ function pollCompletion(id: string): void {
       } catch { /* ignore */ }
     }
   };
-  setTimeout(check, 3000);
+  setTimeout(check, 5000);
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
