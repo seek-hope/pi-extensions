@@ -431,6 +431,14 @@ export default function (pi: ExtensionAPI) {
       background: Type.Optional(Type.Boolean({ description: "Run in background via nohup on remote. Returns log path immediately (default: false)" })),
     }),
     async execute(_id, params, _signal) {
+      // Block sleep — SSH is persistent, no warmup needed; pollRemoteTask auto-delivers bg results
+      if (/^\s*sleep\s+\d/.test(params.command)) {
+        return {
+          content: [{ type: "text", text: "sleep is unnecessary. SSH connections are persistent — just run the actual command directly. For bg tasks, the system auto-polls and delivers results." }],
+          details: { blocked: true },
+        };
+      }
+
       syncFromDisk();
       const conn = findConnection(params.host);
       if (!conn) {
