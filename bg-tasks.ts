@@ -63,9 +63,8 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   const scriptFile = join(TASK_DIR, `${id}.sh`);
   const script = [
     `cd "${cwd}"`,
-    `{ ${description}; } > "${logFile}" 2>&1`,
-    `EXIT=$?`,
-    `echo "EXIT_CODE=$EXIT" >> "${logFile}"`,
+    `( ${description} ) > "${logFile}" 2>&1`,
+    `echo "EXIT_CODE=$?" >> "${logFile}"`,
   ].join("\n");
   writeFileSync(scriptFile, script);
 
