@@ -151,8 +151,13 @@ function ensureShell(conn: Connection): void {
   // Already alive — don't reset
   if (conn.proc && conn.proc.exitCode === null && conn.proc.stdin?.writable) return;
 
-  // Dead or dying — clean up
-  if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
+  // Clean up dead/dying proc
+  if (conn.proc) {
+    conn.proc.removeAllListeners();
+    try { conn.proc.kill(); } catch { /* ok */ }
+    conn.proc = null;
+  }
+  // Reject stale pending promises
   for (const [, p] of conn.pending) p.reject(new Error("Connection reset"));
   conn.pending.clear();
   conn.buf = "";
@@ -160,7 +165,7 @@ function ensureShell(conn: Connection): void {
 
   const args = `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${conn.sshTarget}`.split(" ");
   conn.proc = spawn(args[0], args.slice(1), {
-    stdio: ["pipe", "pipe", "pipe"],  // Capture stderr too
+    stdio: ["pipe", "pipe", "pipe"],
   });
 
   conn.proc.stdout!.on("data", (chunk: Buffer) => {
@@ -260,11 +265,15 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   const key = connKey(user, hostname, port);
   const sock = socketPath(key);
   const sshTarget = targetStr(alias, user, hostname, port);
-  if (isConnected(key)) {
+  // Re-check right before connecting (master may have died since last check)
+  const alreadyUp = isConnected(key);
+  if (alreadyUp) {
     if (!connections.has(key)) addConn(key, alias, sock, sshTarget);
     ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}.`, "info");
     return;
   }
+  // Dead socket lingering — clean up
+  if (existsSync(sock)) { try { rmSync(sock); } catch { /* ok */ } }
   ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
   const termProc = spawn("alacritty", ["-e", "bash", "-c",
@@ -309,16 +318,25 @@ function syncFromDisk(): void {
       if (!name.endsWith(".sock")) continue;
       const sock = join(SOCKET_DIR, name);
       try {
+        // Quick check with short timeout
         const result = spawnSync("ssh", ["-O", "check", "-o", `ControlPath=${sock}`, "x"], {
-          encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 3_000
+          encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 2_000
         });
-        if (result.status !== 0 && !/master running/i.test((result.stderr || ""))) continue;
+        const combined = (result.stdout || "") + (result.stderr || "");
+        if (result.status !== 0 && !/master running/i.test(combined)) {
+          // Master dead — clean up stale socket
+          try { rmSync(sock); } catch { /* ok */ }
+          continue;
+        }
         const key = keyFromFilename(name);
         if (![...connections.values()].some(c => c.socket === sock)) {
           const [uh, pt] = key.split(":");
           addConn(key, uh, sock, pt && pt !== "22" ? `-p ${pt} ${uh}` : uh);
         }
-      } catch { /* not active */ }
+      } catch {
+        // ssh -O check timed out — socket likely stale, clean up
+        try { rmSync(sock); } catch { /* ok */ }
+      }
     }
   } catch { /* empty */ }
 }
@@ -326,7 +344,14 @@ function syncFromDisk(): void {
 function findConnection(host: string): Connection | undefined {
   syncFromDisk();
   const s = host.toLowerCase();
-  for (const [, c] of connections) if (c.key.toLowerCase().includes(s) || c.alias.toLowerCase().includes(s)) return c;
+  // Exact match first: alias or key
+  for (const [, c] of connections) {
+    if (c.alias.toLowerCase() === s || c.key.toLowerCase() === s) return c;
+  }
+  // Substring match as fallback
+  for (const [, c] of connections) {
+    if (c.key.toLowerCase().includes(s) || c.alias.toLowerCase().includes(s)) return c;
+  }
   return undefined;
 }
 
@@ -414,6 +439,8 @@ export default function (pi: ExtensionAPI) {
       if (!isConnected(conn.key)) {
         if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
         connections.delete(conn.key);
+        // Clean up stale socket
+        try { rmSync(conn.socket); } catch { /* ok */ }
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
