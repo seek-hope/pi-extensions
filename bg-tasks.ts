@@ -68,14 +68,14 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   ].join("\n");
 
   // Start in detached tmux
-  execSync(`tmux new-session -d -s "${id}" "bash -c '${wrapped.replace(/'/g, "'\\''")}'" 2>/dev/null`);
+  execSync(`tmux new-session -d -s "${id}" "bash -c '${wrapped.replace(/'/g, "'\\''")}'" 2>/dev/null`, { timeout: 10_000 });
 
   // Timeout killer
   if (timeout > 0) {
     setTimeout(() => {
       const t = tasks.get(id);
       if (t && t.status === "running") {
-        try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`); } catch { /* ok */ }
+        try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
         t.status = "killed";
         t.endTime = Date.now();
         saveTasks(tasks);
@@ -104,7 +104,7 @@ function getTaskOutput(task: Task): string {
 function killTask(id: string): boolean {
   const task = tasks.get(id);
   if (!task) return false;
-  try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`); } catch { /* ok */ }
+  try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
   task.status = "killed";
   task.endTime = Date.now();
   saveTasks(tasks);
@@ -119,7 +119,7 @@ export default function (pi: ExtensionAPI) {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
       try {
-        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore" });
+        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
       } catch {
         // Session gone — check log for exit code
         getTaskOutput(task); // updates status

@@ -231,7 +231,7 @@ function closeConn(target: string, ctx: any): void {
   for (const [key, c] of connections) {
     if (c.key.includes(target) || c.alias.includes(target)) {
       if (c.proc) { try { c.proc.kill(); } catch { /* ok */ } }
-      try { execSync(`ssh -o ControlPath="${c.socket}" -O exit x 2>/dev/null`, { stdio: "ignore" }); } catch { /* ok */ }
+      try { execSync(`ssh -o ControlPath="${c.socket}" -O exit x 2>/dev/null`, { stdio: "ignore", timeout: 10_000 }); } catch { /* ok */ }
       try { rmSync(c.socket); } catch { /* ok */ }
       connections.delete(key);
       ctx.ui.notify(`Closed ${c.key}.`, "info");

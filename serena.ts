@@ -41,7 +41,11 @@ function sendMessage(msg: any): void {
   if (!proc?.stdin?.writable) return;
   const body = JSON.stringify(msg);
   const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
-  proc.stdin.write(header + body);
+  const ok = proc.stdin.write(header + body);
+  if (!ok) {
+    // Backpressure — drain before writing more
+    proc.stdin.once("drain", () => {});
+  }
 }
 
 function mcpRequest(method: string, params?: any): Promise<any> {
