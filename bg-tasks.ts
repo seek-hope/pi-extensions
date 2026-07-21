@@ -132,10 +132,12 @@ function updateTaskWidget(): void {
         running.push(`🔄 ${id}: ${t.description.substring(0, 40)} (${elapsed}m)`);
       }
     }
-    if (running.length > 0) {
-      _pi?.ui?.setWidget?.("bg-tasks", running.map(l => `│ ${l}`));
-    } else {
+    if (running.length === 0) {
       _pi?.ui?.setWidget?.("bg-tasks", undefined);
+    } else if (running.length <= 3) {
+      _pi?.ui?.setWidget?.("bg-tasks", [`│ ${running.join("  │  ")}`, `│ /tasks to manage, /fg <id> for output`]);
+    } else {
+      _pi?.ui?.setWidget?.("bg-tasks", [`│ ${running.length} tasks running`, `│ /tasks to list, /fg <id> for output`]);
     }
   } catch { /* best effort */ }
 }
@@ -225,8 +227,8 @@ export default function (pi: ExtensionAPI) {
       const output = getTaskOutput(task);
       ctx.ui.setWidget("task-" + id, [
         `┌─ ${id} [${task.status}] ${(task.exitCode != null ? ` exit=${task.exitCode}` : "")}`,
-        ...output.split("\n").slice(0, 50).map((l: string) => `│ ${l.substring(0, 80)}`),
-        output.split("\n").length > 50 ? `│ ...` : "",
+        ...output.split("\n").slice(0, 10).map((l: string) => `│ ${l.substring(0, 100)}`),
+        output.split("\n").length > 10 ? `│ ... (${output.split("\n").length} lines total, /read ${task.logFile} for full)` : "",
         `└─`.replace(/_/g, "─"),
       ].filter(Boolean));
     },

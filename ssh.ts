@@ -508,9 +508,10 @@ function runRemote(alias: string, user: string, hostname: string, port: number, 
     ctx.ui.setStatus("ssh-" + key, "");
     conn.lastUse = Date.now();
     ctx.ui.setWidget("ssh-result", [
-      `┌─ ${user}@${hostname}:${port}`,
-      ...result.split("\n").slice(0, 40).map((l: string) => `│ ${l.substring(0, 80)}`),
-    ]);
+      `┌─ ${user}@${hostname}:${port} — ${command.substring(0, 40)}`,
+      ...result.split("\n").slice(0, 8).map((l: string) => `│ ${l.substring(0, 100)}`),
+      result.split("\n").length > 8 ? `│ ... (/read log for full output)` : "",
+    ].filter(Boolean));
   }).catch(e => { ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify(`Failed: ${e.message}`, "error"); });
 }
 
