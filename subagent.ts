@@ -212,7 +212,10 @@ function spawnSubAgent(
       "--no-session",
     ];
     if (options?.model) args.push("--model", options.model);
-    if (options?.tools) args.push("--tools", options.tools.join(","));
+    if (options?.tools) {
+      const toolsArg = Array.isArray(options.tools) ? options.tools.join(",") : options.tools;
+      args.push("--tools", toolsArg);
+    }
     if (options?.systemPrompt) args.push("--system-prompt", options.systemPrompt);
     args.push(task);
 
