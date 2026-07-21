@@ -76,8 +76,12 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
 // ── persistent shell ────────────────────────────────────────────────────────
 
 function ensureShell(conn: Connection): void {
-  if (conn.proc && conn.proc.exitCode === null) return;
-  // Clean up old
+  if (conn.proc && conn.proc.exitCode === null) {
+    // Check if stdin is still writable
+    if (conn.proc.stdin?.writable) return;
+    // Stdin closed — process is dead, clean up
+    try { conn.proc.kill(); } catch { /* ok */ }
+  }
   if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
   for (const [, p] of conn.pending) p.reject(new Error("Connection reset"));
   conn.pending.clear();
@@ -85,36 +89,63 @@ function ensureShell(conn: Connection): void {
   conn.reqId = 0;
 
   const args = `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${conn.sshTarget}`.split(" ");
-  conn.proc = spawn(args[0], args.slice(1), { stdio: ["pipe", "pipe", "ignore"] });
+  conn.proc = spawn(args[0], args.slice(1), {
+    stdio: ["pipe", "pipe", "pipe"],  // Capture stderr too
+  });
 
   conn.proc.stdout!.on("data", (chunk: Buffer) => {
     conn.buf += chunk.toString();
-    while (true) {
-      const m = conn.buf.match(/__END__(\d+):(\d+)\n/);
-      if (!m) break;
-      const idx = conn.buf.indexOf(m[0]);
-      const output = conn.buf.substring(0, idx);
-      conn.buf = conn.buf.substring(idx + m[0].length);
-      const reqId = parseInt(m[1]);
-      const p = conn.pending.get(reqId);
-      if (p) { conn.pending.delete(reqId); p.resolve(output); }
-    }
+    extractResponses(conn);
   });
 
-  conn.proc.on("exit", () => {
+  conn.proc.stderr!.on("data", (chunk: Buffer) => {
+    // Include stderr in output — it may contain error messages
+    conn.buf += chunk.toString();
+    extractResponses(conn);
+  });
+
+  conn.proc.on("exit", (code) => {
     conn.proc = null;
-    for (const [, p] of conn.pending) p.reject(new Error("SSH shell died"));
+    for (const [, p] of conn.pending) p.reject(new Error(`SSH shell exited (code ${code})`));
     conn.pending.clear();
   });
+
+  conn.proc.on("error", (err) => {
+    conn.proc = null;
+    for (const [, p] of conn.pending) p.reject(new Error(`SSH shell error: ${err.message}`));
+    conn.pending.clear();
+  });
+}
+
+function extractResponses(conn: Connection): void {
+  while (true) {
+    const m = conn.buf.match(/__END__(\d+):(\d+)\n/);
+    if (!m) break;
+    const idx = conn.buf.indexOf(m[0]);
+    const output = conn.buf.substring(0, idx);
+    conn.buf = conn.buf.substring(idx + m[0].length);
+    const reqId = parseInt(m[1]);
+    const p = conn.pending.get(reqId);
+    if (p) { conn.pending.delete(reqId); p.resolve(output); }
+  }
 }
 
 function shellExec(conn: Connection, cmd: string, timeout: number): Promise<string> {
   return new Promise((resolve, reject) => {
     ensureShell(conn);
+    if (!conn.proc || !conn.proc.stdin?.writable) {
+      reject(new Error("SSH shell not available"));
+      return;
+    }
     const reqId = ++conn.reqId;
     conn.pending.set(reqId, { resolve, reject });
-    const safe = cmd.replace(/'/g, "'\\''");
-    conn.proc!.stdin!.write(`'${safe}'; echo __END__${reqId}:$?\n`);
+    // Use printf-based approach to avoid shell escaping issues
+    const safe = cmd.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
+    const wrote = conn.proc.stdin.write(`'${safe}'; echo __END__${reqId}:$?\n`);
+    if (!wrote) {
+      conn.pending.delete(reqId);
+      reject(new Error("SSH stdin closed"));
+    }
     setTimeout(() => {
       if (conn.pending.has(reqId)) { conn.pending.delete(reqId); reject(new Error("SSH command timeout")); }
     }, timeout);
