@@ -419,7 +419,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
       "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
-      "MANDATORY: Commands with timeout >120s are automatically run in background (nohup). Set timeout <=120000 to run synchronously.",
+      "MANDATORY: Commands with timeout >300s are automatically run in background (nohup). Set timeout <=300000 to run synchronously.",
       "After background ssh_exec, use another ssh_exec to check progress: 'cat /tmp/task.log' or 'ps aux | grep PID'.",
       "Call ssh_status before running ssh_exec to verify the target host is connected.",
       "If no connection exists, tell the user: /ssh <host>",
@@ -444,7 +444,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
-        const isLong = (params.timeout || 120_000) > 120_000;
+        const isLong = (params.timeout || 120_000) > 300_000;
         const isBg = params.background === true || isLong;
 
         if (isBg) {
