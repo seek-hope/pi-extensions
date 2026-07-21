@@ -125,6 +125,11 @@ check_tool "gh"
 check_tool "clangd"
 check_tool "rust-analyzer"
 check_tool "serena"
+check_tool "grim"
+check_tool "ydotool"
+check_tool "wtype"
+check_tool "tmux"
+check_tool "graphify"
 
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   echo ""
@@ -133,6 +138,11 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   echo "  clangd:        apt install clangd / pacman -S clang"
   echo "  rust-analyzer: rustup component add rust-analyzer"
   echo "  serena:        uv tool install serena-agent"
+  echo "  grim:          pacman -S grim (Wayland screenshots)"
+  echo "  ydotool:       pacman -S ydotool (mouse control)"
+  echo "  wtype:         pacman -S wtype (keyboard input)"
+  echo "  tmux:          pacman -S tmux (background tasks)"
+  echo "  graphify:      npm install -g @sentropic/graphify"
 fi
 
 # ── Phase 6: playwright browsers ────────────────────────────────────────────
@@ -157,6 +167,8 @@ if [ ! -f "$ENV_FILE" ]; then
 
 export CONTEXT7_API_KEY=""     # https://context7.com
 export ANYSEARCH_API_KEY=""    # https://anysearch.com
+export HF_TOKEN=""             # https://huggingface.co/settings/tokens
+export YDOTOOL_SOCKET=/tmp/.ydotool_socket  # computer use
 export HF_API_KEY=""           # https://huggingface.co/settings/tokens
 export HF_TOKEN="$HF_API_KEY"
 
