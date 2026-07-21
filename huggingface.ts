@@ -1,11 +1,10 @@
 /**
  * HuggingFace extension — uses router.huggingface.co/v1 (OpenAI-compatible API).
- * The old api-inference.huggingface.co is deprecated.
+ * Requires: HF_TOKEN env var
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const HF_TOKEN = "HF_TOKEN_REDACTED";
 const BASE_URL = "https://router.huggingface.co/v1";
 
 export default function (pi: ExtensionAPI) {
@@ -20,10 +19,12 @@ export default function (pi: ExtensionAPI) {
       temperature: Type.Optional(Type.Number({ description: "Temperature (default 0.7)" })),
     }),
     async execute(_id, params, _signal) {
+      const token = process.env.HF_TOKEN;
+      if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
       try {
         const res = await fetch(`${BASE_URL}/chat/completions`, {
           method: "POST",
-          headers: { "Authorization": `Bearer ${HF_TOKEN}`, "Content-Type": "application/json" },
+          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model: params.model,
             messages: [{ role: "user", content: params.prompt }],
@@ -50,12 +51,14 @@ export default function (pi: ExtensionAPI) {
       temperature: Type.Optional(Type.Number({ description: "Temperature (default 0.7)" })),
     }),
     async execute(_id, params, _signal) {
+      const token = process.env.HF_TOKEN;
+      if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
       try {
         let msgs;
         try { msgs = JSON.parse(params.messages); } catch { msgs = [{ role: "user", content: params.messages }]; }
         const res = await fetch(`${BASE_URL}/chat/completions`, {
           method: "POST",
-          headers: { "Authorization": `Bearer ${HF_TOKEN}`, "Content-Type": "application/json" },
+          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model: params.model,
             messages: msgs,
@@ -82,6 +85,8 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(Type.String({ description: "Model ID (default: facebook/nllb-200-distilled-600M)" })),
     }),
     async execute(_id, params, _signal) {
+      const token = process.env.HF_TOKEN;
+      if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
       try {
         const model = params.model || "facebook/nllb-200-distilled-600M";
         const prompt = params.sourceLang
@@ -89,7 +94,7 @@ export default function (pi: ExtensionAPI) {
           : `Translate: ${params.text}`;
         const res = await fetch(`${BASE_URL}/chat/completions`, {
           method: "POST",
-          headers: { "Authorization": `Bearer ${HF_TOKEN}`, "Content-Type": "application/json" },
+          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model,
             messages: [{ role: "user", content: prompt }],
