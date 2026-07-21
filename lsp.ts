@@ -77,27 +77,25 @@ class LspClient {
   private buffer = "";
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private initialized = false;
+  private stopped = false;
 
   constructor(private server: LspServer, private root: string, private signal?: AbortSignal) {}
 
   async start(): Promise<void> {
+    this.stopped = false;
     return new Promise((resolve, reject) => {
       this.proc = spawn(this.server.bin, this.server.args, {
         cwd: this.root,
         stdio: ["pipe", "pipe", "pipe"],
       });
       this.proc.stdout!.on("data", (chunk: Buffer) => this.onData(chunk));
-      this.proc.stderr!.on("data", (chunk: Buffer) => {
-        // LSP servers log to stderr; ignore for now
-      });
       this.proc.on("error", reject);
       this.proc.on("exit", (code) => {
-        if (!this.initialized) reject(new Error(`${this.server.id} exited with code ${code}`));
+        if (!this.initialized && !this.stopped) reject(new Error(`${this.server.id} exited with code ${code}`));
       });
       if (this.signal) {
         this.signal.addEventListener("abort", () => this.stop());
       }
-      // Initialize
       this.send("initialize", {
         processId: process.pid,
         rootUri: `file://${this.root}`,
@@ -108,7 +106,7 @@ class LspClient {
             references: {},
           },
         },
-      }).then((result) => {
+      }).then(() => {
         this.initialized = true;
         this.sendNotification("initialized", {});
         resolve();
@@ -117,29 +115,29 @@ class LspClient {
   }
 
   private onData(chunk: Buffer): void {
-    this.buffer += chunk.toString();
-    // Parse complete messages (LSP uses Content-Length header + \r\n\r\n + body)
-    while (true) {
-      const headerEnd = this.buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) break;
-      const header = this.buffer.substring(0, headerEnd);
-      const lengthMatch = header.match(/Content-Length: (\d+)/i);
-      if (!lengthMatch) { this.buffer = this.buffer.substring(headerEnd + 4); continue; }
-      const contentLength = parseInt(lengthMatch[1], 10);
-      const bodyStart = headerEnd + 4;
-      if (this.buffer.length < bodyStart + contentLength) break;
-      const body = this.buffer.substring(bodyStart, bodyStart + contentLength);
-      this.buffer = this.buffer.substring(bodyStart + contentLength);
-      try {
-        const msg = JSON.parse(body);
-        if (msg.id !== undefined && msg.id !== null) {
-          const p = this.pending.get(msg.id);
-          if (p) { this.pending.delete(msg.id); p.resolve(msg.result); }
-        }
-      } catch {
-        // ignore parse errors for partial messages
+    if (this.stopped) return;
+    try {
+      this.buffer += chunk.toString();
+      while (true) {
+        const headerEnd = this.buffer.indexOf("\r\n\r\n");
+        if (headerEnd === -1) break;
+        const header = this.buffer.substring(0, headerEnd);
+        const lengthMatch = header.match(/Content-Length: (\d+)/i);
+        if (!lengthMatch) { this.buffer = this.buffer.substring(headerEnd + 4); continue; }
+        const contentLength = parseInt(lengthMatch[1], 10);
+        const bodyStart = headerEnd + 4;
+        if (this.buffer.length < bodyStart + contentLength) break;
+        const body = this.buffer.substring(bodyStart, bodyStart + contentLength);
+        this.buffer = this.buffer.substring(bodyStart + contentLength);
+        try {
+          const msg = JSON.parse(body);
+          if (msg.id !== undefined && msg.id !== null) {
+            const p = this.pending.get(msg.id);
+            if (p) { this.pending.delete(msg.id); p.resolve(msg.result); }
+          }
+        } catch { /* ignore parse errors */ }
       }
-    }
+    } catch { /* prevent unhandled event crashes */ }
   }
 
   private sendMessage(msg: any): void {
@@ -223,11 +221,19 @@ class LspClient {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     if (this.proc) {
+      // Remove all listeners to prevent post-kill events
+      this.proc.stdout?.removeAllListeners("data");
+      this.proc.stderr?.removeAllListeners("data");
+      this.proc.removeAllListeners();
       try { this.sendNotification("shutdown", {}); } catch { /* ignore */ }
       this.proc.kill();
       this.proc = null;
     }
+    // Reject remaining pending
+    for (const [, p] of this.pending) p.reject(new Error("LSP client stopped"));
+    this.pending.clear();
   }
 }
 
@@ -240,8 +246,12 @@ async function withLsp(
   signal: AbortSignal | undefined,
   fn: (client: LspClient) => Promise<string>,
 ): Promise<string> {
-  const cfg = SERVERS[language];
+  if (!language || !filePath) {
+    return `Error: language and filePath are required`;
+  }
+  const cfg = SERVERS[language?.toLowerCase() || ""];
   if (!cfg) return `Unknown language: ${language}. Supported: python, cpp, rust, typescript`;
+  if (!existsSync(filePath)) return `File not found: ${filePath}`;
   const root = findRoot(ctx.cwd, cfg.rootMarkers);
   const client = new LspClient(cfg, root, signal);
   try {
