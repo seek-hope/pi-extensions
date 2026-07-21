@@ -403,7 +403,8 @@ export default function (pi: ExtensionAPI) {
       "Use subagent_spawn with model='deepseek-v4-flash' for cheap, simple tasks like searching or reading files.",
       "When a user asks for multiple independent changes, spawn a subagent for each one with subagent_parallel.",
       "Always review sub-agent output with subagent_review before merging — never merge blindly.",
-      "After spawning, use subagent_wait to collect the result, then subagent_refine to auto-polish, then decide: subagent_merge or subagent_reject.",
+      "After spawning (spawn, explore, plan), use subagent_wait to collect the result, then subagent_review/reject/merge.",
+      "For exploration use subagent_explore (read-only, cheap). For planning use subagent_plan (design without implementing).",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
@@ -813,9 +814,15 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are an exploration agent. You can ONLY read and search — you CANNOT write, edit, or delete anything. Focus on finding information quickly and reporting it concisely.",
       });
-      const result = await promise;
-      subAgents.delete(id);
-      return { content: [{ type: "text", text: result }], details: { subagentId: id } };
+      // Non-blocking: fire and collect later
+      promise.then(() => {}).catch(() => {});
+      return {
+        content: [{
+          type: "text",
+          text: `Explore agent spawned. ID: ${id}\nTask: ${params.task}\n\nUse subagent_wait("${id}") to collect the result.`,
+        }],
+        details: { subagentId: id },
+      };
     },
   });
 
@@ -845,9 +852,15 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are a planning agent. You explore the codebase to understand the current state, then design a step-by-step implementation plan. You do NOT modify any files — you only READ and PLAN. Your output should be a clear, actionable plan.",
       });
-      const result = await promise;
-      subAgents.delete(id);
-      return { content: [{ type: "text", text: `=== Plan ===\n\n${result}` }], details: { subagentId: id } };
+      // Non-blocking: fire and collect later
+      promise.then(() => {}).catch(() => {});
+      return {
+        content: [{
+          type: "text",
+          text: `Plan agent spawned. ID: ${id}\nTask: ${params.task}\n\nUse subagent_wait("${id}") to collect the plan.`,
+        }],
+        details: { subagentId: id },
+      };
     },
   });
 
