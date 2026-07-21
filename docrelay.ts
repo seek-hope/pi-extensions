@@ -8,12 +8,12 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const BIN = "doc-relay";
 
 function run(args: string[], cwd: string): string {
-  return execSync([BIN, ...args].join(" "), {
+  return execFileSync(BIN, args, {
     cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,

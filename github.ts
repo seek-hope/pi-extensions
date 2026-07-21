@@ -5,10 +5,10 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 function gh(args: string[], cwd: string): string {
-  return execSync(["gh", ...args].join(" "), {
+  return execFileSync("gh", args, {
     cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
@@ -107,16 +107,13 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        let repoFlag = params.repo ? `--repo=${params.repo}` : "";
-        let ref = params.branch || "HEAD";
-        const out = gh(["api", repoFlag, `repos/{owner}/{repo}/contents/${params.path}?ref=${ref}`, "--jq", ".content", "|", "base64 -d"].filter(Boolean), ctx.cwd);
-        // Alternative: use `gh api -H 'Accept: application/vnd.github.raw' /repos/{owner}/{repo}/contents/{path}`
+        const ref = params.branch || "HEAD";
         const args = ["api", "-H", "Accept: application/vnd.github.raw", `/repos/{owner}/{repo}/contents/${params.path}?ref=${ref}`];
         if (params.repo) {
           args.splice(1, 0, `--repo=${params.repo}`);
         }
-        const out2 = gh(args, ctx.cwd);
-        return { content: [{ type: "text", text: out2 }], details: {} };
+        const out = gh(args, ctx.cwd);
+        return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
       }

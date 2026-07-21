@@ -7,7 +7,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync, spawn, spawnSync, ChildProcess } from "node:child_process";
+import { spawn, spawnSync, ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -60,7 +60,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
       return;
     }
-    shellExec(conn2, `wc -c < ${logPath} 2>/dev/null || echo 0`, 10_000).then(result => {
+    shellExec(conn2, `wc -c < '${logPath}' 2>/dev/null || echo 0`, 10_000).then(result => {
       if (stopped) return;
       const size = parseInt(result.trim(), 10) || 0;
       if (size === lastSize) {
@@ -70,7 +70,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
           try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
           const idx = remoteTasks.findIndex(t => t.logPath === logPath);
           if (idx >= 0) remoteTasks.splice(idx, 1);
-          shellExec(conn2, `cat ${logPath} 2>/dev/null`, 15_000).then(output => {
+          shellExec(conn2, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
             if (_sshPi) {
               _sshPi.sendUserMessage([
                 { type: "text", text: `[SSH background task completed on ${host}]` },
@@ -419,7 +419,7 @@ export default function (pi: ExtensionAPI) {
                 `${result.trim()}\n` +
                 `Log: ${logPath}\n` +
                 `Check progress: ssh_exec("${params.host}", "tail -20 ${logPath}")\n` +
-                `Read full log: ssh_exec("${params.host}", "cat ${logPath}")`,
+                `Read full log: ssh_exec("${params.host}", "cat '${logPath}'")`,
             }],
             details: { pid: result.trim(), logPath },
           };

@@ -110,14 +110,27 @@ function createWorktree(projectRoot: string, id: string): string {
   mkdirSync(join(projectRoot, ".pi", "subagent"), { recursive: true });
 
   // Remove stale worktree if exists
-  try { git(["worktree", "remove", "--force", wtDir], projectRoot); } catch { /* ok */ }
-  try { git(["branch", "-D", branch], projectRoot); } catch { /* ok */ }
+  gitQuiet(["worktree", "remove", "--force", wtDir], projectRoot);
+  // Remove stale branch if exists (skip if active)
+  gitQuiet(["branch", "-D", branch], projectRoot);
 
-  // Create branch from HEAD
-  git(["branch", branch, "HEAD"], projectRoot);
+  // Ensure HEAD is valid (needed for branch creation)
+  let headRef: string;
+  try { headRef = git(["rev-parse", "--verify", "HEAD"], projectRoot).trim(); }
+  catch { git(["commit", "-m", "pi: placeholder", "--allow-empty"], projectRoot); headRef = git(["rev-parse", "--verify", "HEAD"], projectRoot).trim(); }
 
-  // Create worktree
-  git(["worktree", "add", wtDir, branch], projectRoot);
+  // Create branch from resolved HEAD ref
+  git(["branch", branch, headRef], projectRoot);
+
+  // Verify branch exists before trying to create worktree
+  try { git(["rev-parse", "--verify", branch], projectRoot); }
+  catch (e: any) { throw new Error(`Failed to create branch ${branch}: ${e.message || e}`); }
+
+  // Create worktree (stderr contains progress; check for fatals)
+  const addOut = gitQuiet(["worktree", "add", wtDir, branch], projectRoot);
+  if (addOut.toLowerCase().includes("fatal") || addOut.toLowerCase().includes("error:")) {
+    throw new Error(`Worktree add failed: ${addOut.trim()}`);
+  }
 
   return wtDir;
 }
