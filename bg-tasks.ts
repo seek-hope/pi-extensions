@@ -59,18 +59,18 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   tasks.set(id, task);
   saveTasks(tasks);
 
-  // Wrap command in logging
-  const wrapped = [
+  // Write script to temp file to avoid shell escaping issues
+  const scriptFile = join(TASK_DIR, `${id}.sh`);
+  const script = [
     `cd "${cwd}"`,
     `{ ${description}; } > "${logFile}" 2>&1`,
     `EXIT=$?`,
     `echo "EXIT_CODE=$EXIT" >> "${logFile}"`,
   ].join("\n");
+  writeFileSync(scriptFile, script);
 
-  // Start in detached tmux
-  execSync(`tmux new-session -d -s "${id}" "bash -c '${wrapped.replace(/'/g, "'\\''")}'" 2>/dev/null`, { timeout: 10_000 });
+  execSync(`tmux new-session -d -s "${id}" "bash ${scriptFile} ; rm -f ${scriptFile}" 2>/dev/null`, { timeout: 10_000 });
 
-  // Timeout killer
   if (timeout > 0) {
     setTimeout(() => {
       const t = tasks.get(id);
