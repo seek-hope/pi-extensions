@@ -90,6 +90,8 @@ class LspClient {
       });
       this.proc.stdout!.on("data", (chunk: Buffer) => this.onData(chunk));
       this.proc.on("error", reject);
+      // Permanent no-op error handler to prevent crashes after stop
+      this.proc.on("error", () => {});
       this.proc.on("exit", (code) => {
         if (!this.initialized && !this.stopped) reject(new Error(`${this.server.id} exited with code ${code}`));
       });
@@ -222,15 +224,14 @@ class LspClient {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.proc) {
-      // Remove all listeners to prevent post-kill events
+      // Remove data listeners but KEEP error listener to prevent crashes
       this.proc.stdout?.removeAllListeners("data");
       this.proc.stderr?.removeAllListeners("data");
-      this.proc.removeAllListeners();
+      // Don't use removeAllListeners() — it removes the error handler too
       try { this.sendNotification("shutdown", {}); } catch { /* ignore */ }
       this.proc.kill();
       this.proc = null;
     }
-    // Reject remaining pending
     for (const [, p] of this.pending) p.reject(new Error("LSP client stopped"));
     this.pending.clear();
   }

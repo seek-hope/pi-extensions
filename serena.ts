@@ -112,6 +112,8 @@ async function startServer(cwd: string): Promise<void> {
       initPromise = null;
       reject(err);
     });
+    // Permanent no-op handler to prevent unhandled error crashes
+    proc.on("error", () => {});
 
     proc.on("exit", (code) => {
       ready = false;
@@ -144,6 +146,9 @@ async function startServer(cwd: string): Promise<void> {
 
 function stopServer(): void {
   if (proc) {
+    // Remove data listeners but KEEP error handler
+    proc.stdout?.removeAllListeners("data");
+    proc.stderr?.removeAllListeners("data");
     try { mcpNotify("shutdown", {}); } catch { /* ok */ }
     proc.kill();
     proc = null;
