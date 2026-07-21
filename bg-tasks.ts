@@ -55,6 +55,14 @@ function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): v
 // ── spawn background task ──────────────────────────────────────────────────
 
 function spawnTask(description: string, cwd: string, timeout: number): Task {
+  // Deduplicate: if identical task already running, return existing
+  for (const [, t] of tasks) {
+    if (t.status === "running" && t.description === description) {
+      // Same description but different cwd? Could be legitimately different.
+      // Use description as the dedup key (the AI is likely repeating the same command).
+      return t;
+    }
+  }
   const id = `task-${Date.now().toString(36)}`;
   const logFile = join(TASK_DIR, `${id}.log`);
   mkdirSync(TASK_DIR, { recursive: true });

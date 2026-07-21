@@ -448,6 +448,20 @@ export default function (pi: ExtensionAPI) {
         const isBg = params.background === true || isLong;
 
         if (isBg) {
+          // Deduplicate: if same command already running on this host, return existing
+          const existing = remoteTasks.find(t => t.host === conn!.key && t.cmd === params.command);
+          if (existing) {
+            return {
+              content: [{
+                type: "text",
+                text: `Background task already running on ${conn!.key}.\\n` +
+                  `Log: ${existing.logPath}\\n` +
+                  `Check progress: ssh_exec("${params.host}", "tail -20 ${existing.logPath}")`,
+              }],
+              details: { logPath: existing.logPath, deduplicated: true },
+            };
+          }
+
           // Long-running task: auto-wrap in nohup on remote, return immediately
           const logPath = `/tmp/pi-bg-${Date.now().toString(36)}.log`;
           const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
