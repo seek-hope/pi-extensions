@@ -12,11 +12,11 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
-function sh(cmd: string, timeout = 30_000): string {
+function run(cmd: string, args: string[], timeout = 30_000): string {
   try {
-    return execSync(cmd, { encoding: "utf-8", maxBuffer: 5 * 1024 * 1024, timeout }).trim();
+    return execFileSync(cmd, args, { encoding: "utf-8", maxBuffer: 5 * 1024 * 1024, timeout }).trim();
   } catch (e: any) {
     // LSP tools exit non-zero when diagnostics found — capture stderr/stdout
     return (e.stdout || "") + "\n" + (e.stderr || "");
@@ -41,19 +41,24 @@ export default function (pi: ExtensionAPI) {
         let result = "";
         switch (lang) {
           case "python":
-            result = sh(`pyright "${file}" 2>&1`, 60_000);
+            result = run("pyright", [file], 60_000);
             break;
           case "cpp":
           case "c":
           case "c++":
-            result = sh(`clangd --check="${file}" 2>&1`, 30_000);
+            result = run("clangd", [`--check=${file}`], 30_000);
             break;
           case "rust":
-            result = sh(`rust-analyzer diagnostics "${file}" 2>&1 || cargo check --manifest-path "$(dirname "${file}")/../Cargo.toml" 2>&1`, 60_000);
+            // Try rust-analyzer first; fall back to cargo check
+            try {
+              result = run("rust-analyzer", ["diagnostics", file], 60_000);
+            } catch {
+              result = run("cargo", ["check"], 60_000);
+            }
             break;
           case "typescript":
           case "ts":
-            result = sh(`tsc --noEmit --pretty false 2>&1`, 60_000);
+            result = run("tsc", ["--noEmit", "--pretty", "false"], 60_000);
             break;
           default:
             return { content: [{ type: "text", text: `Unknown language: ${lang}. Supported: python, cpp, rust, typescript` }], details: {}, isError: true };
@@ -89,8 +94,12 @@ export default function (pi: ExtensionAPI) {
           case "c":
           case "c++":
             try {
-              const r = execSync(`clangd --check="${file}" 2>&1 | grep -A2 "line ${line}"`, { encoding: "utf-8", timeout: 10_000 });
-              return { content: [{ type: "text", text: r.trim() || "No hover info at this position." }], details: {} };
+              const r = run("clangd", [`--check=${file}`], 10_000);
+              // Extract relevant lines around the target line
+              const lines = r.split("\n");
+              const targetIdx = lines.findIndex((l: string) => l.includes(`line ${line}`));
+              const snippet = targetIdx >= 0 ? lines.slice(targetIdx, targetIdx + 3).join("\n") : "";
+              return { content: [{ type: "text", text: snippet || "No hover info at this position." }], details: {} };
             } catch { return { content: [{ type: "text", text: "No hover info available." }], details: {} }; }
           case "rust":
             return { content: [{ type: "text", text: `Hover at ${file}:${line}:${col}\n\nUse rust-analyzer in your editor for full hover support.` }], details: {} };

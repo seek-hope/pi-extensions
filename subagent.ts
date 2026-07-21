@@ -7,9 +7,10 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { spawn, spawnSync, ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ── types ───────────────────────────────────────────────────────────────────
 
@@ -39,13 +40,10 @@ function shortId(): string {
 let _defaultModel: string | undefined;
 let _cheapModel: string | undefined;
 try {
-  const { readFileSync } = require("fs");
-  const { join } = require("path");
-  const { homedir } = require("os");
   const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf-8"));
   _defaultModel = cfg.defaultModel;
   _cheapModel = _defaultModel?.replace(/pro/i, "flash") || _defaultModel;
-} catch (e) { console.error("[subagent] Failed to read settings.json:", e.message); }
+} catch (e: any) { /* settings file may not exist yet */ }
 
 function branchName(id: string): string {
   return `pi/subagent/${id}`;
@@ -54,7 +52,6 @@ function branchName(id: string): string {
 // ── git helpers ─────────────────────────────────────────────────────────────
 
 function git(args: string[], cwd: string): string {
-  const { spawnSync } = require("child_process");
   const result = spawnSync("git", args, {
     cwd,
     encoding: "utf-8",
@@ -84,15 +81,19 @@ function gitQuiet(args: string[], cwd: string): string {
 function ensureGitRepo(projectRoot: string): string {
   const gitDir = join(projectRoot, ".git");
   if (existsSync(gitDir)) {
-    // Verify it's usable
+    // Verify it's usable — but don't destroy on transient errors.
+    // Only nuke if .git/HEAD is missing (fundamentally broken)
     try {
       git(["rev-parse", "--git-dir"], projectRoot);
       return projectRoot;
     } catch {
-      // .git exists but corrupted — remove it and re-init below
-      try {
-        rmSync(gitDir, { recursive: true, force: true });
-      } catch { /* can't remove, will fail below */ }
+      if (!existsSync(join(gitDir, "HEAD"))) {
+        // Truly corrupted — remove and re-init
+        try {
+          rmSync(gitDir, { recursive: true, force: true });
+        } catch { /* can't remove, will fail below */ }
+      }
+      // Otherwise keep existing .git and try to recover below
     }
   }
 

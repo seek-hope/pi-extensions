@@ -11,7 +11,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -170,9 +170,13 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
-        // Escape special characters for shell
-        const escaped = params.text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/`/g, "\\`");
-        sh(`wtype "${escaped}"`, 10000);
+        // Pass text via stdin (-) to avoid shell escaping issues entirely
+        execSync(`wtype -`, {
+          encoding: "utf-8",
+          maxBuffer: 50 * 1024 * 1024,
+          timeout: 10_000,
+          input: params.text,
+        });
         return { content: [{ type: "text", text: `Typed: ${params.text.substring(0, 100)}` }], details: { length: params.text.length } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Type failed: ${e.message}` }], details: {}, isError: true };
@@ -198,7 +202,7 @@ export default function (pi: ExtensionAPI) {
           const trimmed = p.trim();
           if (["ctrl", "alt", "shift", "super"].includes(trimmed)) {
             modifiers.push(trimmed);
-          } else {
+          } else if (!key) {
             key = trimmed;
           }
         }
@@ -207,8 +211,13 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: "Invalid combo: no key specified." }], details: {}, isError: true };
         }
 
-        const modArgs = modifiers.map((m) => `-M ${m}`).join(" ");
-        sh(`wtype ${modArgs} -m ${modifiers.join(" ")} ${key}`, 5000);
+        // Build args array: wtype -M ctrl -M shift -k c  (or just key if no modifiers)
+        const wtypeArgs: string[] = [];
+        for (const mod of modifiers) {
+          wtypeArgs.push("-M", mod);
+        }
+        wtypeArgs.push("-k", key);
+        execFileSync("wtype", wtypeArgs, { encoding: "utf-8", maxBuffer: 5 * 1024, timeout: 5_000 });
         return { content: [{ type: "text", text: `Pressed: ${params.combo}` }], details: { combo: params.combo } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Key combo failed: ${e.message}` }], details: {}, isError: true };

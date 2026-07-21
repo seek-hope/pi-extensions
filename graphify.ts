@@ -3,11 +3,11 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
-function sh(cmd: string): string {
+function run(args: string[]): string {
   try {
-    return execSync(cmd, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 120_000 }).trim();
+    return execFileSync("graphify", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 120_000 }).trim();
   } catch (e: any) { return e.stderr || e.message || ""; }
 }
 
@@ -19,7 +19,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ node: Type.String({ description: "Node name or file path to explain" }) }),
     async execute(_id, params, _signal) {
       try {
-        const out = sh(`graphify explain "${params.node}"`);
+        const out = run(["explain", params.node]);
         return { content: [{ type: "text", text: out || "(no result)" }], details: {} };
       } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
     },
@@ -35,7 +35,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
-        const out = sh(`graphify path "${params.from}" "${params.to}"`);
+        const out = run(["path", params.from, params.to]);
         return { content: [{ type: "text", text: out || "(no path found)" }], details: {} };
       } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
     },

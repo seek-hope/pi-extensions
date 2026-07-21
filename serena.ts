@@ -95,6 +95,17 @@ function onData(chunk: Buffer): void {
 async function startServer(cwd: string): Promise<void> {
   if (initPromise) return initPromise;
 
+  // Kill any existing dead/dying process before creating a new one
+  if (proc) {
+    proc.stdout?.removeAllListeners("data");
+    proc.stderr?.removeAllListeners("data");
+    proc.removeAllListeners("error");
+    proc.removeAllListeners("exit");
+    try { proc.kill(); } catch { /* ok */ }
+    proc = null;
+  }
+  ready = false;
+
   initPromise = new Promise((resolve, reject) => {
     const root = findProjectRoot(cwd);
     proc = spawn("serena", ["start-mcp-server", "--project", root], {
@@ -111,19 +122,18 @@ async function startServer(cwd: string): Promise<void> {
       }
     });
 
-    proc.on("error", (err) => {
+    const onError = (err: Error) => {
       ready = false;
       initPromise = null;
       reject(err);
-    });
-    // Permanent no-op handler to prevent unhandled error crashes
-    proc.on("error", () => {});
+    };
+    proc.once("error", onError);
 
     proc.on("exit", (code) => {
       ready = false;
       initPromise = null;
-      if (code !== 0) {
-        // Don't reject — will retry on next tool call
+      if (code !== 0 && code !== null) {
+        // Process exited with an error — don't reject; will retry on next tool call
       }
     });
 
@@ -150,9 +160,11 @@ async function startServer(cwd: string): Promise<void> {
 
 function stopServer(): void {
   if (proc) {
-    // Remove data listeners but KEEP error handler
+    // Remove all listeners to prevent leaks and unexpected callbacks
     proc.stdout?.removeAllListeners("data");
     proc.stderr?.removeAllListeners("data");
+    proc.removeAllListeners("error");
+    proc.removeAllListeners("exit");
     try { mcpNotify("shutdown", {}); } catch { /* ok */ }
     proc.kill();
     proc = null;
@@ -183,11 +195,6 @@ async function callSerenaTool(toolName: string, args: Record<string, any>, cwd: 
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // Safety net
-  process.on("uncaughtException", (err) => {
-    console.error("[serena] UNCAUGHT:", err.message);
-  });
-
   // ── tool registration: key serena tools ──────────────────────────────
 
   const tools: Array<{

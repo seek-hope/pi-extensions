@@ -9,23 +9,27 @@ import { Type } from "typebox";
 import { execSync } from "node:child_process";
 
 const NODE_PATH = process.env.HOME + "/.npm/lib/node_modules";
-const PW_SCRIPT = `
+
+// Escape a string for safe interpolation into a single-quoted JS string.
+// Also escapes template literal backticks and dollar-brace.
+function jsEscape(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/`/g, "\\`").replace(/\$/g, "\\$");
+}
+
+function runPlaywright(jsBody: string, cwd: string): string {
+  const script = `
 const { chromium } = require("playwright");
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   const page = await context.newPage();
   try {
-    // PLACEHOLDER will be replaced
-    PLACEHOLDER;
+    ${jsBody}
   } finally {
     await browser.close();
   }
 })();
 `;
-
-function runPlaywright(jsBody: string, cwd: string): string {
-  const script = PW_SCRIPT.replace("PLACEHOLDER;", jsBody);
   return execSync(`node -e '${script.replace(/'/g, "'\\''")}'`, {
     cwd,
     encoding: "utf-8",
@@ -45,7 +49,8 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const js = `await page.goto("${params.url}"); const t = await page.title(); const b = await page.evaluate("document.body.innerText"); console.log("Title: " + t + "\\n\\n" + (b || "").substring(0, 5000));`;
+        const url = jsEscape(params.url);
+        const js = `await page.goto('${url}'); const t = await page.title(); const b = await page.evaluate("document.body.innerText"); console.log("Title: " + t + "\\n\\n" + (b || "").substring(0, 5000));`;
         const out = runPlaywright(js, ctx.cwd);
         return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
@@ -64,7 +69,9 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const js = `await page.goto("${params.url}"); const result = await page.evaluate(() => { ${params.script} }); console.log(JSON.stringify(result, null, 2));`;
+        const url = jsEscape(params.url);
+        const script = jsEscape(params.script);
+        const js = `await page.goto('${url}'); const result = await page.evaluate(() => { ${script} }); console.log(JSON.stringify(result, null, 2));`;
         const out = runPlaywright(js, ctx.cwd);
         return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
@@ -84,14 +91,14 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const target = params.target;
-        // Try as CSS selector first, fall back to text
+        const url = jsEscape(params.url);
+        const target = jsEscape(params.target);
         const js = `
-          await page.goto("${params.url}");
+          await page.goto('${url}');
           try {
-            await page.click("${target}");
+            await page.click('${target}');
           } catch {
-            await page.click("text=${target}");
+            await page.click('text=${target}');
           }
           ${params.snapshotAfter !== false
             ? "const b = await page.evaluate('document.body.innerText'); console.log((b || '').substring(0, 3000));"
@@ -117,14 +124,15 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const target = params.target;
-        const text = params.text;
+        const url = jsEscape(params.url);
+        const target = jsEscape(params.target);
+        const text = jsEscape(params.text);
         const js = `
-          await page.goto("${params.url}");
+          await page.goto('${url}');
           try {
-            await page.fill("${target}", "${text}");
+            await page.fill('${target}', '${text}');
           } catch {
-            await page.fill("text=${target}", "${text}");
+            await page.fill('text=${target}', '${text}');
           }
           const b = await page.evaluate('document.body.innerText');
           console.log((b || '').substring(0, 3000));
