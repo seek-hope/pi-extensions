@@ -188,7 +188,7 @@ function ensureShell(conn: Connection): void {
     "-o", `ControlPath=${conn.socket}`,
     "-o", "ConnectTimeout=5",
     "-o", "LogLevel=ERROR",
-    conn.sshTarget,
+    ...conn.sshTarget.split(" "),
   ];
   conn.proc = spawn(args[0], args.slice(1), {
     stdio: ["pipe", "pipe", "pipe"],
