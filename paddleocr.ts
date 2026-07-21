@@ -18,30 +18,15 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        // Use the paddleocr CLI that comes with the npm package
-        const lang = params.language || "en";
-        const args = ["paddleocr", "--lang", lang, "--input", params.imagePath];
-        const out = execSync(args.join(" "), {
-          cwd: ctx.cwd,
-          encoding: "utf-8",
-          maxBuffer: 10 * 1024 * 1024,
-          timeout: 120_000,
-        });
+        const imgPath = params.imagePath;
+        if (!imgPath) return { content: [{ type: "text", text: "imagePath required" }], details: {}, isError: true };
+        const out = execSync(
+          `NODE_PATH=${process.env.HOME}/.npm/lib/node_modules node ${process.env.HOME}/.local/bin/paddle-ocr "${imgPath}"`,
+          { cwd: ctx.cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 120_000 }
+        );
         return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
-        // Fallback: try via npx
-        try {
-          const lang = params.language || "en";
-          const out = execSync(["npx", "-y", "paddleocr", "--lang", lang, "--input", params.imagePath].join(" "), {
-            cwd: ctx.cwd,
-            encoding: "utf-8",
-            maxBuffer: 10 * 1024 * 1024,
-            timeout: 120_000,
-          });
-          return { content: [{ type: "text", text: out }], details: {} };
-        } catch (e2: any) {
-          return { content: [{ type: "text", text: `PaddleOCR error: ${e.stderr || e.message}\n\nFallback also failed: ${e2.stderr || e2.message}` }], details: {}, isError: true };
-        }
+        return { content: [{ type: "text", text: `PaddleOCR: ${e.stderr || e.message}` }], details: {}, isError: true };
       }
     },
   });
