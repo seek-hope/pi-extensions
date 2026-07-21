@@ -8,7 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 // ── types ───────────────────────────────────────────────────────────────────
@@ -81,7 +81,10 @@ function ensureGitRepo(projectRoot: string): string {
       git(["rev-parse", "--git-dir"], projectRoot);
       return projectRoot;
     } catch {
-      // .git exists but corrupted — unlikely but handle
+      // .git exists but corrupted — remove it and re-init below
+      try {
+        rmSync(gitDir, { recursive: true, force: true });
+      } catch { /* can't remove, will fail below */ }
     }
   }
 
@@ -249,36 +252,44 @@ function spawnSubAgent(
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
-    proc.on("close", (code) => {
+    let settled = false;
+    function settle(result: string, status: "done" | "error") {
+      if (settled) return;
+      settled = true;
+      agent.status = status;
       agent.endTime = Date.now();
-      if (agent.status === "cancelled") return;
+      resolve(result);
+    }
 
-      agent.status = code === 0 ? "done" : "error";
+    proc.on("close", (code) => {
+      if (agent.status === "cancelled") return;
+      if (settled) return;
+      // Guard: if entry was removed from global map (e.g. by subagent_parallel cleanup),
+      // don't auto-commit — worktree may already be cleaned up
+      if (!subAgents.has(id)) return;
 
       if (code === 0) {
         agent.result = stdout.trim();
         // Auto-commit changes made by the sub-agent
         agent.commitHash = commitWorktree(worktreePath, id, task);
-        resolve(stdout.trim());
+        settle(stdout.trim(), "done");
       } else {
         agent.error = stderr.trim() || `exit code ${code}`;
-        resolve(`[Sub-agent error (${code})] ${agent.error}\n\nOutput:\n${stdout.trim().substring(0, 3000)}`);
+        settle(`[Sub-agent error (${code})] ${agent.error}\n\nOutput:\n${stdout.trim().substring(0, 3000)}`, "error");
       }
     });
 
     proc.on("error", (err) => {
-      agent.status = "error";
       agent.error = err.message;
-      resolve(`[Sub-agent spawn error] ${err.message}`);
+      settle(`[Sub-agent spawn error] ${err.message}`, "error");
     });
 
     // 10 minute timeout
     setTimeout(() => {
-      if (agent.status === "running") {
+      if (agent.status === "running" && !settled) {
         proc.kill();
-        agent.status = "error";
         agent.error = "timeout (10 min)";
-        resolve(`[Sub-agent timeout]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`);
+        settle(`[Sub-agent timeout]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
       }
     }, 600_000);
   });
@@ -727,6 +738,7 @@ export default function (pi: ExtensionAPI) {
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
         for (const r of batchResults) subAgents.delete(r.id);
+        cleanupWorktree(ctx.cwd, r.id, true);
       }
 
       const summary = [
@@ -787,6 +799,7 @@ export default function (pi: ExtensionAPI) {
         context = result;
         results.push({ task, id, result, commitHash: ag?.commitHash });
         subAgents.delete(id);
+        cleanupWorktree(ctx.cwd, id, true);
       }
 
       const summary = [
@@ -932,10 +945,12 @@ export default function (pi: ExtensionAPI) {
           `Be strict and thorough. Every issue must reference a concrete file and line.`,
         ].join("\n");
 
-        const { promise: reviewPromise } = spawnSubAgent(reviewTask, ctx.cwd, {
+        const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewTask, ctx.cwd, {
           model: _defaultModel || "deepseek-v4-pro",
         });
         const reviewerOutput = await reviewPromise;
+        subAgents.delete(reviewerId);
+        cleanupWorktree(ctx.cwd, reviewerId, true);
 
         // Parse reviewer output
         const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
@@ -972,10 +987,12 @@ export default function (pi: ExtensionAPI) {
           `- Be thorough: every issue listed above must be addressed`,
         ].join("\n");
 
-        const { promise: fixPromise } = spawnSubAgent(fixTask, ctx.cwd, {
+        const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixTask, ctx.cwd, {
           model: _cheapModel || "deepseek-v4-flash",
         });
         const fixerOutput = await fixPromise;
+        subAgents.delete(fixerId);
+        cleanupWorktree(ctx.cwd, fixerId, true);
 
         // Commit the fixes
         const fixHash = commitWorktree(ag.worktreePath, params.id, `fix iteration ${i}: ${issuesCount} issue(s)`);
@@ -1057,6 +1074,7 @@ export default function (pi: ExtensionAPI) {
         });
         const reviewerOutput = await reviewPromise;
         subAgents.delete(reviewerId);
+        cleanupWorktree(ctx.cwd, reviewerId, true);
 
         const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
         const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
@@ -1100,6 +1118,7 @@ export default function (pi: ExtensionAPI) {
         });
         const fixerOutput = await fixPromise;
         subAgents.delete(fixerId);
+        cleanupWorktree(ctx.cwd, fixerId, true);
 
         rounds[rounds.length - 1].fixerResult = fixerOutput.substring(0, 2000);
       }

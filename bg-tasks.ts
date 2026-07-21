@@ -60,24 +60,33 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   mkdirSync(TASK_DIR, { recursive: true });
 
   const startTime = Date.now();
-  const task: Task = { id, description, status: "running", startTime, logFile };
-  tasks.set(id, task);
-  saveTasks(tasks);
 
   // Write script to temp file to avoid shell escaping issues
+  // Use a unique, random heredoc delimiter to prevent injection via task content
+  const heredocMarker = `PIEOF_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   const scriptFile = join(TASK_DIR, `${id}.sh`);
   const script = [
-    `cd "${cwd}"`,
-    `cat > /tmp/_bgtask_${id}.sh << 'PIEOF'`,
+    `cd '${cwd.replace(/'/g, "'\\''")}'`,
+    `cat > /tmp/_bgtask_${id}.sh << '${heredocMarker}'`,
     description,
-    `PIEOF`,
+    `${heredocMarker}`,
     `( bash /tmp/_bgtask_${id}.sh ) > "${logFile}" 2>&1`,
     `echo "EXIT_CODE=$?" >> "${logFile}"`,
     `rm -f /tmp/_bgtask_${id}.sh`,
   ].join("\n");
   writeFileSync(scriptFile, script);
 
-  execSync(`tmux new-session -d -s "${id}" "bash ${scriptFile} ; rm -f ${scriptFile}" 2>/dev/null`, { timeout: 10_000 });
+  try {
+    execSync(`tmux new-session -d -s "${id}" "bash ${scriptFile} ; rm -f ${scriptFile}" 2>/dev/null`, { timeout: 10_000 });
+  } catch {
+    // tmux spawn failed — clean up and throw
+    try { unlinkSync(scriptFile); } catch { /* ok */ }
+    throw new Error(`Failed to start tmux session for task ${id}`);
+  }
+
+  const task: Task = { id, description, status: "running", startTime, logFile };
+  tasks.set(id, task);
+  saveTasks(tasks);
 
   // Poll for completion and notify
   pollCompletion(id);
@@ -90,6 +99,7 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
         t.status = "killed";
         t.endTime = Date.now();
         saveTasks(tasks);
+        updateTaskWidget();
       }
     }, timeout);
   }
@@ -106,7 +116,7 @@ function getTaskOutput(task: Task): string {
       task.exitCode = parseInt(exitMatch[1], 10);
       task.status = task.exitCode === 0 ? "done" : "error";
       task.endTime = Date.now();
-      saveTasks(tasks);
+      // Don't save here — caller handles persistence to avoid double-writes
     }
     return content;
   } catch { return "(cannot read)"; }
@@ -152,19 +162,21 @@ function pollCompletion(id: string): void {
       updateTaskWidget();
       setTimeout(check, 5000);
     } catch {
-      // Session ended
-      const output = getTaskOutput(task);
-      tasks.set(id, task);
+      // Session ended — atomically get output and update status
+      const current = tasks.get(id);
+      if (!current || current.status !== "running") return;
+      getTaskOutput(current);  // sets status to done/error
       saveTasks(tasks);
-      const emoji = task.status === "done" ? "✅" : "❌";
+      const output = readFileSync(current.logFile, "utf-8"); // get full output for message
+      const emoji = current.status === "done" ? "✅" : "❌";
       updateTaskWidget();
-      notifyUser(`${emoji} Background task ${id} completed (${task.status})`, task.status === "done" ? "info" : "error");
+      notifyUser(`${emoji} Background task ${id} completed (${current.status})`, current.status === "done" ? "info" : "error");
       // Send result as new user input so AI can process it
       try {
-        if (_pi) {
+        if (_pi && current.status !== "killed") {
           const msg = [
-            { type: "text", text: `[Background task ${id} completed (${task.status})]` },
-            { type: "text", text: `Task: ${task.description.substring(0, 200)}` },
+            { type: "text", text: `[Background task ${id} completed (${current.status})]` },
+            { type: "text", text: `Task: ${current.description.substring(0, 200)}` },
             { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
           ];
           _pi.sendUserMessage(msg, { deliverAs: "followUp" });
@@ -245,7 +257,10 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Attaching to ${id}... (Ctrl+B D to detach)`, "info");
       const proc = spawn("tmux", ["attach-session", "-t", id], { stdio: "inherit" });
-      await new Promise<void>(r => proc.on("exit", () => r()));
+      await new Promise<void>((resolve) => {
+        proc.on("exit", () => resolve());
+        proc.on("error", () => resolve());
+      });
       syncTasks();
     },
   });

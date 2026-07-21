@@ -7,8 +7,8 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync, spawn, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { execSync, spawn, spawnSync, ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -47,35 +47,51 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
   let lastSize = 0;
   let unchanged = 0;
   let errors = 0;
+  let stopped = false;
 
-  async function check() {
-    try {
-      const result = await shellExec(conn, `wc -c < ${logPath} 2>/dev/null || echo 0`, 10_000);
+  function check() {
+    if (stopped) return;
+    // Verify connection still alive before polling
+    const conn2 = findConnection(host);
+    if (!conn2 || !isConnected(conn2.key)) {
+      // Connection lost — clean up orphaned task
+      const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+      if (idx >= 0) remoteTasks.splice(idx, 1);
+      try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+      return;
+    }
+    shellExec(conn2, `wc -c < ${logPath} 2>/dev/null || echo 0`, 10_000).then(result => {
+      if (stopped) return;
       const size = parseInt(result.trim(), 10) || 0;
       if (size === lastSize) {
         unchanged++;
-        // Log stopped growing for 15s → task likely done
         if (unchanged >= 5) {
+          stopped = true;
           try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
-          remoteTasks.splice(remoteTasks.findIndex(t => t.logPath === logPath), 1);
-          const output = await shellExec(conn, `cat ${logPath} 2>/dev/null`, 15_000);
-          if (_sshPi) {
-            _sshPi.sendUserMessage([
-              { type: "text", text: `[SSH background task completed on ${host}]` },
-              { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
-              { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
-            ], { deliverAs: "followUp" });
-          }
+          const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+          if (idx >= 0) remoteTasks.splice(idx, 1);
+          shellExec(conn2, `cat ${logPath} 2>/dev/null`, 15_000).then(output => {
+            if (_sshPi) {
+              _sshPi.sendUserMessage([
+                { type: "text", text: `[SSH background task completed on ${host}]` },
+                { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+                { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
+              ], { deliverAs: "followUp" });
+            }
+          }).catch(() => {});
           return;
         }
       } else {
         lastSize = size;
         unchanged = 0;
-        // Update widget so model knows task is still running
         try { _sshPi?.ui?.setStatus?.("ssh-bg", `🔄 SSH bg task running on ${host}`); } catch { /* ok */ }
       }
       setTimeout(check, 5000);
-    } catch { errors++; if (errors < 30) { setTimeout(check, 5000); } else { try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ } } }
+    }).catch(() => {
+      errors++;
+      if (errors < 30 && !stopped) { setTimeout(check, 5000); }
+      else { try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ } }
+    });
   }
   setTimeout(check, 3000);
 }
@@ -92,7 +108,9 @@ function targetStr(alias: string, user: string, hostname: string, port: number):
 
 function resolveSshConfig(host: string): { user: string; hostname: string; port: number } | null {
   try {
-    const out = execSync(`ssh -G "${host}" 2>/dev/null`, { encoding: "utf-8", stdio: "pipe", timeout: 5_000 });
+    // Use spawnSync with args array — no shell, no injection risk
+    const result = spawnSync("ssh", ["-G", host], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 5_000 });
+    const out = (result.stdout || "") + (result.stderr || "");
     const cfg: Record<string, string> = {};
     for (const line of out.split("\n")) { const s = line.indexOf(" "); if (s > 0) cfg[line.substring(0, s)] = line.substring(s + 1); }
     if (cfg["hostname"] && cfg["hostname"] !== host) {
@@ -107,7 +125,10 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
   let user = "", hostname = "", port = 0, command = "", i = 0;
   while (i < parts.length) {
     const p = parts[i];
-    if (p === "-p" && i + 1 < parts.length) { port = parseInt(parts[i + 1]); i += 2; }
+    if (p === "-p") {
+      if (i + 1 < parts.length) { port = parseInt(parts[i + 1]); i += 2; }
+      else { i++; } // -p at end: skip it
+    }
     else if (p.startsWith("-")) { i += (i + 1 < parts.length && !parts[i + 1].startsWith("-")) ? 2 : 1; }
     else if (p.includes("@")) {
       const [u, h] = p.split("@"); user = u;
@@ -196,11 +217,10 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
       conn.pending.delete(reqId);
       reject(new Error("SSH stdin closed"));
     }
-    const bufSnapshot = conn.buf;
     setTimeout(() => {
       if (conn.pending.has(reqId)) {
         conn.pending.delete(reqId);
-        reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${bufSnapshot.substring(0, 1000)}`));
+        reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${conn.buf.substring(0, 1000)}`));
       }
     }, timeout);
   });
@@ -211,8 +231,15 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
 function isConnected(key: string): boolean {
   const sock = socketPath(key);
   if (!existsSync(sock)) return false;
-  try { execSync(`ssh -o ControlPath="${sock}" -O check x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 5_000 }); return true; }
-  catch (e: any) { return /master running/i.test(e.stdout || "") || /master running/i.test(e.stderr || ""); }
+  try {
+    const result = spawnSync("ssh", ["-o", `ControlPath=${sock}`, "-O", "check", "x"], {
+      encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 5_000
+    });
+    if (result.status === 0) return true;
+    const combined = (result.stdout || "") + (result.stderr || "");
+    return /master running/i.test(combined);
+  }
+  catch { return false; }
 }
 
 function connect(alias: string, user: string, hostname: string, port: number, ctx: any): void {
@@ -258,11 +285,15 @@ function keyFromFilename(name: string): string {
 function syncFromDisk(): void {
   if (!existsSync(SOCKET_DIR)) return;
   try {
-    for (const name of execSync(`ls "${SOCKET_DIR}" 2>/dev/null || true`, { encoding: "utf-8" }).split("\n")) {
+    const entries = readdirSync(SOCKET_DIR);
+    for (const name of entries) {
       if (!name.endsWith(".sock")) continue;
       const sock = join(SOCKET_DIR, name);
       try {
-        execSync(`ssh -O check -o ControlPath="${sock}" x 2>&1`, { encoding: "utf-8", stdio: "pipe", timeout: 3_000 });
+        const result = spawnSync("ssh", ["-O", "check", "-o", `ControlPath=${sock}`, "x"], {
+          encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 3_000
+        });
+        if (result.status !== 0 && !/master running/i.test((result.stderr || ""))) continue;
         const key = keyFromFilename(name);
         if (![...connections.values()].some(c => c.socket === sock)) {
           const [uh, pt] = key.split(":");
@@ -284,7 +315,7 @@ function closeConn(target: string, ctx: any): void {
   for (const [key, c] of connections) {
     if (c.key.includes(target) || c.alias.includes(target)) {
       if (c.proc) { try { c.proc.kill(); } catch { /* ok */ } }
-      try { execSync(`ssh -o ControlPath="${c.socket}" -O exit x 2>/dev/null`, { stdio: "ignore", timeout: 10_000 }); } catch { /* ok */ }
+      try { spawnSync("ssh", ["-o", `ControlPath=${c.socket}`, "-O", "exit", "x"], { stdio: "ignore", timeout: 10_000 }); } catch { /* ok */ }
       try { rmSync(c.socket); } catch { /* ok */ }
       connections.delete(key);
       ctx.ui.notify(`Closed ${c.key}.`, "info");
@@ -420,12 +451,19 @@ export default function (pi: ExtensionAPI) {
         const target = conn.alias !== conn.key.split(":")[0]?.split("@")[1]
           ? `${conn.alias}:${params.remotePath}`  // SSH config alias
           : `-P ${conn.key.split(":")[1]} ${conn.key.split(":")[0]}:${params.remotePath}`;
-        const result = execSync(
-          `scp -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${params.localPath} ${target}`,
-          { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000 }
-        );
+        const scpArgs = [
+          "-o", `ControlPath=${conn.socket}`,
+          "-o", "ConnectTimeout=5",
+          "-o", "LogLevel=ERROR",
+          params.localPath,
+          target,
+        ];
+        const result = spawnSync("scp", scpArgs, {
+          encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000, stdio: ["ignore", "pipe", "pipe"]
+        });
+        if (result.status !== 0) throw new Error(result.stderr || `scp exited with code ${result.status}`);
         conn.lastUse = Date.now();
-        return { content: [{ type: "text", text: `Copied: ${params.localPath} → ${conn.alias}:${params.remotePath}\n${result || "OK"}` }], details: {} };
+        return { content: [{ type: "text", text: `Copied: ${params.localPath} → ${conn.alias}:${params.remotePath}\n${result.stdout || "OK"}` }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
       }
@@ -451,12 +489,19 @@ export default function (pi: ExtensionAPI) {
         const target = conn.alias !== conn.key.split(":")[0]?.split("@")[1]
           ? `${conn.alias}:${params.remotePath}`
           : `-P ${conn.key.split(":")[1]} ${conn.key.split(":")[0]}:${params.remotePath}`;
-        const result = execSync(
-          `scp -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${target} ${params.localPath}`,
-          { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000 }
-        );
+        const scpArgs = [
+          "-o", `ControlPath=${conn.socket}`,
+          "-o", "ConnectTimeout=5",
+          "-o", "LogLevel=ERROR",
+          target,
+          params.localPath,
+        ];
+        const result = spawnSync("scp", scpArgs, {
+          encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000, stdio: ["ignore", "pipe", "pipe"]
+        });
+        if (result.status !== 0) throw new Error(result.stderr || `scp exited with code ${result.status}`);
         conn.lastUse = Date.now();
-        return { content: [{ type: "text", text: `Copied: ${conn.alias}:${params.remotePath} → ${params.localPath}\n${result || "OK"}` }], details: {} };
+        return { content: [{ type: "text", text: `Copied: ${conn.alias}:${params.remotePath} → ${params.localPath}\n${result.stdout || "OK"}` }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
       }
@@ -485,8 +530,12 @@ export default function (pi: ExtensionAPI) {
     syncFromDisk();
     for (const t of [...remoteTasks]) {
       const conn = findConnection(t.host);
-      if (conn) {
+      if (conn && isConnected(conn.key)) {
         pollRemoteTask(conn, t.logPath, t.cmd, t.host);
+      } else {
+        // Orphaned task — clean up
+        const idx = remoteTasks.findIndex(rt => rt.logPath === t.logPath);
+        if (idx >= 0) remoteTasks.splice(idx, 1);
       }
     }
   });
