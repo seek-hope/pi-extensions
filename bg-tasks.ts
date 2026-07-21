@@ -207,14 +207,13 @@ export default function (pi: ExtensionAPI) {
     }
     updateTaskWidget();
   }
-      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
-  syncTasks();
+
+  // ── commands ────────────────────────────────────────────────────────
 
   // ── /tasks command ────────────────────────────────────────────────────
   pi.registerCommand("tasks", {
     description: "List background tasks",
     handler: async (_args, ctx) => {
-      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
       syncTasks();
       if (tasks.size === 0) { ctx.ui.notify("No background tasks.", "info"); return; }
 
@@ -258,12 +257,11 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Attaching to ${id}... (Ctrl+B D to detach)`, "info");
       const proc = spawn("tmux", ["attach-session", "-t", id], { stdio: "inherit" });
-      let attached = false;
       await new Promise<void>((resolve) => {
         proc.on("exit", () => resolve());
         proc.on("error", () => resolve());
       });
-      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
+      try { proc.kill(); } catch { /* best effort */ }
       syncTasks();
     },
   });
@@ -325,7 +323,6 @@ export default function (pi: ExtensionAPI) {
     description: "Check the status of all background tasks.",
     parameters: Type.Object({}),
     async execute() {
-      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
       syncTasks();
       if (tasks.size === 0) return { content: [{ type: "text", text: "No background tasks." }], details: {} };
       const lines = ["Background tasks:"];

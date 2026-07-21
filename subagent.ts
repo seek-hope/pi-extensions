@@ -992,6 +992,8 @@ export default function (pi: ExtensionAPI) {
           model: _cheapModel || "deepseek-v4-flash",
         });
         const fixerOutput = await fixPromise;
+        // Merge fixer's work back to the original agent's branch
+        try { git(["merge", "--no-edit", branchName(fixerId)], ag.worktreePath); } catch { /* best effort */ }
         subAgents.delete(fixerId);
         cleanupWorktree(ctx.cwd, fixerId, true);
 
@@ -1118,6 +1120,12 @@ export default function (pi: ExtensionAPI) {
           model: _defaultModel || "deepseek-v4-pro",
         });
         const fixerOutput = await fixPromise;
+        // Merge fixer's work to target branch
+        try {
+          git(["checkout", targetBranch || "-"], ctx.cwd);
+          git(["merge", "--no-edit", branchName(fixerId)], ctx.cwd);
+          git(["checkout", "-"], ctx.cwd);
+        } catch { /* best effort */ }
         subAgents.delete(fixerId);
         cleanupWorktree(ctx.cwd, fixerId, true);
 

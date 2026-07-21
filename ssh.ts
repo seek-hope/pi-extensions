@@ -189,7 +189,7 @@ function ensureShell(conn: Connection): void {
 
 function extractResponses(conn: Connection): void {
   while (true) {
-    const m = conn.buf.match(/__END__(\d+):(\d+)\n/);
+    const m = conn.buf.match(/__END__(\d+)_\w+:(\d+)\n/);
     if (!m) break;
     const idx = conn.buf.indexOf(m[0]);
     const output = conn.buf.substring(0, idx);
@@ -208,11 +208,12 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
       return;
     }
     const reqId = ++conn.reqId;
+    const rand = Math.random().toString(36).slice(2, 10);
     conn.pending.set(reqId, { resolve, reject });
     // Pass command directly via stdin — the shell reads lines and executes them
     // Don't wrap in quotes (that would treat semicolons literally)
     // Use a heredoc-like approach: write command, then echo the marker
-    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}:$?\n`);
+    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
     if (!wrote) {
       conn.pending.delete(reqId);
       reject(new Error("SSH stdin closed"));
