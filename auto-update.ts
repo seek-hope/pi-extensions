@@ -38,12 +38,11 @@ export default function (pi: ExtensionAPI) {
       results.push("\n=== npm global tools ===");
       const npmTools = [
         "@colbymchenry/codegraph",
+        "@sentropic/graphify",
         "playwright",
-        "paddleocr",
         "typescript-language-server",
         "pyright",
         "context7",
-        "@huggingface/inference",
         "doc-relay",
       ];
       for (const pkg of npmTools) {
@@ -98,12 +97,12 @@ export default function (pi: ExtensionAPI) {
 
       if (scope === "all" || scope === "npm") {
         run("npm: @colbymchenry/codegraph", () => sh("npm install -g @colbymchenry/codegraph@latest 2>&1"));
+        run("npm: @sentropic/graphify", () => sh("npm install -g @sentropic/graphify@latest 2>&1"));
         run("npm: playwright", () => sh("npm install -g playwright@latest 2>&1"));
-        run("npm: paddleocr", () => sh("npm install -g paddleocr@latest 2>&1"));
         run("npm: typescript-language-server", () => sh("npm install -g typescript-language-server@latest 2>&1"));
         run("npm: pyright", () => sh("npm install -g pyright@latest 2>&1"));
         run("npm: context7", () => sh("npm install -g context7@latest 2>&1"));
-        run("npm: @huggingface/inference", () => sh("npm install -g @huggingface/inference@latest 2>&1"));
+        run("npm: doc-relay", () => sh("npm install -g doc-relay@latest 2>&1"));
       }
 
       if (scope === "all" || scope === "playwright") {
@@ -115,6 +114,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (scope === "all" || scope === "system") {
+        run("System: grim (screenshots)", () => sh("pacman -Q grim 2>&1 || echo 'not via pacman'"));
+        run("System: ydotool (mouse)", () => sh("pacman -Q ydotool 2>&1 || echo 'not via pacman'"));
+        run("System: wtype (keyboard)", () => sh("pacman -Q wtype 2>&1 || echo 'not via pacman'"));
+        run("System: tmux", () => sh("tmux -V 2>&1"));
         run("gh CLI", () => sh("(sudo apt update -qq 2>/dev/null && sudo apt install -y gh 2>&1) || echo 'gh version:' $(gh --version | head -1)"));
         run("rust-analyzer", () => sh("rustup component add rust-analyzer 2>&1 || echo 'version:' $(rust-analyzer --version 2>&1 | head -1)"));
         run("clangd", () => sh("clangd --version 2>&1 | head -1"));

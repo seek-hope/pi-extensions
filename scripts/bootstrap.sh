@@ -86,12 +86,11 @@ say "Phase 4: Installing global npm tools..."
 
 NPM_PACKAGES=(
   "@colbymchenry/codegraph"
+  "@sentropic/graphify"
   "playwright"
-  "paddleocr"
   "typescript-language-server"
   "pyright"
   "context7"
-  "@huggingface/inference"
   "doc-relay"
 )
 
