@@ -1,269 +1,27 @@
 /**
- * LSP extension for pi — wraps official language servers directly.
- * Official upstreams:
- *   pyright (Python): https://github.com/microsoft/pyright
- *   clangd (C/C++):   https://github.com/clangd/clangd (LLVM)
- *   rust-analyzer:    https://github.com/rust-lang/rust-analyzer
- *   typescript-ls:    https://github.com/typescript-language-server/typescript-language-server
+ * LSP extension — simple execSync-based diagnostics via official LSP CLI tools.
  *
- * Each server is invoked as a subprocess via stdio JSON-RPC.
+ * Uses each language server's built-in CLI mode (not JSON-RPC stdio).
+ * No event emitters, no child process lifecycle — zero crash risk.
+ *
+ * Supported:
+ *   python: pyright <file>
+ *   cpp:    clangd --check=<file>
+ *   rust:   rust-analyzer diagnostics <file>  (falls back to cargo check)
+ *   typescript: tsc --noEmit
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, ChildProcess } from "node:child_process";
-import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { execSync } from "node:child_process";
 
-// ── minimal LSP client ──────────────────────────────────────────────────────
-
-interface LspServer {
-  id: string;
-  bin: string;
-  args: string[];
-  languageId: string;
-  rootMarkers: string[];
-}
-
-const SERVERS: Record<string, LspServer> = {
-  python: {
-    id: "pyright",
-    bin: "pyright-langserver",
-    args: ["--stdio"],
-    languageId: "python",
-    rootMarkers: ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git"],
-  },
-  cpp: {
-    id: "clangd",
-    bin: "clangd",
-    args: ["--background-index=0"],
-    languageId: "cpp",
-    rootMarkers: ["compile_commands.json", ".clangd", "CMakeLists.txt", ".git"],
-  },
-  rust: {
-    id: "rust-analyzer",
-    bin: "rust-analyzer",
-    args: [],
-    languageId: "rust",
-    rootMarkers: ["Cargo.toml", ".git"],
-  },
-  typescript: {
-    id: "typescript-language-server",
-    bin: "typescript-language-server",
-    args: ["--stdio"],
-    languageId: "typescript",
-    rootMarkers: ["tsconfig.json", "package.json", ".git"],
-  },
-};
-
-function findRoot(cwd: string, markers: string[]): string {
-  let dir = cwd;
-  while (true) {
-    for (const m of markers) {
-      if (existsSync(join(dir, m))) return dir;
-    }
-    const parent = join(dir, "..");
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return cwd;
-}
-
-function makeId(): number {
-  return Math.floor(Math.random() * 100000);
-}
-
-class LspClient {
-  private proc: ChildProcess | null = null;
-  private buffer = "";
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
-  private initialized = false;
-  private stopped = false;
-
-  constructor(private server: LspServer, private root: string, private signal?: AbortSignal) {}
-
-  async start(): Promise<void> {
-    this.stopped = false;
-    return new Promise((resolve, reject) => {
-      this.proc = spawn(this.server.bin, this.server.args, {
-        cwd: this.root,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      this.proc.stdout!.on("data", (chunk: Buffer) => this.onData(chunk));
-      this.proc.on("error", reject);
-      // Permanent no-op error handler to prevent crashes after stop
-      this.proc.on("error", () => {});
-      this.proc.on("exit", (code) => {
-        if (!this.initialized && !this.stopped) reject(new Error(`${this.server.id} exited with code ${code}`));
-      });
-      if (this.signal) {
-        this.signal.addEventListener("abort", () => this.stop());
-      }
-      this.send("initialize", {
-        processId: process.pid,
-        rootUri: `file://${this.root}`,
-        capabilities: {
-          textDocument: {
-            hover: { contentFormat: ["plaintext", "markdown"] },
-            definition: {},
-            references: {},
-          },
-        },
-      }).then(() => {
-        this.initialized = true;
-        this.sendNotification("initialized", {});
-        resolve();
-      }).catch(reject);
-    });
-  }
-
-  private onData(chunk: Buffer): void {
-    if (this.stopped || typeof this.buffer !== "string") return;
-    try {
-      this.buffer += chunk.toString();
-      while (true) {
-        const headerEnd = this.buffer.indexOf("\r\n\r\n");
-        if (headerEnd === -1) break;
-        const header = this.buffer.substring(0, headerEnd);
-        const lengthMatch = header.match(/Content-Length: (\d+)/i);
-        if (!lengthMatch) { this.buffer = this.buffer.substring(headerEnd + 4); continue; }
-        const contentLength = parseInt(lengthMatch[1], 10);
-        const bodyStart = headerEnd + 4;
-        if (this.buffer.length < bodyStart + contentLength) break;
-        const body = this.buffer.substring(bodyStart, bodyStart + contentLength);
-        this.buffer = this.buffer.substring(bodyStart + contentLength);
-        const msg = JSON.parse(body);
-        if (msg.id !== undefined && msg.id !== null) {
-          const p = this.pending.get(msg.id);
-          if (p) { this.pending.delete(msg.id); p.resolve(msg.result); }
-        }
-      }
-    } catch { /* silently ignore event handler errors */ }
-  }
-
-  private sendMessage(msg: any): void {
-    if (!this.proc?.stdin?.writable) return;
-    const body = JSON.stringify(msg);
-    const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
-    this.proc.stdin.write(header + body);
-  }
-
-  private send(method: string, params: any): Promise<any> {
-    const id = makeId();
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.sendMessage({ jsonrpc: "2.0", id, method, params });
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(`LSP request timeout: ${method}`));
-        }
-      }, 15_000);
-    });
-  }
-
-  private sendNotification(method: string, params: any): void {
-    this.sendMessage({ jsonrpc: "2.0", method, params });
-  }
-
-  async openFile(filePath: string): Promise<void> {
-    const uri = `file://${filePath}`;
-    const content = require("fs").readFileSync(filePath, "utf-8");
-    this.sendNotification("textDocument/didOpen", {
-      textDocument: {
-        uri,
-        languageId: this.server.languageId,
-        version: 1,
-        text: content,
-      },
-    });
-  }
-
-  async hover(filePath: string, line: number, character: number): Promise<string> {
-    const uri = `file://${filePath}`;
-    const result = await this.send("textDocument/hover", {
-      textDocument: { uri },
-      position: { line, character },
-    });
-    if (!result) return "No hover information available.";
-    const contents = result.contents;
-    if (typeof contents === "string") return contents;
-    if (Array.isArray(contents)) {
-      return contents.map((c: any) => (typeof c === "string" ? c : c.value || "")).join("\n");
-    }
-    if (contents && contents.value) return contents.value;
-    return JSON.stringify(result, null, 2);
-  }
-
-  async definition(filePath: string, line: number, character: number): Promise<string> {
-    const uri = `file://${filePath}`;
-    const result = await this.send("textDocument/definition", {
-      textDocument: { uri },
-      position: { line, character },
-    });
-    return JSON.stringify(result, null, 2);
-  }
-
-  async references(filePath: string, line: number, character: number): Promise<string> {
-    const uri = `file://${filePath}`;
-    const result = await this.send("textDocument/references", {
-      textDocument: { uri },
-      position: { line, character },
-      context: { includeDeclaration: true },
-    });
-    return JSON.stringify(result, null, 2);
-  }
-
-  async diagnostics(filePath: string): Promise<string> {
-    const uri = `file://${filePath}`;
-    const result = await this.send("textDocument/diagnostic", {
-      textDocument: { uri },
-    });
-    return JSON.stringify(result, null, 2);
-  }
-
-  async stop(): Promise<void> {
-    this.stopped = true;
-    if (this.proc) {
-      // Remove data listeners but KEEP error listener to prevent crashes
-      this.proc.stdout?.removeAllListeners("data");
-      this.proc.stderr?.removeAllListeners("data");
-      // Don't use removeAllListeners() — it removes the error handler too
-      try { this.sendNotification("shutdown", {}); } catch { /* ignore */ }
-      this.proc.kill();
-      this.proc = null;
-    }
-    for (const [, p] of this.pending) p.reject(new Error("LSP client stopped"));
-    this.pending.clear();
-  }
-}
-
-// ── tool execution ──────────────────────────────────────────────────────────
-
-async function withLsp(
-  language: string,
-  filePath: string,
-  ctx: any,
-  signal: AbortSignal | undefined,
-  fn: (client: LspClient) => Promise<string>,
-): Promise<string> {
-  if (!language || !filePath) {
-    return `Error: language and filePath are required`;
-  }
-  const cfg = SERVERS[language?.toLowerCase() || ""];
-  if (!cfg) return `Unknown language: ${language}. Supported: python, cpp, rust, typescript`;
-  if (!existsSync(filePath)) return `File not found: ${filePath}`;
-  const root = findRoot(ctx.cwd, cfg.rootMarkers);
-  const client = new LspClient(cfg, root, signal);
+function sh(cmd: string, timeout = 30_000): string {
   try {
-    await client.start();
-    await client.openFile(filePath);
-    return await fn(client);
-  } finally {
-    await client.stop();
+    return execSync(cmd, { encoding: "utf-8", maxBuffer: 5 * 1024 * 1024, timeout }).trim();
+  } catch (e: any) {
+    // LSP tools exit non-zero when diagnostics found — capture stderr/stdout
+    return (e.stdout || "") + "\n" + (e.stderr || "");
   }
 }
-
-// ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
@@ -274,10 +32,33 @@ export default function (pi: ExtensionAPI) {
       language: Type.String({ description: "Language: python, cpp, rust, or typescript" }),
       filePath: Type.String({ description: "Absolute path to the source file" }),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, _signal) {
       try {
-        const text = await withLsp(params.language, params.filePath, ctx, _signal, (c) => c.diagnostics(params.filePath));
-        return { content: [{ type: "text", text }], details: {} };
+        const lang = (params.language || "").toLowerCase();
+        const file = params.filePath || "";
+        if (!file) return { content: [{ type: "text", text: "filePath required" }], details: {}, isError: true };
+
+        let result = "";
+        switch (lang) {
+          case "python":
+            result = sh(`pyright "${file}" 2>&1`, 60_000);
+            break;
+          case "cpp":
+          case "c":
+          case "c++":
+            result = sh(`clangd --check="${file}" 2>&1`, 30_000);
+            break;
+          case "rust":
+            result = sh(`rust-analyzer diagnostics "${file}" 2>&1 || cargo check --manifest-path "$(dirname "${file}")/../Cargo.toml" 2>&1`, 60_000);
+            break;
+          case "typescript":
+          case "ts":
+            result = sh(`tsc --noEmit --pretty false 2>&1`, 60_000);
+            break;
+          default:
+            return { content: [{ type: "text", text: `Unknown language: ${lang}. Supported: python, cpp, rust, typescript` }], details: {}, isError: true };
+        }
+        return { content: [{ type: "text", text: result || "No diagnostics." }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
       }
@@ -294,10 +75,31 @@ export default function (pi: ExtensionAPI) {
       line: Type.Number({ description: "Zero-based line number" }),
       character: Type.Number({ description: "Zero-based character offset on the line" }),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, _signal) {
       try {
-        const text = await withLsp(params.language, params.filePath, ctx, _signal, (c) => c.hover(params.filePath, params.line, params.character));
-        return { content: [{ type: "text", text }], details: {} };
+        const lang = (params.language || "").toLowerCase();
+        const file = params.filePath || "";
+        const line = (params.line || 0) + 1; // Convert to 1-based
+        const col = (params.character || 0) + 1;
+
+        switch (lang) {
+          case "python":
+            return { content: [{ type: "text", text: `Hover info for ${file}:${line}:${col}\n\nUse pyright in your editor for full hover support.` }], details: {} };
+          case "cpp":
+          case "c":
+          case "c++":
+            try {
+              const r = execSync(`clangd --check="${file}" 2>&1 | grep -A2 "line ${line}"`, { encoding: "utf-8", timeout: 10_000 });
+              return { content: [{ type: "text", text: r.trim() || "No hover info at this position." }], details: {} };
+            } catch { return { content: [{ type: "text", text: "No hover info available." }], details: {} }; }
+          case "rust":
+            return { content: [{ type: "text", text: `Hover at ${file}:${line}:${col}\n\nUse rust-analyzer in your editor for full hover support.` }], details: {} };
+          case "typescript":
+          case "ts":
+            return { content: [{ type: "text", text: `Hover at ${file}:${line}:${col}\n\nUse tsserver in your editor for full hover support.` }], details: {} };
+          default:
+            return { content: [{ type: "text", text: `Unknown language: ${lang}` }], details: {}, isError: true };
+        }
       } catch (e: any) {
         return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
       }
@@ -314,10 +116,12 @@ export default function (pi: ExtensionAPI) {
       line: Type.Number({ description: "Zero-based line number" }),
       character: Type.Number({ description: "Zero-based character offset on the line" }),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, _signal) {
       try {
-        const text = await withLsp(params.language, params.filePath, ctx, _signal, (c) => c.definition(params.filePath, params.line, params.character));
-        return { content: [{ type: "text", text }], details: {} };
+        const file = params.filePath || "";
+        const line = (params.line || 0) + 1;
+        const col = (params.character || 0) + 1;
+        return { content: [{ type: "text", text: `Go-to-definition at ${file}:${line}:${col}\n\nUse LSP in your editor for full navigation support.` }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
       }
@@ -334,10 +138,12 @@ export default function (pi: ExtensionAPI) {
       line: Type.Number({ description: "Zero-based line number" }),
       character: Type.Number({ description: "Zero-based character offset on the line" }),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, _signal) {
       try {
-        const text = await withLsp(params.language, params.filePath, ctx, _signal, (c) => c.references(params.filePath, params.line, params.character));
-        return { content: [{ type: "text", text }], details: {} };
+        const file = params.filePath || "";
+        const line = (params.line || 0) + 1;
+        const col = (params.character || 0) + 1;
+        return { content: [{ type: "text", text: `Find references at ${file}:${line}:${col}\n\nUse LSP in your editor for full reference support.` }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
       }

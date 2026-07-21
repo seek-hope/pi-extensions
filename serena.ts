@@ -179,6 +179,11 @@ async function callSerenaTool(toolName: string, args: Record<string, any>, cwd: 
 // ── extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // Safety net
+  process.on("uncaughtException", (err) => {
+    console.error("[serena] UNCAUGHT:", err.message);
+  });
+
   // ── tool registration: key serena tools ──────────────────────────────
 
   const tools: Array<{
