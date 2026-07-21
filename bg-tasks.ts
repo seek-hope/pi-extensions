@@ -68,8 +68,12 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   const scriptFile = join(TASK_DIR, `${id}.sh`);
   const script = [
     `cd "${cwd}"`,
-    `( ${description} ) > "${logFile}" 2>&1`,
+    `cat > /tmp/_bgtask_${id}.sh << 'PIEOF'`,
+    description,
+    `PIEOF`,
+    `( bash /tmp/_bgtask_${id}.sh ) > "${logFile}" 2>&1`,
     `echo "EXIT_CODE=$?" >> "${logFile}"`,
+    `rm -f /tmp/_bgtask_${id}.sh`,
   ].join("\n");
   writeFileSync(scriptFile, script);
 
@@ -188,6 +192,7 @@ export default function (pi: ExtensionAPI) {
         saveTasks(tasks);
       }
     }
+    updateTaskWidget();
   }
   syncTasks();
 

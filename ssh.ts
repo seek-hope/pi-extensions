@@ -41,9 +41,12 @@ const remoteTasks: RemoteBgTask[] = [];
 
 // Poll remote background task and inject result when done
 function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: string): void {
-  remoteTasks.push({ host, logPath, cmd, startTime: Date.now() });
+  if (!remoteTasks.some(t => t.logPath === logPath)) {
+    remoteTasks.push({ host, logPath, cmd, startTime: Date.now() });
+  }
   let lastSize = 0;
   let unchanged = 0;
+  let errors = 0;
 
   async function check() {
     try {
@@ -72,7 +75,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
         try { _sshPi?.ui?.setStatus?.("ssh-bg", `🔄 SSH bg task running on ${host}`); } catch { /* ok */ }
       }
       setTimeout(check, 5000);
-    } catch { setTimeout(check, 5000); }
+    } catch { errors++; if (errors < 30) { setTimeout(check, 5000); } else { try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ } } }
   }
   setTimeout(check, 3000);
 }
@@ -124,12 +127,10 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
 // ── persistent shell ────────────────────────────────────────────────────────
 
 function ensureShell(conn: Connection): void {
-  if (conn.proc && conn.proc.exitCode === null) {
-    // Check if stdin is still writable
-    if (conn.proc.stdin?.writable) return;
-    // Stdin closed — process is dead, clean up
-    try { conn.proc.kill(); } catch { /* ok */ }
-  }
+  // Already alive — don't reset
+  if (conn.proc && conn.proc.exitCode === null && conn.proc.stdin?.writable) return;
+
+  // Dead or dying — clean up
   if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
   for (const [, p] of conn.pending) p.reject(new Error("Connection reset"));
   conn.pending.clear();
@@ -195,11 +196,11 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
       conn.pending.delete(reqId);
       reject(new Error("SSH stdin closed"));
     }
+    const bufSnapshot = conn.buf;
     setTimeout(() => {
       if (conn.pending.has(reqId)) {
         conn.pending.delete(reqId);
-        // Return partial output if available
-        reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${conn.buf.substring(0, 1000)}`));
+        reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${bufSnapshot.substring(0, 1000)}`));
       }
     }, timeout);
   });
