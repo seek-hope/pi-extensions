@@ -43,7 +43,8 @@ function branchName(id: string): string {
 
 function git(args: string[], cwd: string): string {
   const { execSync } = require("child_process");
-  return execSync(["git", ...args].join(" "), {
+  const escaped = args.map(a => `'${a.replace(/'/g, "'\\''")}'`);
+  return execSync(["git", ...escaped].join(" "), {
     cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
