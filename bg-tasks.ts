@@ -133,6 +133,17 @@ function pollCompletion(id: string): void {
       saveTasks(tasks);
       const emoji = task.status === "done" ? "✅" : "❌";
       notifyUser(`${emoji} Background task ${id} completed (${task.status})`, task.status === "done" ? "info" : "error");
+      // Send result as new user input so AI can process it
+      try {
+        if (_pi) {
+          const msg = [
+            { type: "text", text: `[Background task ${id} completed (${task.status})]` },
+            { type: "text", text: `Task: ${task.description.substring(0, 200)}` },
+            { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
+          ];
+          _pi.sendUserMessage(msg, { deliverAs: "followUp" });
+        }
+      } catch { /* ignore */ }
     }
   };
   setTimeout(check, 3000);
