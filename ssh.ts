@@ -30,8 +30,18 @@ interface Connection {
 const connections = new Map<string, Connection>();
 let _sshPi: ExtensionAPI | null = null;
 
+// Track remote bg tasks persistently
+interface RemoteBgTask {
+  host: string;
+  logPath: string;
+  cmd: string;
+  startTime: number;
+}
+const remoteTasks: RemoteBgTask[] = [];
+
 // Poll remote background task and inject result when done
 function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: string): void {
+  remoteTasks.push({ host, logPath, cmd, startTime: Date.now() });
   let lastSize = 0;
   let unchanged = 0;
 
@@ -44,6 +54,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
         // Log stopped growing for 15s → task likely done
         if (unchanged >= 5) {
           try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+          remoteTasks.splice(remoteTasks.findIndex(t => t.logPath === logPath), 1);
           const output = await shellExec(conn, `cat ${logPath} 2>/dev/null`, 15_000);
           if (_sshPi) {
             _sshPi.sendUserMessage([
@@ -466,6 +477,17 @@ export default function (pi: ExtensionAPI) {
       for (const [, c] of connections) lines.push(`  ${isConnected(c.key) ? "🟢" : "⚫"} ${c.key}`);
       return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
     },
+  });
+
+  // ── session_start: recover running remote tasks ─────────────────
+  pi.on("session_start", async () => {
+    syncFromDisk();
+    for (const t of [...remoteTasks]) {
+      const conn = findConnection(t.host);
+      if (conn) {
+        pollRemoteTask(conn, t.logPath, t.cmd, t.host);
+      }
+    }
   });
 
   pi.on("session_shutdown", () => {
