@@ -281,11 +281,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH Execute",
-    description: "Execute a command on a remote server via persistent SSH connection.",
+    description:
+      "Execute a command on a remote server via persistent SSH connection. " +
+      "For long-running tasks (training, builds), use the background parameter: " +
+      "the command runs via nohup on the remote server and returns immediately with a log path. " +
+      "Use another ssh_exec to check progress via 'cat /tmp/task.log' or 'ps aux | grep PID'.",
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
       "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
-      "MANDATORY: For long-running remote tasks (training, builds, downloads), wrap the command with nohup and redirect output: 'nohup CMD > /tmp/task.log 2>&1 & echo PID=$!'. Then use another ssh_exec to check progress via 'cat /tmp/task.log' or 'ps aux | grep PID'.",
+      "MANDATORY: For long-running remote tasks (training, builds, downloads), set background=true. The command runs via nohup, returns a log path immediately.",
+      "After background ssh_exec, use another ssh_exec to check progress: 'cat /tmp/task.log' or 'ps aux | grep PID'.",
       "Call ssh_status before running ssh_exec to verify the target host is connected.",
       "If no connection exists, tell the user: /ssh <host>",
     ],
@@ -293,6 +298,7 @@ export default function (pi: ExtensionAPI) {
       host: Type.String({ description: "SSH host alias" }),
       command: Type.String({ description: "Command to execute on the remote server" }),
       timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 60000)" })),
+      background: Type.Optional(Type.Boolean({ description: "Run in background via nohup on remote. Returns log path immediately (default: false)" })),
     }),
     async execute(_id, params, _signal) {
       syncFromDisk();
@@ -306,6 +312,26 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
+        const isBg = params.background === true;
+        if (isBg) {
+          // Long-running task: wrap in nohup on remote, return immediately
+          const logPath = `/tmp/pi-bg-${Date.now().toString(36)}.log`;
+          const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
+          const result = await shellExec(conn, bgCmd, 15000);
+          conn.lastUse = Date.now();
+          return {
+            content: [{
+              type: "text",
+              text: `Background task started on ${conn.key}.\n` +
+                `${result.trim()}\n` +
+                `Log: ${logPath}\n` +
+                `Check progress: ssh_exec("${conn.alias}", "tail -20 ${logPath}")\n` +
+                `Check running: ssh_exec("${conn.alias}", "ps aux | grep '${params.command.substring(0, 30)}'")\n` +
+                `Read full log: ssh_exec("${conn.alias}", "cat ${logPath}")`,
+            }],
+            details: { pid: result.trim(), logPath },
+          };
+        }
         const result = await shellExec(conn, params.command, Math.min(params.timeout || 60_000, 300_000));
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: result }], details: {} };
