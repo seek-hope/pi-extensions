@@ -14,6 +14,13 @@ import { homedir } from "node:os";
 
 const SOCKET_DIR = join(homedir(), ".ssh", "pi-sockets");
 
+interface PendingEntry {
+  resolve: (v: string) => void;
+  reject: (e: Error) => void;
+  rand: string;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
 interface Connection {
   key: string;
   alias: string;
@@ -21,7 +28,7 @@ interface Connection {
   sshTarget: string;
   proc: ChildProcess | null;
   buf: string;
-  pending: Map<number, { resolve: (v: string) => void; reject: (e: Error) => void }>;
+  pending: Map<number, PendingEntry>;
   reqId: number;
   startTime: number;
   lastUse: number;
@@ -100,7 +107,9 @@ function connKey(user: string, hostname: string, port: number): string {
   return `${user}@${hostname}:${port}`;
 }
 function socketPath(key: string): string {
-  return join(SOCKET_DIR, key.replace(/[@:]/g, "_") + ".sock");
+  // Use @ and : directly in the filename — both are valid on Linux.
+  // Old code replaced them with _, which broke usernames containing _.
+  return join(SOCKET_DIR, key + ".sock");
 }
 function targetStr(alias: string, user: string, hostname: string, port: number): string {
   return alias !== hostname ? alias : `-p ${port} ${user}@${hostname}`;
@@ -126,14 +135,22 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
   while (i < parts.length) {
     const p = parts[i];
     if (p === "-p") {
-      if (i + 1 < parts.length) { port = parseInt(parts[i + 1]); i += 2; }
+      if (i + 1 < parts.length) { const v = parseInt(parts[i + 1]); if (!isNaN(v)) port = v; i += 2; }
       else { i++; } // -p at end: skip it
     }
     else if (p.startsWith("-")) { i += (i + 1 < parts.length && !parts[i + 1].startsWith("-")) ? 2 : 1; }
     else if (p.includes("@")) {
-      const [u, h] = p.split("@"); user = u;
-      if (h.includes(":")) { const [hn, pt] = h.split(":"); hostname = hn; port = port || parseInt(pt); }
-      else hostname = h;
+      // Split on the LAST @ for user/host boundary (user may contain @ in rare cases)
+      const atIdx = p.lastIndexOf("@");
+      user = p.substring(0, atIdx);
+      const hostPart = p.substring(atIdx + 1);
+      if (hostPart.includes(":")) {
+        const colonIdx = hostPart.lastIndexOf(":");
+        hostname = hostPart.substring(0, colonIdx);
+        const pt = parseInt(hostPart.substring(colonIdx + 1));
+        if (!isNaN(pt)) port = port || pt;
+        else hostname = hostPart; // colon but no valid port — treat as hostname
+      } else hostname = hostPart;
       if (i + 1 < parts.length) command = parts.slice(i + 1).join(" ");
       i = parts.length;
     } else { hostname = p; if (i + 1 < parts.length) command = parts.slice(i + 1).join(" "); i = parts.length; }
@@ -157,13 +174,22 @@ function ensureShell(conn: Connection): void {
     try { conn.proc.kill(); } catch { /* ok */ }
     conn.proc = null;
   }
-  // Reject stale pending promises
-  for (const [, p] of conn.pending) p.reject(new Error("Connection reset"));
+  // Reject stale pending promises and clear their timers
+  for (const [, p] of conn.pending) {
+    if (p.timer) clearTimeout(p.timer);
+    p.reject(new Error("Connection reset"));
+  }
   conn.pending.clear();
   conn.buf = "";
   conn.reqId = 0;
 
-  const args = `ssh -o ControlPath="${conn.socket}" -o ConnectTimeout=5 -o LogLevel=ERROR ${conn.sshTarget}`.split(" ");
+  const args = [
+    "ssh",
+    "-o", `ControlPath=${conn.socket}`,
+    "-o", "ConnectTimeout=5",
+    "-o", "LogLevel=ERROR",
+    conn.sshTarget,
+  ];
   conn.proc = spawn(args[0], args.slice(1), {
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -181,13 +207,19 @@ function ensureShell(conn: Connection): void {
 
   conn.proc.on("exit", (code) => {
     conn.proc = null;
-    for (const [, p] of conn.pending) p.reject(new Error(`SSH shell exited (code ${code})`));
+    for (const [, p] of conn.pending) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(new Error(`SSH shell exited (code ${code})`));
+    }
     conn.pending.clear();
   });
 
   conn.proc.on("error", (err) => {
     conn.proc = null;
-    for (const [, p] of conn.pending) p.reject(new Error(`SSH shell error: ${err.message}`));
+    for (const [, p] of conn.pending) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(new Error(`SSH shell error: ${err.message}`));
+    }
     conn.pending.clear();
   });
 }
@@ -207,14 +239,20 @@ function extractResponses(conn: Connection): void {
     }
   }
   while (true) {
-    const m = conn.buf.match(/__END__(\d+)_\w+:(\d+)\n/);
+    const m = conn.buf.match(/__END__(\d+)_(\w+):(\d+)\n/);
     if (!m) break;
     const idx = conn.buf.indexOf(m[0]);
     const output = conn.buf.substring(0, idx);
     conn.buf = conn.buf.substring(idx + m[0].length);
     const reqId = parseInt(m[1]);
+    const rand = m[2];
     const p = conn.pending.get(reqId);
-    if (p) { conn.pending.delete(reqId); p.resolve(output); }
+    // Validate the random token to prevent marker injection from command output
+    if (p && p.rand === rand) {
+      conn.pending.delete(reqId);
+      if (p.timer) clearTimeout(p.timer);
+      p.resolve(output);
+    }
   }
 }
 
@@ -227,29 +265,39 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     }
     const reqId = ++conn.reqId;
     const rand = Math.random().toString(36).slice(2, 10);
-    conn.pending.set(reqId, { resolve, reject });
-    // Pass command directly via stdin — the shell reads lines and executes them
-    // Don't wrap in quotes (that would treat semicolons literally)
-    // Use a heredoc-like approach: write command, then echo the marker
-    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
-    if (!wrote) {
-      conn.pending.delete(reqId);
-      reject(new Error("SSH stdin closed"));
-    }
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       if (conn.pending.has(reqId)) {
+        const entry = conn.pending.get(reqId)!;
         conn.pending.delete(reqId);
-        const partial = conn.buf; reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${partial.substring(0, 1000)}`));
+        if (entry.timer) clearTimeout(entry.timer);
+        const partial = conn.buf;
+        entry.reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${partial.substring(0, 1000)}`));
       }
     }, timeout);
+    conn.pending.set(reqId, { resolve, reject, rand, timer });
+    // Pass command directly via stdin — the shell reads lines and executes them
+    // Don't wrap in quotes (that would treat semicolons literally)
+    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
+    if (!wrote) {
+      // Backpressure: wait for drain before giving up
+      conn.proc.stdin.once("drain", () => {
+        // Data flushed — keep waiting for response
+      });
+      // Still reject after timeout if response never arrives
+    }
   });
 }
 
 // ── connection management ───────────────────────────────────────────────────
 
 function isConnected(key: string): boolean {
-  const sock = socketPath(key);
-  if (!existsSync(sock)) return false;
+  // Try new format first (user@host:port.sock), then legacy (_-encoded)
+  let sock = socketPath(key);
+  if (!existsSync(sock)) {
+    const legacySock = join(SOCKET_DIR, key.replace(/[@:]/g, "_") + ".sock");
+    if (existsSync(legacySock)) sock = legacySock;
+    else return false;
+  }
   try {
     const result = spawnSync("ssh", ["-o", `ControlPath=${sock}`, "-O", "check", "x"], {
       encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 5_000
@@ -284,13 +332,16 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
     `echo "Connected!" || echo "Auth failed."; read -p 'Press Enter...'`
   ], { stdio: "ignore", detached: true });
   termProc.unref();
+  let connectPolling = true;
   termProc.on("error", () => {
+    connectPolling = false;
     ctx.ui.setStatus("ssh-" + key, "");
     ctx.ui.notify("Failed to open terminal (alacritty not found?). Use ssh from an external terminal.", "warning");
   });
   ctx.ui.setStatus("ssh-" + key, `Waiting...`);
   let tries = 0;
   function poll() {
+    if (!connectPolling) return;
     tries++;
     if (isConnected(key)) { addConn(key, alias, sock, sshTarget); ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify(`Connected.`, "info"); return; }
     if (tries < 10) { ctx.ui.setStatus("ssh-" + key, `Waiting... (${tries * 2}s)`); setTimeout(poll, 2000); }
@@ -304,7 +355,10 @@ function addConn(key: string, alias: string, sock: string, target: string): void
 }
 
 function keyFromFilename(name: string): string {
-  const raw = name.replace(".sock", "");
+  const raw = name.replace(/\.sock$/, "");
+  // New format (user@host:port — contains both @ and :)
+  if (raw.includes("@") && raw.includes(":")) return raw;
+  // Legacy format (user_host_port — underscore-encoded); fragile with _ in username
   const i1 = raw.indexOf("_"), i2 = raw.lastIndexOf("_");
   if (i1 < 0 || i2 <= i1) return raw;
   return `${raw.substring(0, i1)}@${raw.substring(i1 + 1, i2)}:${raw.substring(i2 + 1)}`;
@@ -356,17 +410,35 @@ function findConnection(host: string): Connection | undefined {
 }
 
 function closeConn(target: string, ctx: any): void {
+  const t = target.toLowerCase();
+  // Exact match on alias or key first (case-insensitive)
+  for (const [key, c] of connections) {
+    if (c.alias.toLowerCase() === t || c.key.toLowerCase() === t || c.key === target || c.alias === target) {
+      destroyConn(key, c, ctx);
+      return;
+    }
+  }
+  // Fallback: substring match on alias or key
   for (const [key, c] of connections) {
     if (c.key.includes(target) || c.alias.includes(target)) {
-      if (c.proc) { try { c.proc.kill(); } catch { /* ok */ } }
-      try { spawnSync("ssh", ["-o", `ControlPath=${c.socket}`, "-O", "exit", "x"], { stdio: "ignore", timeout: 10_000 }); } catch { /* ok */ }
-      try { rmSync(c.socket); } catch { /* ok */ }
-      connections.delete(key);
-      ctx.ui.notify(`Closed ${c.key}.`, "info");
+      destroyConn(key, c, ctx);
       return;
     }
   }
   ctx.ui.notify(`No connection matching "${target}".`, "error");
+}
+
+function destroyConn(key: string, c: Connection, ctx: any): void {
+  if (c.proc) { try { c.proc.kill(); } catch { /* ok */ } }
+  for (const [, p] of c.pending) {
+    if (p.timer) clearTimeout(p.timer);
+    try { p.reject(new Error("Connection closed")); } catch { /* ok */ }
+  }
+  c.pending.clear();
+  try { spawnSync("ssh", ["-o", `ControlPath=${c.socket}`, "-O", "exit", "x"], { stdio: "ignore", timeout: 10_000 }); } catch { /* ok */ }
+  try { rmSync(c.socket); } catch { /* ok */ }
+  connections.delete(key);
+  ctx.ui.notify(`Closed ${c.key}.`, "info");
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -457,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 
         if (isBg) {
           // Deduplicate: if same command already running on this host, return existing
-          const existing = remoteTasks.find(t => t.host === conn!.key && t.cmd === params.command);
+          const existing = remoteTasks.find(t => t.host === params.host && t.cmd === params.command);
           if (existing) {
             return {
               content: [{
@@ -470,8 +542,10 @@ export default function (pi: ExtensionAPI) {
             };
           }
 
-          // Long-running task: auto-wrap in nohup on remote, return immediately
+          // Long-running task: register BEFORE await to prevent concurrent dedup misses
           const logPath = `/tmp/pi-bg-${Date.now().toString(36)}.log`;
+          remoteTasks.push({ host: params.host, logPath, cmd: params.command, startTime: Date.now() });
+
           const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
           const result = await shellExec(conn, bgCmd, 15000);
           conn.lastUse = Date.now();
@@ -516,22 +590,13 @@ export default function (pi: ExtensionAPI) {
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
-        // Extract user@host from connection key (last '@' for user, everything after is host:port)
-        const atIdx = conn.key.lastIndexOf("@");
-        const userHost = atIdx >= 0 ? conn.key.substring(atIdx + 1) : conn.key;
-        const colonIdx = userHost.lastIndexOf(":");
-        const hostname = colonIdx >= 0 ? userHost.substring(0, colonIdx) : userHost;
-        const port = colonIdx >= 0 ? userHost.substring(colonIdx + 1) : "22";
-        // If alias differs from resolved hostname, use SSH config alias; otherwise explicit
-        const target = conn.alias !== hostname
-          ? `${conn.alias}:${params.remotePath}`  // SSH config alias
-          : `-P ${port} ${conn.key.substring(0, atIdx >= 0 ? atIdx : conn.key.length)}:${params.remotePath}`;
+        // ControlMaster handles the connection — just use alias:path
         const scpArgs = [
           "-o", `ControlPath=${conn.socket}`,
           "-o", "ConnectTimeout=5",
           "-o", "LogLevel=ERROR",
           params.localPath,
-          target,
+          `${conn.alias}:${params.remotePath}`,
         ];
         const result = spawnSync("scp", scpArgs, {
           encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000, stdio: ["ignore", "pipe", "pipe"]
@@ -561,21 +626,12 @@ export default function (pi: ExtensionAPI) {
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
-        // Extract user@host from connection key (last '@' for user, everything after is host:port)
-        const atIdx = conn.key.lastIndexOf("@");
-        const userHost = atIdx >= 0 ? conn.key.substring(atIdx + 1) : conn.key;
-        const colonIdx = userHost.lastIndexOf(":");
-        const hostname = colonIdx >= 0 ? userHost.substring(0, colonIdx) : userHost;
-        const port = colonIdx >= 0 ? userHost.substring(colonIdx + 1) : "22";
-        // If alias differs from resolved hostname, use SSH config alias; otherwise explicit
-        const target = conn.alias !== hostname
-          ? `${conn.alias}:${params.remotePath}`
-          : `-P ${port} ${conn.key.substring(0, atIdx >= 0 ? atIdx : conn.key.length)}:${params.remotePath}`;
+        // ControlMaster handles the connection — just use alias:path
         const scpArgs = [
           "-o", `ControlPath=${conn.socket}`,
           "-o", "ConnectTimeout=5",
           "-o", "LogLevel=ERROR",
-          target,
+          `${conn.alias}:${params.remotePath}`,
           params.localPath,
         ];
         const result = spawnSync("scp", scpArgs, {
@@ -627,6 +683,7 @@ export default function (pi: ExtensionAPI) {
       try { c.proc?.kill(); } catch { /* ok */ }
       // Reject any pending promises so they don't hang
       for (const [, p] of c.pending) {
+        if (p.timer) clearTimeout(p.timer);
         try { p.reject(new Error("Session shutdown")); } catch { /* ok */ }
       }
       c.pending.clear();
