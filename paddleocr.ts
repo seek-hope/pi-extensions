@@ -1,32 +1,152 @@
 /**
- * PaddleOCR extension for pi — wraps the official paddleocr npm package.
- * Official upstream: https://github.com/PaddlePaddle/PaddleOCR
- * npm: paddleocr v1.2.0 (by x3zvawq) — cross-platform OCR based on PaddleOCR v5 + ONNX Runtime
+ * PaddleOCR extension — official PaddleOCR cloud API.
+ * Uses PaddleOCR-VL-1.6 model via api-v2 REST endpoint.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+
+const JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
+const TOKEN = "PADDLEOCR_TOKEN_REDACTED";
+const MODEL = "PaddleOCR-VL-1.6";
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "paddle_ocr",
     label: "PaddleOCR",
-    description: "Extract text from images using PaddleOCR (official PaddleOCR v5 + ONNX Runtime). Supports .png, .jpg, .jpeg, .webp, .bmp files.",
+    description:
+      "Extract text from images using PaddleOCR (official PaddleOCR v5 + ONNX Runtime). " +
+      "Supports .png, .jpg, .jpeg, .webp, .bmp files.",
     parameters: Type.Object({
       imagePath: Type.String({ description: "Path to the image file to OCR" }),
       language: Type.Optional(Type.String({ description: "Language code: ch, en, en_ch (default: en)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, _signal) {
       try {
-        const imgPath = params.imagePath;
-        if (!imgPath) return { content: [{ type: "text", text: "imagePath required" }], details: {}, isError: true };
-        const out = execSync(
-          `NODE_PATH=${process.env.HOME}/.npm/lib/node_modules node ${process.env.HOME}/.local/bin/paddle-ocr "${imgPath}"`,
-          { cwd: ctx.cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 120_000 }
-        );
-        return { content: [{ type: "text", text: out }], details: {} };
+        const filePath = params.imagePath;
+        if (!filePath || !existsSync(filePath)) {
+          return {
+            content: [{ type: "text", text: `File not found: ${filePath}` }],
+            details: {},
+            isError: true,
+          };
+        }
+
+        const isUrl = filePath.startsWith("http");
+
+        // Step 1: Submit job
+        let jobResp: any;
+        if (isUrl) {
+          jobResp = await fetch(JOB_URL, {
+            method: "POST",
+            headers: {
+              "Authorization": `bearer ${TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              fileUrl: filePath,
+              model: MODEL,
+              optionalPayload: {
+                useDocOrientationClassify: false,
+                useDocUnwarping: false,
+                useChartRecognition: false,
+              },
+            }),
+            signal: _signal,
+          });
+        } else {
+          const fileData = readFileSync(filePath);
+          const form = new FormData();
+          form.append("file", new Blob([fileData]), filePath.split("/").pop() || "image.png");
+          form.append("model", MODEL);
+          form.append("optionalPayload", JSON.stringify({
+            useDocOrientationClassify: false,
+            useDocUnwarping: false,
+            useChartRecognition: false,
+          }));
+          jobResp = await fetch(JOB_URL, {
+            method: "POST",
+            headers: { "Authorization": `bearer ${TOKEN}` },
+            body: form,
+            signal: _signal,
+          });
+        }
+
+        if (jobResp.status !== 200) {
+          const err = await jobResp.text();
+          return {
+            content: [{ type: "text", text: `PaddleOCR submit failed (${jobResp.status}): ${err}` }],
+            details: {},
+            isError: true,
+          };
+        }
+
+        const jobData: any = await jobResp.json();
+        const jobId = jobData.data.jobId;
+
+        // Step 2: Poll until done
+        let state = "";
+        let resultUrl = "";
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 3000));
+          const pollResp = await fetch(`${JOB_URL}/${jobId}`, {
+            headers: { "Authorization": `bearer ${TOKEN}` },
+            signal: _signal,
+          });
+          if (pollResp.status !== 200) continue;
+          const pollData: any = await pollResp.json();
+          state = pollData.data.state;
+          if (state === "done") {
+            resultUrl = pollData.data.resultUrl?.jsonUrl || "";
+            break;
+          }
+          if (state === "failed") {
+            return {
+              content: [{ type: "text", text: `OCR failed: ${pollData.data.errorMsg}` }],
+              details: {},
+              isError: true,
+            };
+          }
+        }
+
+        if (state !== "done" || !resultUrl) {
+          return {
+            content: [{ type: "text", text: "OCR timed out after 3 minutes." }],
+            details: {},
+            isError: true,
+          };
+        }
+
+        // Step 3: Fetch and parse results
+        const resultResp = await fetch(resultUrl, { signal: _signal });
+        const text = await resultResp.text();
+        const lines = text.trim().split("\n").filter(Boolean);
+
+        const output: string[] = [];
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line);
+            const layouts = parsed.result?.layoutParsingResults || [];
+            for (const layout of layouts) {
+              const md = layout.markdown?.text || "";
+              if (md) output.push(md);
+            }
+          } catch { /* skip malformed lines */ }
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: output.join("\n\n") || "(no text extracted)",
+          }],
+          details: { jobId, pages: lines.length },
+        };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `PaddleOCR: ${e.stderr || e.message}` }], details: {}, isError: true };
+        return {
+          content: [{ type: "text", text: `PaddleOCR error: ${e.message}` }],
+          details: {},
+          isError: true,
+        };
       }
     },
   });
