@@ -25,7 +25,6 @@ interface Task {
   endTime?: number;
   exitCode?: number;
   logFile: string;
-  model?: string;
 }
 
 // ── persist tasks to disk ──────────────────────────────────────────────────
@@ -157,7 +156,7 @@ function pollCompletion(id: string): void {
     const task = tasks.get(id);
     if (!task || task.status !== "running") return;
     try {
-      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+      try { execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 }); } catch (e) { if (e.code === "ENOENT") { task.status = "error"; task.error = "tmux not installed"; } else { getTaskOutput(task); } saveTasks(tasks); continue; }
       // Still running
       updateTaskWidget();
       setTimeout(check, 5000);
@@ -197,7 +196,7 @@ export default function (pi: ExtensionAPI) {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
       try {
-        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+        try { execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 }); } catch (e) { if (e.code === "ENOENT") { task.status = "error"; task.error = "tmux not installed"; } else { getTaskOutput(task); } saveTasks(tasks); continue; }
         // Still running — resume polling
         pollCompletion(id);
       } catch {
@@ -208,12 +207,14 @@ export default function (pi: ExtensionAPI) {
     }
     updateTaskWidget();
   }
+      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
   syncTasks();
 
   // ── /tasks command ────────────────────────────────────────────────────
   pi.registerCommand("tasks", {
     description: "List background tasks",
     handler: async (_args, ctx) => {
+      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
       syncTasks();
       if (tasks.size === 0) { ctx.ui.notify("No background tasks.", "info"); return; }
 
@@ -257,10 +258,12 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Attaching to ${id}... (Ctrl+B D to detach)`, "info");
       const proc = spawn("tmux", ["attach-session", "-t", id], { stdio: "inherit" });
+      let attached = false;
       await new Promise<void>((resolve) => {
         proc.on("exit", () => resolve());
         proc.on("error", () => resolve());
       });
+      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
       syncTasks();
     },
   });
@@ -322,6 +325,7 @@ export default function (pi: ExtensionAPI) {
     description: "Check the status of all background tasks.",
     parameters: Type.Object({}),
     async execute() {
+      if (!attached) { try { proc.kill(); } catch { /* ok */ } }
       syncTasks();
       if (tasks.size === 0) return { content: [{ type: "text", text: "No background tasks." }], details: {} };
       const lines = ["Background tasks:"];

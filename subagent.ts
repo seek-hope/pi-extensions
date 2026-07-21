@@ -45,7 +45,7 @@ try {
   const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf-8"));
   _defaultModel = cfg.defaultModel;
   _cheapModel = _defaultModel?.replace(/pro/i, "flash") || _defaultModel;
-} catch { /* use defaults */ }
+} catch (e) { console.error("[subagent] Failed to read settings.json:", e.message); }
 
 function branchName(id: string): string {
   return `pi/subagent/${id}`;
@@ -92,7 +92,7 @@ function ensureGitRepo(projectRoot: string): string {
   git(["init"], projectRoot);
   // Create initial commit so worktree add works
   try {
-    git(["add", "-A"], projectRoot);
+    git(["add", "-A", "--ignore-errors"], projectRoot);
     git(["commit", "-m", "pi: initial snapshot (auto-created for sub-agent tracking)", "--allow-empty"], projectRoot);
   } catch {
     git(["commit", "-m", "pi: initial snapshot", "--allow-empty"], projectRoot);
@@ -584,6 +584,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const branch = branchName(params.id);
+      if (gitQuiet(["status", "--porcelain"], ctx.cwd).trim()) { return { content: [{ type: "text", text: "Working tree has uncommitted changes. Commit or stash before merging." }], details: {}, isError: true }; }
       const ag = subAgents.get(params.id);
 
       // Try merge

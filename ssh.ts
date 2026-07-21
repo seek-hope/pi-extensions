@@ -220,7 +220,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     setTimeout(() => {
       if (conn.pending.has(reqId)) {
         conn.pending.delete(reqId);
-        reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${conn.buf.substring(0, 1000)}`));
+        const partial = conn.buf; reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${partial.substring(0, 1000)}`));
       }
     }, timeout);
   });
