@@ -9,7 +9,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync, spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -64,7 +64,9 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   // Use a unique, random heredoc delimiter to prevent injection via task content
   const heredocMarker = `PIEOF_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   const scriptFile = join(TASK_DIR, `${id}.sh`);
+  // Script self-deletes via trap; the task body is heredoc-isolated so injection-free
   const script = [
+    `trap 'rm -f "$0"' EXIT`,
     `cd '${cwd.replace(/'/g, "'\\''")}'`,
     `cat > /tmp/_bgtask_${id}.sh << '${heredocMarker}'`,
     description,
@@ -75,10 +77,12 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   ].join("\n");
   writeFileSync(scriptFile, script);
 
-  try {
-    execSync(`tmux new-session -d -s "${id}" "bash ${scriptFile} ; rm -f ${scriptFile}" 2>/dev/null`, { timeout: 10_000 });
-  } catch {
-    // tmux spawn failed — clean up and throw
+  // Use spawnSync with args array — no shell injection
+  const result = spawnSync("tmux", ["new-session", "-d", "-s", id, "bash", scriptFile], {
+    stdio: "ignore",
+    timeout: 10_000,
+  });
+  if (result.error || result.status !== 0) {
     try { unlinkSync(scriptFile); } catch { /* ok */ }
     throw new Error(`Failed to start tmux session for task ${id}`);
   }
@@ -94,7 +98,7 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
     setTimeout(() => {
       const t = tasks.get(id);
       if (t && t.status === "running") {
-        try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
+        try { spawnSync("tmux", ["kill-session", "-t", id], { stdio: "ignore", timeout: 5_000 }); } catch { /* ok */ }
         t.status = "killed";
         t.endTime = Date.now();
         saveTasks(tasks);
@@ -124,7 +128,7 @@ function getTaskOutput(task: Task): string {
 function killTask(id: string): boolean {
   const task = tasks.get(id);
   if (!task) return false;
-  try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
+  try { spawnSync("tmux", ["kill-session", "-t", id], { stdio: "ignore", timeout: 5_000 }); } catch { /* ok */ }
   task.status = "killed";
   task.endTime = Date.now();
   saveTasks(tasks);
@@ -155,18 +159,24 @@ function pollCompletion(id: string): void {
   const check = () => {
     const task = tasks.get(id);
     if (!task || task.status !== "running") return;
+    let sessionAlive = false;
     try {
-      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+      const r = spawnSync("tmux", ["has-session", "-t", id], { stdio: "ignore", timeout: 5_000 });
+      sessionAlive = r.status === 0;
+    } catch { /* session check failed — treat as gone */ }
+
+    if (sessionAlive) {
       // Still running
       updateTaskWidget();
       setTimeout(check, 5000);
-    } catch {
+    } else {
       // Session ended — atomically get output and update status
       const current = tasks.get(id);
       if (!current || current.status !== "running") return;
       getTaskOutput(current);  // sets status to done/error
       saveTasks(tasks);
-      const output = readFileSync(current.logFile, "utf-8"); // get full output for message
+      let output = "(no output)";
+      try { output = existsSync(current.logFile) ? readFileSync(current.logFile, "utf-8") : output; } catch { /* use default */ }
       const emoji = current.status === "done" ? "✅" : "❌";
       updateTaskWidget();
       notifyUser(`${emoji} Background task ${id} completed (${current.status})`, current.status === "done" ? "info" : "error");
@@ -204,7 +214,6 @@ export default function (pi: ExtensionAPI) {
         getTaskOutput(task);
         saveTasks(tasks);
       }
-    }
     updateTaskWidget();
   }
 
