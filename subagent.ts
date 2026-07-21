@@ -174,6 +174,25 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 
 // ── depth tracking ─────────────────────────────────────────────────────────
 
+/** Run pi as a sub-process directly in a given directory (no worktree). */
+function runSubProcess(task: string, cwd: string, model?: string): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const args: string[] = ["-p", "--no-context-files", "--no-session"];
+    if (model) args.push("--model", model);
+    args.push(task);
+    const proc = spawn("pi", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on("close", () => resolve({ stdout, stderr }));
+    proc.on("error", () => resolve({ stdout, stderr: stderr || "spawn error" }));
+    setTimeout(() => { proc.kill(); resolve({ stdout, stderr: stderr || "timeout" }); }, 600_000);
+  });
+}
+
+// ── depth tracking ─────────────────────────────────────────────────────────
+
 const MAX_DEPTH = 5;
 
 function currentDepth(): number {
@@ -181,8 +200,17 @@ function currentDepth(): number {
   return isNaN(d) ? 0 : d;
 }
 
+/** Resolve the nearest git repo root from a starting directory. */
+function resolveGitRoot(cwd: string): string {
+  try {
+    return git(["rev-parse", "--show-toplevel"], cwd).trim();
+  } catch {
+    return cwd; // fallback to original cwd
+  }
+}
+
 function projectRoot(cwd: string): string {
-  return process.env.PI_SUBAGENT_ROOT || cwd;
+  return process.env.PI_SUBAGENT_ROOT || resolveGitRoot(cwd);
 }
 
 // ── spawn sub-agent ─────────────────────────────────────────────────────────
@@ -942,10 +970,15 @@ export default function (pi: ExtensionAPI) {
       const iterations: { iter: number; reviewerResult: string; fixerResult: string; issuesFound: number; clean: boolean }[] = [];
 
       for (let i = 1; i <= maxIter; i++) {
-        // Step 1: Review
+        // Step 1: Review — embed actual diff so reviewer sees the real changes
+        const diffContent = getDiff(ctx.cwd, params.id);
         const reviewTask = [
-          `Review the git diff of branch ${ag.branch}.`,
+          `Review the following code changes.`,
           `Review criteria: ${criteria}`,
+          ``,
+          `--- BEGIN DIFF ---`,
+          diffContent.substring(0, 24000),
+          `--- END DIFF ---`,
           ``,
           `IMPORTANT: Respond in this exact format:`,
           `FOUND: <number of distinct issues found, 0 if none>`,
@@ -987,30 +1020,22 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: summary }], details: { iterations: i, clean: true } };
         }
 
-        // Step 2: Fix
+        // Step 2: Fix — run fixer directly in the target worktree so it can see & edit files
         const fixTask = [
-          `You are fixing issues found during code review on branch ${ag.branch}.`,
+          `You are fixing issues found during code review.`,
           ``,
-          `Review found ${issuesCount} issue(s):`,
+          `Issues to fix (${issuesCount} found):`,
           reviewerOutput.substring(0, 4000),
           ``,
           `Your task: Fix ALL the issues listed above.`,
-          `- Work in the current directory (this is the worktree for branch ${ag.branch})`,
-          `- Make concrete edits to the files`,
+          `- Make concrete edits to the files (the files are in this directory)`,
           `- After fixing, verify your changes are correct`,
-          `- Do NOT commit — commits are handled automatically`,
           `- Be thorough: every issue listed above must be addressed`,
         ].join("\n");
 
-        const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixTask, ctx.cwd, {
-          model: _cheapModel || "deepseek-v4-flash",
-          tools: ["read", "edit", "write", "bash", "serena_search_pattern"], // edit-only, no subagent
-        });
-        const fixerOutput = await fixPromise;
-        // Merge fixer's work back to the original agent's branch
-        try { git(["merge", "--no-edit", branchName(fixerId)], ag.worktreePath); } catch { /* best effort */ }
-        subAgents.delete(fixerId);
-        cleanupWorktree(ctx.cwd, fixerId, true);
+        // Run the fixer directly in the target worktree (not a new sub-agent worktree)
+        const fixerResult = await runSubProcess(fixTask, ag.worktreePath, _cheapModel);
+        const fixerOutput = fixerResult.stdout + fixerResult.stderr;
 
         // Commit the fixes
         const fixHash = commitWorktree(ag.worktreePath, params.id, `fix iteration ${i}: ${issuesCount} issue(s)`);
