@@ -167,7 +167,8 @@ function pollCompletion(id: string): void {
       if (!current || current.status !== "running") return;
       getTaskOutput(current);  // sets status to done/error
       saveTasks(tasks);
-      const output = readFileSync(current.logFile, "utf-8"); // get full output for message
+      let output = "";
+      try { output = readFileSync(current.logFile, "utf-8"); } catch { /* file may have been removed */ }
       const emoji = current.status === "done" ? "✅" : "❌";
       updateTaskWidget();
       notifyUser(`${emoji} Background task ${id} completed (${current.status})`, current.status === "done" ? "info" : "error");
@@ -202,7 +203,9 @@ export default function (pi: ExtensionAPI) {
         pollCompletion(id);
       } catch {
         // Session gone — check log for exit code
-        getTaskOutput(task);
+        try {
+          getTaskOutput(task);
+        } catch { /* log file may be gone */ }
         saveTasks(tasks);
       }
     }

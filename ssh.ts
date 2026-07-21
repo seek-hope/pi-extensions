@@ -188,6 +188,19 @@ function ensureShell(conn: Connection): void {
 }
 
 function extractResponses(conn: Connection): void {
+  // Safety: if buffer grows too large without a valid marker, truncate
+  const MAX_BUF = 2 * 1024 * 1024; // 2 MB
+  if (conn.buf.length > MAX_BUF) {
+    // Find the last valid marker or truncate from the front
+    const lastMarker = conn.buf.lastIndexOf("__END__");
+    if (lastMarker > 0) {
+      // Discard everything before the last marker (stale data)
+      conn.buf = conn.buf.substring(lastMarker);
+    } else {
+      // No marker at all — malformed output, truncate entirely
+      conn.buf = "";
+    }
+  }
   while (true) {
     const m = conn.buf.match(/__END__(\d+)_\w+:(\d+)\n/);
     if (!m) break;
@@ -254,13 +267,18 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   }
   ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
-  spawn("alacritty", ["-e", "bash", "-c",
+  const termProc = spawn("alacritty", ["-e", "bash", "-c",
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=12h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
     `-o StrictHostKeyChecking=accept-new -fN ${sshTarget} && ` +
     `echo "Connected!" || echo "Auth failed."; read -p 'Press Enter...'`
-  ], { stdio: "ignore", detached: true }).unref();
+  ], { stdio: "ignore", detached: true });
+  termProc.unref();
+  termProc.on("error", () => {
+    ctx.ui.setStatus("ssh-" + key, "");
+    ctx.ui.notify("Failed to open terminal (alacritty not found?). Use ssh from an external terminal.", "warning");
+  });
   ctx.ui.setStatus("ssh-" + key, `Waiting...`);
   let tries = 0;
   function poll() {
@@ -449,9 +467,16 @@ export default function (pi: ExtensionAPI) {
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
-        const target = conn.alias !== conn.key.split(":")[0]?.split("@")[1]
+        // Extract user@host from connection key (last '@' for user, everything after is host:port)
+        const atIdx = conn.key.lastIndexOf("@");
+        const userHost = atIdx >= 0 ? conn.key.substring(atIdx + 1) : conn.key;
+        const colonIdx = userHost.lastIndexOf(":");
+        const hostname = colonIdx >= 0 ? userHost.substring(0, colonIdx) : userHost;
+        const port = colonIdx >= 0 ? userHost.substring(colonIdx + 1) : "22";
+        // If alias differs from resolved hostname, use SSH config alias; otherwise explicit
+        const target = conn.alias !== hostname
           ? `${conn.alias}:${params.remotePath}`  // SSH config alias
-          : `-P ${conn.key.split(":")[1]} ${conn.key.split(":")[0]}:${params.remotePath}`;
+          : `-P ${port} ${conn.key.substring(0, atIdx >= 0 ? atIdx : conn.key.length)}:${params.remotePath}`;
         const scpArgs = [
           "-o", `ControlPath=${conn.socket}`,
           "-o", "ConnectTimeout=5",
@@ -487,9 +512,16 @@ export default function (pi: ExtensionAPI) {
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
-        const target = conn.alias !== conn.key.split(":")[0]?.split("@")[1]
+        // Extract user@host from connection key (last '@' for user, everything after is host:port)
+        const atIdx = conn.key.lastIndexOf("@");
+        const userHost = atIdx >= 0 ? conn.key.substring(atIdx + 1) : conn.key;
+        const colonIdx = userHost.lastIndexOf(":");
+        const hostname = colonIdx >= 0 ? userHost.substring(0, colonIdx) : userHost;
+        const port = colonIdx >= 0 ? userHost.substring(colonIdx + 1) : "22";
+        // If alias differs from resolved hostname, use SSH config alias; otherwise explicit
+        const target = conn.alias !== hostname
           ? `${conn.alias}:${params.remotePath}`
-          : `-P ${conn.key.split(":")[1]} ${conn.key.split(":")[0]}:${params.remotePath}`;
+          : `-P ${port} ${conn.key.substring(0, atIdx >= 0 ? atIdx : conn.key.length)}:${params.remotePath}`;
         const scpArgs = [
           "-o", `ControlPath=${conn.socket}`,
           "-o", "ConnectTimeout=5",
@@ -542,7 +574,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
-    for (const [, c] of connections) { try { c.proc?.kill(); } catch { /* ok */ } }
+    for (const [, c] of connections) {
+      try { c.proc?.kill(); } catch { /* ok */ }
+      // Reject any pending promises so they don't hang
+      for (const [, p] of c.pending) {
+        try { p.reject(new Error("Session shutdown")); } catch { /* ok */ }
+      }
+      c.pending.clear();
+    }
   });
 }
 

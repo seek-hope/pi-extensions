@@ -54,14 +54,22 @@ function branchName(id: string): string {
 // ── git helpers ─────────────────────────────────────────────────────────────
 
 function git(args: string[], cwd: string): string {
-  const { execSync } = require("child_process");
-  const escaped = args.map(a => `'${a.replace(/'/g, "'\\''")}'`);
-  return execSync(["git", ...escaped].join(" "), {
+  const { spawnSync } = require("child_process");
+  const result = spawnSync("git", args, {
     cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
     timeout: 30_000,
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  if (result.status !== 0) {
+    const err: any = new Error(result.stderr?.trim() || `git ${args[0]} exited with code ${result.status}`);
+    err.stderr = result.stderr || "";
+    err.stdout = result.stdout || "";
+    err.status = result.status;
+    throw err;
+  }
+  return result.stdout || "";
 }
 
 function gitQuiet(args: string[], cwd: string): string {
@@ -779,8 +787,10 @@ export default function (pi: ExtensionAPI) {
         });
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
-        for (const r of batchResults) subAgents.delete(r.id);
-        cleanupWorktree(ctx.cwd, r.id, true);
+        for (const r of batchResults) {
+          subAgents.delete(r.id);
+          cleanupWorktree(ctx.cwd, r.id, true);
+        }
       }
 
       const summary = [
@@ -882,8 +892,14 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are an exploration agent. You can ONLY read and search — you CANNOT write, edit, or delete anything. Focus on finding information quickly and reporting it concisely.",
       });
-      // Non-blocking: fire and collect later
-      promise.then(() => {}).catch(() => {});
+      // Non-blocking: fire and collect later; auto-cleanup after completion
+      promise.then(() => {
+        subAgents.delete(id);
+        cleanupWorktree(ctx.cwd, id, true);
+      }).catch(() => {
+        subAgents.delete(id);
+        cleanupWorktree(ctx.cwd, id, true);
+      });
       return {
         content: [{
           type: "text",
@@ -920,8 +936,14 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are a planning agent. You explore the codebase to understand the current state, then design a step-by-step implementation plan. You do NOT modify any files — you only READ and PLAN. Your output should be a clear, actionable plan.",
       });
-      // Non-blocking: fire and collect later
-      promise.then(() => {}).catch(() => {});
+      // Non-blocking: fire and collect later; auto-cleanup after completion
+      promise.then(() => {
+        subAgents.delete(id);
+        cleanupWorktree(ctx.cwd, id, true);
+      }).catch(() => {
+        subAgents.delete(id);
+        cleanupWorktree(ctx.cwd, id, true);
+      });
       return {
         content: [{
           type: "text",
@@ -1082,18 +1104,39 @@ export default function (pi: ExtensionAPI) {
       // Determine if target is a sub-agent ID or a direct file/code description
       let targetDesc = target;
       let targetBranch: string | undefined;
+      let targetWorktree: string | undefined;
       const existingAgent = subAgents.get(target);
       if (existingAgent && existingAgent.status !== "running") {
         targetBranch = existingAgent.branch;
+        targetWorktree = existingAgent.worktreePath;
         targetDesc = `branch ${targetBranch} (task: ${existingAgent.task})`;
       }
 
+      // Resolve the effective worktree for the audit
+      const effectiveWorktree = existingAgent?.worktreePath || ctx.cwd;
+
       for (let r = 1; r <= maxRounds; r++) {
         // ── Review phase (fresh-eye: no context from previous rounds) ──
+        // Embed the actual diff/code so the reviewer sees what to audit
+        let diffContent: string;
+        if (existingAgent) {
+          diffContent = getDiff(ctx.cwd, target);
+        } else {
+          // Target is a file path or description — reviewer must read the actual files
+          diffContent = [
+            `The audit target is: ${target}`,
+            `Use the read tool to inspect the relevant files before forming your review.`,
+            `Start by reading the file(s) at the target path to understand the code.`,
+          ].join("\n");
+        }
         const reviewPrompt = [
           `Review the following code for: ${criteria}`,
           ``,
           `Target: ${targetDesc}`,
+          ``,
+          `--- BEGIN CODE/DIFF TO REVIEW ---`,
+          diffContent.substring(0, 24000),
+          `--- END CODE/DIFF ---`,
           ``,
           `IMPORTANT — Fresh Eye Protocol:`,
           `- You are reviewing the code as it exists RIGHT NOW.`,
@@ -1111,7 +1154,9 @@ export default function (pi: ExtensionAPI) {
           `If CLEAN is true, just write "CLEAN: true" with a brief note confirming the code passes review.`,
         ].join("\n");
 
-        const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewPrompt, ctx.cwd, {
+        // Reviewer runs in the effective worktree so it can see actual files
+        const reviewerCwd = existingAgent ? existingAgent.worktreePath : ctx.cwd;
+        const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewPrompt, reviewerCwd, {
           model: _defaultModel || "deepseek-v4-pro",
           systemPrompt: "You are a thorough, unbiased code reviewer. Approach each review with completely fresh eyes. Do not assume anything — verify everything. Be strict and precise.",
           tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"], // read-only
@@ -1157,17 +1202,26 @@ export default function (pi: ExtensionAPI) {
           `Work in the current directory and make concrete edits to the files.`,
         ].join("\n");
 
-        const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixPrompt, ctx.cwd, {
+        // Fixer runs in the effective worktree (sub-agent worktree or main cwd)
+        const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixPrompt, effectiveWorktree, {
           model: _defaultModel || "deepseek-v4-pro",
           tools: ["read", "edit", "write", "bash", "serena_search_pattern"], // edit-only, no subagent
         });
         const fixerOutput = await fixPromise;
-        // Merge fixer's work to target branch
-        try {
-          git(["checkout", targetBranch || "-"], ctx.cwd);
-          git(["merge", "--no-edit", branchName(fixerId)], ctx.cwd);
-          git(["checkout", "-"], ctx.cwd);
-        } catch { /* best effort */ }
+
+        // Merge fixer's work into the target branch (if auditing a sub-agent)
+        if (existingAgent && targetBranch) {
+          try {
+            // Save current HEAD before switching
+            const origHead = git(["rev-parse", "--abbrev-ref", "HEAD"], ctx.cwd).trim();
+            git(["checkout", targetBranch], ctx.cwd);
+            git(["merge", "--no-edit", branchName(fixerId)], ctx.cwd);
+            // Switch back to original HEAD
+            if (origHead && origHead !== targetBranch) {
+              git(["checkout", origHead], ctx.cwd);
+            }
+          } catch { /* best effort — if merge fails, fixer changes stay on fixer branch */ }
+        }
         subAgents.delete(fixerId);
         cleanupWorktree(ctx.cwd, fixerId, true);
 
