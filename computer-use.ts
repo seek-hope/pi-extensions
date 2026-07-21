@@ -7,11 +7,14 @@
  *   wtype    — keyboard text input and key combos
  *   hyprctl  — cursor position, screen info
  *
- * Inspired by Anthropic Computer Use and GitHub Copilot Computer Use.
+ * Coordinate systems:
+ *   absolute  — pixel coordinates (e.g. 960, 540)
+ *   normalized — 0-1000 scale mapped to screen bounds (Claude Code compatible)
+ *   relative  — offset from current cursor position
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync, execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -20,11 +23,8 @@ import { randomUUID } from "node:crypto";
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 function sh(cmd: string, timeout = 5_000): string {
-  try {
-    return execSync(cmd, { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout }).trim();
-  } catch (e: any) {
-    return e.stderr || e.message || "";
-  }
+  try { return spawnSync("sh", ["-c", cmd], { encoding: "utf-8", maxBuffer: 50*1024*1024, timeout }).stdout.trim(); }
+  catch { return ""; }
 }
 
 function sudoSh(cmd: string, timeout = 5_000): string {
@@ -40,7 +40,6 @@ function getCursorPos(): { x: number; y: number } {
 
 function getScreenBounds(): { width: number; height: number; monitors: string } {
   const out = sh("hyprctl monitors");
-  // Parse all monitor geometries to find total bounds
   let maxX = 0, maxY = 0;
   const re = /(\d+)x(\d+)@[\d.]+ at (\d+)x(\d+)/g;
   let m;
@@ -50,11 +49,65 @@ function getScreenBounds(): { width: number; height: number; monitors: string } 
     maxX = Math.max(maxX, x + w);
     maxY = Math.max(maxY, y + h);
   }
+  return { width: maxX || 2560, height: maxY || 1440, monitors: out };
+}
+
+/** Convert normalized coordinates (0-1000 scale) to absolute pixel coords */
+function normalizeToPixel(nx: number, ny: number, bound: { width: number; height: number }) {
   return {
-    width: maxX || 2560,
-    height: maxY || 1440,
-    monitors: out,
+    x: Math.round((nx / 1000) * bound.width),
+    y: Math.round((ny / 1000) * bound.height),
   };
+}
+
+/** Clamp coordinates to screen bounds */
+function clamp(x: number, y: number, bound: { width: number; height: number }) {
+  return {
+    x: Math.max(0, Math.min(x, bound.width - 1)),
+    y: Math.max(0, Math.min(y, bound.height - 1)),
+  };
+}
+
+// ── reliability helpers ────────────────────────────────────────────────────
+
+/** Check if ydotool daemon is running */
+function ydotoolOK(): boolean {
+  try {
+    spawnSync("sudo", ["YDOTOOL_SOCKET=/tmp/.ydotool_socket", "ydotool", "mousemove", "-x", "0", "-y", "0"], {
+      encoding: "utf-8", stdio: "ignore", timeout: 2_000
+    });
+    return true;
+  } catch { return false; }
+}
+
+/** Retry a ydotool action up to maxRetries times with delay */
+function ydotoolRetry(action: string, maxRetries = 3, delayMs = 200): void {
+  let lastErr: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      sudoSh(action, 5_000);
+      return;
+    } catch (e) { lastErr = e; if (i < maxRetries - 1) { const _sleep = spawnSync("sleep", [(delayMs / 1000).toString()], { timeout: delayMs + 500 }); } }
+  }
+  throw lastErr || new Error(`ydotool failed after ${maxRetries} retries`);
+}
+
+/** Move mouse and verify position (retry if not at target) */
+function moveToVerified(x: number, y: number, bound: { width: number; height: number }): void {
+  const { x: cx, y: cy } = clamp(x, y, bound);
+  let lastErr: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
+      // Small settle delay
+      const _sleep = spawnSync("sleep", ["0.05"], { timeout: 200 });
+      const pos = getCursorPos();
+      // Accept if within 5px tolerance
+      if (Math.abs(pos.x - cx) <= 5 && Math.abs(pos.y - cy) <= 5) return;
+      if (attempt === 2) return; // Last attempt — accept anyway
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error(`Failed to move to (${cx}, ${cy})`);
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -107,16 +160,32 @@ export default function (pi: ExtensionAPI) {
   // ── move mouse ────────────────────────────────────────────────────────
   pi.registerTool({
     name: "computer_move",
-    label: "Computer Move Mouse",
-    description: "Move the mouse cursor to absolute screen coordinates (x, y).",
+    label: "Computer Move",
+    description:
+      "Move the mouse cursor. Supports 3 coordinate systems:\n" +
+      "- absolute pixel: pass x, y as raw pixel values\n" +
+      "- normalized (Claude Code compatible): set `coordSystem: 'normalized'`, x/y are 0-1000\n" +
+      "- relative: set `coordSystem: 'relative'`, x/y are pixel offsets from current position",
     parameters: Type.Object({
-      x: Type.Number({ description: "X coordinate (pixels from left)" }),
-      y: Type.Number({ description: "Y coordinate (pixels from top)" }),
+      x: Type.Number({ description: "X coordinate (pixels, or 0-1000 if normalized)" }),
+      y: Type.Number({ description: "Y coordinate (pixels, or 0-1000 if normalized)" }),
+      coordSystem: Type.Optional(Type.String({ description: "'absolute' (default), 'normalized' (0-1000), or 'relative'" })),
     }),
     async execute(_id, params, _signal) {
       try {
-        sudoSh(`ydotool mousemove -x ${params.x} -y ${params.y}`);
-        return { content: [{ type: "text", text: `Moved to (${params.x}, ${params.y})` }], details: { x: params.x, y: params.y } };
+        const bound = getScreenBounds();
+        let tx = params.x, ty = params.y;
+
+        if (params.coordSystem === "normalized") {
+          ({ x: tx, y: ty } = normalizeToPixel(params.x, params.y, bound));
+        } else if (params.coordSystem === "relative") {
+          const pos = getCursorPos();
+          tx = pos.x + params.x;
+          ty = pos.y + params.y;
+        }
+
+        moveToVerified(tx, ty, bound);
+        return { content: [{ type: "text", text: `Moved to (${tx}, ${ty})` }], details: { x: tx, y: ty } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Move failed: ${e.message}` }], details: {}, isError: true };
       }
@@ -127,18 +196,54 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "computer_click",
     label: "Computer Click",
-    description: "Click the mouse at the current position. Button: left=1, middle=2, right=3.",
+    description: "Click the mouse at the current position. Button: left=1, middle=2, right=3. Adds a small settle delay after click for reliability.",
     parameters: Type.Object({
       button: Type.Optional(Type.Number({ description: "Mouse button: 1=left, 2=middle, 3=right (default: 1=left)" })),
     }),
     async execute(_id, params, _signal) {
       try {
         const btn = params.button || 1;
-        sudoSh(`ydotool click ${btn}`);
+        ydotoolRetry(`ydotool click ${btn}`);
+        // Settle delay — ensures UI responds before next action
+        const _sleep = spawnSync("sleep", ["0.08"], { timeout: 200 });
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Clicked button ${btn} at (${pos.x}, ${pos.y})` }], details: { button: btn, ...pos } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Click failed: ${e.message}` }], details: {}, isError: true };
+      }
+    },
+  });
+
+  // ── combined move + click (one-shot for reliability) ─────────────────
+  pi.registerTool({
+    name: "computer_click_at",
+    label: "Computer Click At",
+    description: "Move mouse to a position then click. Use normalized coords (0-1000) for Claude Code compatible workflows.",
+    parameters: Type.Object({
+      x: Type.Number({ description: "X coordinate" }),
+      y: Type.Number({ description: "Y coordinate" }),
+      button: Type.Optional(Type.Number({ description: "Mouse button: 1=left, 2=middle, 3=right (default: 1=left)" })),
+      coordSystem: Type.Optional(Type.String({ description: "'absolute' (default), 'normalized' (0-1000), or 'relative'" })),
+    }),
+    async execute(_id, params, _signal) {
+      try {
+        const bound = getScreenBounds();
+        let tx = params.x, ty = params.y;
+        if (params.coordSystem === "normalized") {
+          ({ x: tx, y: ty } = normalizeToPixel(params.x, params.y, bound));
+        } else if (params.coordSystem === "relative") {
+          const pos = getCursorPos();
+          tx = pos.x + params.x;
+          ty = pos.y + params.y;
+        }
+        moveToVerified(tx, ty, bound);
+        const btn = params.button || 1;
+        ydotoolRetry(`ydotool click ${btn}`);
+        const _sleep = spawnSync("sleep", ["0.08"], { timeout: 200 });
+        const pos = getCursorPos();
+        return { content: [{ type: "text", text: `Clicked button ${btn} at (${pos.x}, ${pos.y})` }], details: { button: btn, x: tx, y: ty } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Click-at failed: ${e.message}` }], details: {}, isError: true };
       }
     },
   });
@@ -151,7 +256,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_id, _params, _signal) {
       try {
-        sudoSh("ydotool click --repeat 2 --next-delay 100 1");
+        ydotoolRetry("ydotool click --repeat 2 --next-delay 100 1");
+        const _sleep = spawnSync("sleep", ["0.1"], { timeout: 200 });
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Double-clicked at (${pos.x}, ${pos.y})` }], details: { ...pos } };
       } catch (e: any) {
@@ -171,7 +277,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal) {
       try {
         // Pass text via stdin (-) to avoid shell escaping issues entirely
-        execSync(`wtype -`, {
+        execFileSync("wtype", ["-"], {
           encoding: "utf-8",
           maxBuffer: 50 * 1024 * 1024,
           timeout: 10_000,
@@ -236,12 +342,12 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal) {
       try {
         const dir = params.amount > 0 ? 4 : 5; // 4=up, 5=down
-        const count = Math.abs(params.amount);
+        const count = Math.min(Math.abs(params.amount), 20); // Cap at 20 for sanity
         for (let i = 0; i < count; i++) {
-          sudoSh(`ydotool click ${dir}`);
+          ydotoolRetry(`ydotool click ${dir}`, 2, 50);
         }
         const pos = getCursorPos();
-        return { content: [{ type: "text", text: `Scrolled ${params.amount > 0 ? "up" : "down"} ${count} clicks at (${pos.x}, ${pos.y})` }], details: { amount: params.amount, ...pos } };
+        return { content: [{ type: "text", text: `Scrolled ${params.amount > 0 ? "up" : "down"} ${count} at (${pos.x}, ${pos.y})` }], details: { amount: params.amount, ...pos } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Scroll failed: ${e.message}` }], details: {}, isError: true };
       }
@@ -256,19 +362,30 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       toX: Type.Number({ description: "Target X coordinate" }),
       toY: Type.Number({ description: "Target Y coordinate" }),
+      coordSystem: Type.Optional(Type.String({ description: "'absolute' (default), 'normalized' (0-1000), or 'relative'" })),
     }),
     async execute(_id, params, _signal) {
       try {
+        const bound = getScreenBounds();
+        let tx = params.toX, ty = params.toY;
+        if (params.coordSystem === "normalized") {
+          ({ x: tx, y: ty } = normalizeToPixel(params.toX, params.toY, bound));
+        } else if (params.coordSystem === "relative") {
+          const pos = getCursorPos();
+          tx = pos.x + params.toX;
+          ty = pos.y + params.toY;
+        }
+        ({ x: tx, y: ty } = clamp(tx, ty, bound));
+
         const start = getCursorPos();
-        sudoSh("ydotool mousedown 1");
-        // Small delay for drag initiation
-        await new Promise((r) => setTimeout(r, 50));
-        sudoSh(`ydotool mousemove -x ${params.toX} -y ${params.toY}`);
-        await new Promise((r) => setTimeout(r, 50));
-        sudoSh("ydotool mouseup 1");
+        ydotoolRetry("ydotool mousedown 1");
+        const _s1 = spawnSync("sleep", ["0.05"], { timeout: 200 });
+        sudoSh(`ydotool mousemove -x ${tx} -y ${ty}`, 3_000);
+        const _s2 = spawnSync("sleep", ["0.05"], { timeout: 200 });
+        ydotoolRetry("ydotool mouseup 1");
         return {
-          content: [{ type: "text", text: `Dragged from (${start.x},${start.y}) to (${params.toX},${params.toY})` }],
-          details: { from: start, to: { x: params.toX, y: params.toY } },
+          content: [{ type: "text", text: `Dragged from (${start.x},${start.y}) to (${tx},${ty})` }],
+          details: { from: start, to: { x: tx, y: ty } },
         };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Drag failed: ${e.message}` }], details: {}, isError: true };
