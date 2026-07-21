@@ -148,7 +148,11 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
       reject(new Error("SSH stdin closed"));
     }
     setTimeout(() => {
-      if (conn.pending.has(reqId)) { conn.pending.delete(reqId); reject(new Error("SSH command timeout")); }
+      if (conn.pending.has(reqId)) {
+        conn.pending.delete(reqId);
+        // Return partial output if available
+        reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${conn.buf.substring(0, 1000)}`));
+      }
     }, timeout);
   });
 }
@@ -297,7 +301,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       host: Type.String({ description: "SSH host alias" }),
       command: Type.String({ description: "Command to execute on the remote server" }),
-      timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 60000)" })),
+      timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 120000 = 2 min)" })),
       background: Type.Optional(Type.Boolean({ description: "Run in background via nohup on remote. Returns log path immediately (default: false)" })),
     }),
     async execute(_id, params, _signal) {
@@ -332,7 +336,7 @@ export default function (pi: ExtensionAPI) {
             details: { pid: result.trim(), logPath },
           };
         }
-        const result = await shellExec(conn, params.command, Math.min(params.timeout || 60_000, 300_000));
+        const result = await shellExec(conn, params.command, Math.min(params.timeout || 120_000, 600_000));
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (e: any) {
