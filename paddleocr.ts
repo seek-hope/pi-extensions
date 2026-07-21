@@ -24,15 +24,14 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal) {
       try {
         const filePath = params.imagePath;
-        if (!filePath || !existsSync(filePath)) {
+        const isUrl = filePath.startsWith("http");
+        if (!isUrl && (!filePath || !existsSync(filePath))) {
           return {
             content: [{ type: "text", text: `File not found: ${filePath}` }],
             details: {},
             isError: true,
           };
         }
-
-        const isUrl = filePath.startsWith("http");
 
         // Step 1: Submit job
         let jobResp: any;
