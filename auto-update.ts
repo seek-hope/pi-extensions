@@ -31,7 +31,7 @@ export default function (pi: ExtensionAPI) {
       // 1. Git pull extension updates
       ctx.ui.notify("Updating extension code...", "info");
       results.push("=== Extension Code (git pull) ===");
-      results.push(sh("git pull origin master 2>&1 || echo 'No remote configured. Commit: '$(git rev-parse HEAD)"));
+      results.push(sh("git pull origin main 2>&1 || echo 'No remote configured. Commit: '$(git rev-parse HEAD)"));
 
       // 2. Update npm global tools
       ctx.ui.notify("Updating npm tools...", "info");
@@ -92,7 +92,7 @@ export default function (pi: ExtensionAPI) {
       };
 
       if (scope === "all" || scope === "extensions") {
-        run("Extension Code (git pull)", () => sh("git pull origin master 2>&1 || echo 'No remote. Local commit: '$(git rev-parse --short HEAD)"));
+        run("Extension Code (git pull)", () => sh("git pull origin main 2>&1 || echo 'No remote. Local commit: '$(git rev-parse --short HEAD)"));
       }
 
       if (scope === "all" || scope === "npm") {
@@ -135,7 +135,7 @@ export default function (pi: ExtensionAPI) {
       const remote = sh("git remote get-url origin 2>/dev/null", EXT_DIR).trim();
       if (remote && !remote.includes("Error")) {
         // Check if behind remote
-        sh("git fetch origin master 2>/dev/null", EXT_DIR);
+        sh("git fetch origin main 2>/dev/null", EXT_DIR);
         const behind = sh("git rev-list HEAD..origin/master --count 2>/dev/null", EXT_DIR).trim();
         if (behind && behind !== "0" && !behind.includes("Error")) {
           ctx.ui.notify(`Extensions: ${behind} commit(s) behind remote. Run /update-tools to sync.`, "warning");

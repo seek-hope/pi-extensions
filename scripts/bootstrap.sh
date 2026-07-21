@@ -3,7 +3,7 @@
 #  pi-bootstrap.sh — Deploy pi coding agent with all extensions to a new server
 #
 #  Usage:
-#    curl -fsSL https://raw.githubusercontent.com/seek-hope/pi-extensions/master/scripts/bootstrap.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/seek-hope/pi-extensions/main/scripts/bootstrap.sh | bash
 #    OR
 #    git clone https://github.com/seek-hope/pi-extensions ~/pi-extensions
 #    cd ~/pi-extensions && bash scripts/bootstrap.sh
@@ -49,7 +49,7 @@ say "Phase 2: Deploying extensions..."
 
 if [ -d "$EXT_DIR/.git" ]; then
   say "Extensions already exist, updating..."
-  cd "$EXT_DIR" && git pull --ff-only origin master 2>/dev/null || warn "Could not git pull (local changes?)"
+  cd "$EXT_DIR" && git pull --ff-only origin main 2>/dev/null || warn "Could not git pull (local changes?)"
 else
   mkdir -p "$(dirname "$EXT_DIR")"
   rm -rf "$EXT_DIR"
