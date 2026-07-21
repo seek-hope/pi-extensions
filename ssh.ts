@@ -293,7 +293,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
       "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
-      "MANDATORY: For long-running remote tasks (training, builds, downloads), set background=true. The command runs via nohup, returns a log path immediately.",
+      "MANDATORY: Commands with timeout >120s are automatically run in background (nohup). Set timeout <=120000 to run synchronously.",
       "After background ssh_exec, use another ssh_exec to check progress: 'cat /tmp/task.log' or 'ps aux | grep PID'.",
       "Call ssh_status before running ssh_exec to verify the target host is connected.",
       "If no connection exists, tell the user: /ssh <host>",
@@ -316,9 +316,11 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
-        const isBg = params.background === true;
+        const isLong = (params.timeout || 120_000) > 120_000;
+        const isBg = params.background === true || isLong;
+
         if (isBg) {
-          // Long-running task: wrap in nohup on remote, return immediately
+          // Long-running task: auto-wrap in nohup on remote, return immediately
           const logPath = `/tmp/pi-bg-${Date.now().toString(36)}.log`;
           const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
           const result = await shellExec(conn, bgCmd, 15000);
@@ -329,9 +331,8 @@ export default function (pi: ExtensionAPI) {
               text: `Background task started on ${conn.key}.\n` +
                 `${result.trim()}\n` +
                 `Log: ${logPath}\n` +
-                `Check progress: ssh_exec("${conn.alias}", "tail -20 ${logPath}")\n` +
-                `Check running: ssh_exec("${conn.alias}", "ps aux | grep '${params.command.substring(0, 30)}'")\n` +
-                `Read full log: ssh_exec("${conn.alias}", "cat ${logPath}")`,
+                `Check progress: ssh_exec("${params.host}", "tail -20 ${logPath}")\n` +
+                `Read full log: ssh_exec("${params.host}", "cat ${logPath}")`,
             }],
             details: { pid: result.trim(), logPath },
           };
