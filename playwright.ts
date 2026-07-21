@@ -45,7 +45,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const js = `await page.goto("${params.url}"); const title = await page.title(); const text = await page.evaluate(() => document.body?.innerText || ""); console.log("Title: " + title + "\n\n" + text.substring(0, 5000));`;
+        const js = `await page.goto("${params.url}"); const t = await page.title(); const b = await page.evaluate("document.body.innerText"); console.log("Title: " + t + "\\n\\n" + (b || "").substring(0, 5000));`;
         const out = runPlaywright(js, ctx.cwd);
         return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
@@ -94,7 +94,7 @@ export default function (pi: ExtensionAPI) {
             await page.click("text=${target}");
           }
           ${params.snapshotAfter !== false
-            ? "const text = await page.evaluate(() => document.body?.innerText || ''); console.log(text.substring(0, 3000));"
+            ? "const b = await page.evaluate('document.body.innerText'); console.log((b || '').substring(0, 3000));"
             : "console.log('Clicked.');"
           }
         `;
@@ -126,8 +126,8 @@ export default function (pi: ExtensionAPI) {
           } catch {
             await page.fill("text=${target}", "${text}");
           }
-          const text = await page.evaluate(() => document.body?.innerText || '');
-          console.log(text.substring(0, 3000));
+          const b = await page.evaluate('document.body.innerText');
+          console.log((b || '').substring(0, 3000));
         `;
         const out = runPlaywright(js, ctx.cwd);
         return { content: [{ type: "text", text: out }], details: {} };
