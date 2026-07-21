@@ -139,9 +139,10 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     }
     const reqId = ++conn.reqId;
     conn.pending.set(reqId, { resolve, reject });
-    // Use printf-based approach to avoid shell escaping issues
-    const safe = cmd.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
-    const wrote = conn.proc.stdin.write(`'${safe}'; echo __END__${reqId}:$?\n`);
+    // Pass command directly via stdin — the shell reads lines and executes them
+    // Don't wrap in quotes (that would treat semicolons literally)
+    // Use a heredoc-like approach: write command, then echo the marker
+    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}:$?\n`);
     if (!wrote) {
       conn.pending.delete(reqId);
       reject(new Error("SSH stdin closed"));
