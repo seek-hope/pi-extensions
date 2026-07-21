@@ -13,7 +13,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execSync } from "node:child_process";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
-import { tmpdir } from "node:path";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
