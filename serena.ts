@@ -38,9 +38,10 @@ function nextId(): number {
 }
 
 function sendMessage(msg: any): void {
+  if (!proc?.stdin?.writable) return;
   const body = JSON.stringify(msg);
   const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
-  proc!.stdin!.write(header + body);
+  proc.stdin.write(header + body);
 }
 
 function mcpRequest(method: string, params?: any): Promise<any> {
@@ -62,19 +63,20 @@ function mcpNotify(method: string, params?: any): void {
 }
 
 function onData(chunk: Buffer): void {
-  buffer += chunk.toString();
-  while (true) {
-    const headerEnd = buffer.indexOf("\r\n\r\n");
-    if (headerEnd === -1) break;
-    const header = buffer.substring(0, headerEnd);
-    const m = header.match(/Content-Length: (\d+)/i);
-    if (!m) { buffer = buffer.substring(headerEnd + 4); continue; }
-    const len = parseInt(m[1], 10);
-    const bodyStart = headerEnd + 4;
-    if (buffer.length < bodyStart + len) break;
-    const body = buffer.substring(bodyStart, bodyStart + len);
-    buffer = buffer.substring(bodyStart + len);
-    try {
+  if (typeof buffer !== "string") return;
+  try {
+    buffer += chunk.toString();
+    while (true) {
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) break;
+      const header = buffer.substring(0, headerEnd);
+      const m = header.match(/Content-Length: (\d+)/i);
+      if (!m) { buffer = buffer.substring(headerEnd + 4); continue; }
+      const len = parseInt(m[1], 10);
+      const bodyStart = headerEnd + 4;
+      if (buffer.length < bodyStart + len) break;
+      const body = buffer.substring(bodyStart, bodyStart + len);
+      buffer = buffer.substring(bodyStart + len);
       const msg = JSON.parse(body);
       if (msg.id !== undefined && pending.has(msg.id)) {
         const p = pending.get(msg.id)!;
@@ -82,8 +84,8 @@ function onData(chunk: Buffer): void {
         if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
         else p.resolve(msg.result);
       }
-    } catch { /* partial message, wait for more */ }
-  }
+    }
+  } catch { /* silently ignore */ }
 }
 
 async function startServer(cwd: string): Promise<void> {
