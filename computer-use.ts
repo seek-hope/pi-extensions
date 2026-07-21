@@ -31,15 +31,23 @@ function sudoSh(cmd: string, timeout = 5_000): string {
   return sh(`sudo YDOTOOL_SOCKET=/tmp/.ydotool_socket ${cmd}`, timeout);
 }
 
+/** Non-blocking promise-based sleep for use inside async execute() */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function getCursorPos(): { x: number; y: number } {
   const out = sh("hyprctl cursorpos");
-  const m = out.match(/(\d+),\s*(\d+)/);
+  // Support optional negative coords just in case
+  const m = out.match(/(-?\d+),\s*(-?\d+)/);
   if (m) return { x: parseInt(m[1]), y: parseInt(m[2]) };
-  return { x: 0, y: 0 };
+  // If hyprctl output is unrecognized, throw so callers don't silently get (0,0)
+  throw new Error(`Unable to parse cursor position from hyprctl output: "${out}"`);
 }
 
 function getScreenBounds(): { width: number; height: number; monitors: string } {
   const out = sh("hyprctl monitors");
+  if (!out) throw new Error("hyprctl monitors returned no output");
   let maxX = 0, maxY = 0;
   const re = /(\d+)x(\d+)@[\d.]+ at (\d+)x(\d+)/g;
   let m;
@@ -70,44 +78,38 @@ function clamp(x: number, y: number, bound: { width: number; height: number }) {
 
 // ── reliability helpers ────────────────────────────────────────────────────
 
-/** Check if ydotool daemon is running */
-function ydotoolOK(): boolean {
-  try {
-    spawnSync("sudo", ["YDOTOOL_SOCKET=/tmp/.ydotool_socket", "ydotool", "mousemove", "-x", "0", "-y", "0"], {
-      encoding: "utf-8", stdio: "ignore", timeout: 2_000
-    });
-    return true;
-  } catch { return false; }
-}
-
-/** Retry a ydotool action up to attempts times (default: 3 total) */
-function ydotoolRetry(action: string, attempts = 3, delayMs = 200): void {
+/** Retry a ydotool action up to attempts times (default: 3) */
+async function ydotoolRetry(action: string, attempts = 3, delayMs = 200): Promise<void> {
   let lastErr: any;
   for (let i = 0; i < attempts; i++) {
     try {
       sudoSh(action, 5_000);
       return;
-    } catch (e) { lastErr = e; if (i < attempts - 1) { const _sleep = spawnSync("sleep", [(delayMs / 1000).toString()], { timeout: delayMs + 500 }); } }
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) {
+        await sleep(delayMs);
+      }
+    }
   }
   throw lastErr || new Error(`ydotool failed after ${attempts} attempts`);
 }
 
 /** Move mouse and verify position (retry if not at target) */
-function moveToVerified(x: number, y: number, bound: { width: number; height: number }): void {
+async function moveToVerified(x: number, y: number, bound: { width: number; height: number }): Promise<void> {
   const { x: cx, y: cy } = clamp(x, y, bound);
-  let lastErr: any;
   for (let attempt = 0; attempt < 3; attempt++) {
+    sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
+    await sleep(50);
     try {
-      sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
-      // Small settle delay
-      const _sleep = spawnSync("sleep", ["0.05"], { timeout: 200 });
       const pos = getCursorPos();
       // Accept if within 5px tolerance
       if (Math.abs(pos.x - cx) <= 5 && Math.abs(pos.y - cy) <= 5) return;
-      if (attempt === 2) return; // 3rd attempt — accept anyway
-    } catch (e) { lastErr = e; }
+    } catch {
+      // getCursorPos failed — may be transient; retry
+    }
   }
-  throw lastErr || new Error(`Failed to move to (${cx}, ${cy})`);
+  // After 3 attempts, don't throw — we still moved; just not verified
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -129,7 +131,20 @@ export default function (pi: ExtensionAPI) {
       const file = `${tmpdir()}/pi-screenshot-${randomUUID()}.png`;
       try {
         if (params.region) {
-          const [x, y, w, h] = params.region.split(",").map(Number);
+          const parts = params.region.split(",");
+          if (parts.length !== 4) {
+            return { content: [{ type: "text", text: "Invalid region: expected 'x,y,w,h' with exactly 4 comma-separated numbers." }], details: {}, isError: true };
+          }
+          const nums = parts.map(Number);
+          for (let i = 0; i < 4; i++) {
+            if (isNaN(nums[i])) {
+              return { content: [{ type: "text", text: `Invalid region: '${parts[i]}' is not a valid number.` }], details: {}, isError: true };
+            }
+          }
+          const [x, y, w, h] = nums;
+          if (w <= 0 || h <= 0) {
+            return { content: [{ type: "text", text: `Invalid region: width and height must be positive (got ${w}x${h}).` }], details: {}, isError: true };
+          }
           sh(`grim -g "${x},${y} ${w}x${h}" "${file}"`);
         } else {
           sh(`grim "${file}"`);
@@ -184,7 +199,7 @@ export default function (pi: ExtensionAPI) {
           ty = pos.y + params.y;
         }
 
-        moveToVerified(tx, ty, bound);
+        await moveToVerified(tx, ty, bound);
         return { content: [{ type: "text", text: `Moved to (${tx}, ${ty})` }], details: { x: tx, y: ty } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Move failed: ${e.message}` }], details: {}, isError: true };
@@ -203,9 +218,9 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal) {
       try {
         const btn = params.button || 1;
-        ydotoolRetry(`ydotool click ${btn}`);
+        await ydotoolRetry(`ydotool click ${btn}`);
         // Settle delay — ensures UI responds before next action
-        const _sleep = spawnSync("sleep", ["0.08"], { timeout: 200 });
+        await sleep(80);
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Clicked button ${btn} at (${pos.x}, ${pos.y})` }], details: { button: btn, ...pos } };
       } catch (e: any) {
@@ -236,10 +251,10 @@ export default function (pi: ExtensionAPI) {
           tx = pos.x + params.x;
           ty = pos.y + params.y;
         }
-        moveToVerified(tx, ty, bound);
+        await moveToVerified(tx, ty, bound);
         const btn = params.button || 1;
-        ydotoolRetry(`ydotool click ${btn}`);
-        const _sleep = spawnSync("sleep", ["0.08"], { timeout: 200 });
+        await ydotoolRetry(`ydotool click ${btn}`);
+        await sleep(80);
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Clicked button ${btn} at (${pos.x}, ${pos.y})` }], details: { button: btn, x: tx, y: ty } };
       } catch (e: any) {
@@ -256,8 +271,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_id, _params, _signal) {
       try {
-        ydotoolRetry("ydotool click --repeat 2 --next-delay 100 1");
-        const _sleep = spawnSync("sleep", ["0.1"], { timeout: 200 });
+        await ydotoolRetry("ydotool click --repeat 2 --next-delay 100 1");
+        await sleep(100);
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Double-clicked at (${pos.x}, ${pos.y})` }], details: { ...pos } };
       } catch (e: any) {
@@ -302,27 +317,30 @@ export default function (pi: ExtensionAPI) {
       try {
         const parts = params.combo.toLowerCase().split("+");
         const modifiers: string[] = [];
-        let key = "";
+        const keys: string[] = [];
 
         for (const p of parts) {
           const trimmed = p.trim();
           if (["ctrl", "alt", "shift", "super"].includes(trimmed)) {
             modifiers.push(trimmed);
-          } else if (!key) {
-            key = trimmed;
+          } else {
+            keys.push(trimmed);
           }
         }
 
-        if (!key) {
-          return { content: [{ type: "text", text: "Invalid combo: no key specified." }], details: {}, isError: true };
+        if (keys.length === 0) {
+          return { content: [{ type: "text", text: `Invalid combo "${params.combo}": no key specified.` }], details: {}, isError: true };
+        }
+        if (keys.length > 1) {
+          return { content: [{ type: "text", text: `Invalid combo "${params.combo}": multiple non-modifier keys (${keys.join(", ")}). Use a single key with modifiers.` }], details: {}, isError: true };
         }
 
-        // Build args array: wtype -M ctrl -M shift -k c  (or just key if no modifiers)
+        // Build args array: wtype -M ctrl -M shift -k c
         const wtypeArgs: string[] = [];
         for (const mod of modifiers) {
           wtypeArgs.push("-M", mod);
         }
-        wtypeArgs.push("-k", key);
+        wtypeArgs.push("-k", keys[0]);
         execFileSync("wtype", wtypeArgs, { encoding: "utf-8", maxBuffer: 5 * 1024, timeout: 5_000 });
         return { content: [{ type: "text", text: `Pressed: ${params.combo}` }], details: { combo: params.combo } };
       } catch (e: any) {
@@ -341,10 +359,13 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
+        if (params.amount === 0) {
+          return { content: [{ type: "text", text: "Scroll amount is 0 — nothing to do." }], details: { amount: 0 } };
+        }
         const dir = params.amount > 0 ? 4 : 5; // 4=up, 5=down
         const count = Math.min(Math.abs(params.amount), 20); // Cap at 20 for sanity
         for (let i = 0; i < count; i++) {
-          ydotoolRetry(`ydotool click ${dir}`, 3, 50);
+          await ydotoolRetry(`ydotool click ${dir}`, 3, 50);
         }
         const pos = getCursorPos();
         return { content: [{ type: "text", text: `Scrolled ${params.amount > 0 ? "up" : "down"} ${count} at (${pos.x}, ${pos.y})` }], details: { amount: params.amount, ...pos } };
@@ -365,6 +386,8 @@ export default function (pi: ExtensionAPI) {
       coordSystem: Type.Optional(Type.String({ description: "'absolute' (default), 'normalized' (0-1000), or 'relative'" })),
     }),
     async execute(_id, params, _signal) {
+      // Track whether mousedown was issued so we can release it on error
+      let mouseDown = false;
       try {
         const bound = getScreenBounds();
         let tx = params.toX, ty = params.toY;
@@ -378,16 +401,22 @@ export default function (pi: ExtensionAPI) {
         ({ x: tx, y: ty } = clamp(tx, ty, bound));
 
         const start = getCursorPos();
-        ydotoolRetry("ydotool mousedown 1");
-        const _s1 = spawnSync("sleep", ["0.05"], { timeout: 200 });
-        sudoSh(`ydotool mousemove -x ${tx} -y ${ty}`, 3_000);
-        const _s2 = spawnSync("sleep", ["0.05"], { timeout: 200 });
-        ydotoolRetry("ydotool mouseup 1");
+        await ydotoolRetry("ydotool mousedown 1");
+        mouseDown = true;
+        await sleep(50);
+        // Use moveToVerified for reliable movement with retry
+        await moveToVerified(tx, ty, bound);
+        await ydotoolRetry("ydotool mouseup 1");
+        mouseDown = false;
         return {
           content: [{ type: "text", text: `Dragged from (${start.x},${start.y}) to (${tx},${ty})` }],
           details: { from: start, to: { x: tx, y: ty } },
         };
       } catch (e: any) {
+        // Always attempt to release the mouse button if we pressed it down
+        if (mouseDown) {
+          try { sudoSh("ydotool mouseup 1", 2_000); } catch { /* best effort */ }
+        }
         return { content: [{ type: "text", text: `Drag failed: ${e.message}` }], details: {}, isError: true };
       }
     },
