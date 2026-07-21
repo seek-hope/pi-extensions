@@ -156,10 +156,11 @@ function pollCompletion(id: string): void {
     const task = tasks.get(id);
     if (!task || task.status !== "running") return;
     try {
-      try { execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 }); } catch (e) { if (e.code === "ENOENT") { task.status = "error"; task.error = "tmux not installed"; } else { getTaskOutput(task); } saveTasks(tasks); continue; }
-      // Still running
-      updateTaskWidget();
-      setTimeout(check, 5000);
+      try {
+        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+        // Still running
+        updateTaskWidget();
+        setTimeout(check, 5000);
     } catch {
       // Session ended — atomically get output and update status
       const current = tasks.get(id);
@@ -196,7 +197,8 @@ export default function (pi: ExtensionAPI) {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
       try {
-        try { execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 }); } catch (e) { if (e.code === "ENOENT") { task.status = "error"; task.error = "tmux not installed"; } else { getTaskOutput(task); } saveTasks(tasks); continue; }
+      try {
+        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
         // Still running — resume polling
         pollCompletion(id);
       } catch {
