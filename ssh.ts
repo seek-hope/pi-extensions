@@ -175,7 +175,7 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
   spawn("alacritty", ["-e", "bash", "-c",
     `echo "Connecting to ${displayHost}..."; ` +
-    `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=2h ` +
+    `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=12h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
     `-o StrictHostKeyChecking=accept-new -fN ${sshTarget} && ` +
     `echo "Connected!" || echo "Auth failed."; read -p 'Press Enter...'`
