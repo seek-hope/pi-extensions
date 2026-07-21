@@ -1000,10 +1000,10 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       target: Type.String({ description: "What to audit: a sub-agent ID (to review its work), a file path, or a description of the code to review" }),
       criteria: Type.String({ description: "Review criteria: what to check for (e.g. 'security vulnerabilities', 'code quality', 'SQL injection, XSS, auth bypass')" }),
-      maxRounds: Type.Optional(Type.Number({ description: "Max review rounds (default: 3, max: 5)" })),
+      maxRounds: Type.Optional(Type.Number({ description: "Max review rounds (default: 5, max: 5)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const maxRounds = Math.min(params.maxRounds || 3, 5);
+      const maxRounds = Math.min(params.maxRounds || 5, 5);
       const criteria = params.criteria;
       const target = params.target;
       const rounds: { round: number; issuesFound: number; reviewerResult: string; fixerResult: string; clean: boolean }[] = [];
