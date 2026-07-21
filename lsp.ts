@@ -115,7 +115,7 @@ class LspClient {
   }
 
   private onData(chunk: Buffer): void {
-    if (this.stopped) return;
+    if (this.stopped || typeof this.buffer !== "string") return;
     try {
       this.buffer += chunk.toString();
       while (true) {
@@ -129,21 +129,20 @@ class LspClient {
         if (this.buffer.length < bodyStart + contentLength) break;
         const body = this.buffer.substring(bodyStart, bodyStart + contentLength);
         this.buffer = this.buffer.substring(bodyStart + contentLength);
-        try {
-          const msg = JSON.parse(body);
-          if (msg.id !== undefined && msg.id !== null) {
-            const p = this.pending.get(msg.id);
-            if (p) { this.pending.delete(msg.id); p.resolve(msg.result); }
-          }
-        } catch { /* ignore parse errors */ }
+        const msg = JSON.parse(body);
+        if (msg.id !== undefined && msg.id !== null) {
+          const p = this.pending.get(msg.id);
+          if (p) { this.pending.delete(msg.id); p.resolve(msg.result); }
+        }
       }
-    } catch { /* prevent unhandled event crashes */ }
+    } catch { /* silently ignore event handler errors */ }
   }
 
   private sendMessage(msg: any): void {
+    if (!this.proc?.stdin?.writable) return;
     const body = JSON.stringify(msg);
     const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
-    this.proc!.stdin!.write(header + body);
+    this.proc.stdin.write(header + body);
   }
 
   private send(method: string, params: any): Promise<any> {
