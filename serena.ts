@@ -8,18 +8,40 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 // ── MCP client ──────────────────────────────────────────────────────────────
 
-let proc: ChildProcess | null = null;
+const REQUEST_TIMEOUT_MS = 30_000;
+const INITIALIZE_TIMEOUT_MS = 20_000;
+const MAX_HEADER_BYTES = 8 * 1024;
+const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+interface ServerState {
+  child: ChildProcessWithoutNullStreams;
+  root: string;
+  buffer: Buffer;
+  ready: boolean;
+  closed: boolean;
+  termination: Promise<void> | null;
+}
+
+interface PendingRequest {
+  state: ServerState;
+  method: string;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
+let server: ServerState | null = null;
+let initialization: { state: ServerState; promise: Promise<void> } | null = null;
 let messageId = 0;
-const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
-let buffer = "";
-let ready = false;
-let initPromise: Promise<void> | null = null;
+const pending = new Map<number, PendingRequest>();
 
 function findProjectRoot(cwd: string): string {
   let dir = cwd;
@@ -37,159 +59,377 @@ function nextId(): number {
   return ++messageId;
 }
 
-function sendMessage(msg: any): void {
-  if (!proc?.stdin?.writable) return;
-  const body = JSON.stringify(msg);
-  const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
-  const ok = proc.stdin.write(header + body);
-  if (!ok) {
-    // Backpressure — drain before writing more
-    proc.stdin.once("drain", () => {});
+function asError(error: unknown, fallback: string): Error {
+  if (error instanceof Error) return error;
+  if (typeof error === "string" && error.length > 0) return new Error(error);
+  try {
+    const detail = JSON.stringify(error);
+    return new Error(detail && detail !== "{}" ? detail : fallback);
+  } catch {
+    return new Error(fallback);
   }
 }
 
-function mcpRequest(method: string, params?: any): Promise<any> {
+function sendMessage(state: ServerState, msg: unknown): void {
+  const { child } = state;
+  if (
+    state.closed
+    || child.exitCode !== null
+    || child.signalCode !== null
+    || !child.stdin.writable
+    || child.stdin.destroyed
+    || child.stdin.writableEnded
+  ) {
+    throw new Error("Serena MCP server is not running");
+  }
+
+  const body = JSON.stringify(msg);
+  if (body === undefined) throw new Error("Cannot serialize MCP message");
+  const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
+  child.stdin.write(header + body);
+}
+
+function takePending(id: number): PendingRequest | undefined {
+  const request = pending.get(id);
+  if (!request) return undefined;
+
+  pending.delete(id);
+  clearTimeout(request.timeout);
+  if (request.signal && request.onAbort) {
+    request.signal.removeEventListener("abort", request.onAbort);
+  }
+  return request;
+}
+
+function rejectPendingForState(state: ServerState, error: Error): void {
+  for (const [id, request] of pending) {
+    if (request.state !== state) continue;
+    takePending(id)?.reject(error);
+  }
+}
+
+function mcpRequest(
+  state: ServerState,
+  method: string,
+  params?: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  signal?: AbortSignal,
+): Promise<unknown> {
   const id = nextId();
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    sendMessage({ jsonrpc: "2.0", id, method, params: params || {} });
-    setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error(`MCP timeout: ${method}`));
+    const timeout = setTimeout(() => {
+      const request = takePending(id);
+      if (request) {
+        request.reject(new Error(`Serena MCP request timed out: ${method}`));
       }
-    }, 30_000);
+    }, timeoutMs);
+
+    const request: PendingRequest = { state, method, resolve, reject, timeout, signal };
+    if (signal) {
+      request.onAbort = () => {
+        const aborted = takePending(id);
+        if (!aborted) return;
+        aborted.reject(new Error(`Serena MCP request cancelled: ${method}`));
+        try {
+          sendMessage(state, {
+            jsonrpc: "2.0",
+            method: "notifications/cancelled",
+            params: { requestId: id, reason: "Client cancelled the tool call" },
+          });
+        } catch {
+          // The transport failure will be reported by the original request path.
+        }
+      };
+      signal.addEventListener("abort", request.onAbort, { once: true });
+    }
+
+    pending.set(id, request);
+    if (signal?.aborted) {
+      request.onAbort?.();
+      return;
+    }
+
+    try {
+      sendMessage(state, { jsonrpc: "2.0", id, method, params: params ?? {} });
+    } catch (error) {
+      takePending(id)?.reject(asError(error, `Failed to send Serena MCP request: ${method}`));
+    }
   });
 }
 
-function mcpNotify(method: string, params?: any): void {
-  sendMessage({ jsonrpc: "2.0", method, params: params || {} });
+function mcpNotify(state: ServerState, method: string, params?: unknown): void {
+  sendMessage(state, { jsonrpc: "2.0", method, params: params ?? {} });
 }
 
-function onData(chunk: Buffer): void {
-  if (typeof buffer !== "string") return;
-  try {
-    buffer += chunk.toString();
-    while (true) {
-      const headerEnd = buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) break;
-      const header = buffer.substring(0, headerEnd);
-      const m = header.match(/Content-Length: (\d+)/i);
-      if (!m) { buffer = buffer.substring(headerEnd + 4); continue; }
-      const len = parseInt(m[1], 10);
-      const bodyStart = headerEnd + 4;
-      if (buffer.length < bodyStart + len) break;
-      const body = buffer.substring(bodyStart, bodyStart + len);
-      buffer = buffer.substring(bodyStart + len);
-      const msg = JSON.parse(body);
-      if (msg.id !== undefined && pending.has(msg.id)) {
-        const p = pending.get(msg.id)!;
-        pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
-        else p.resolve(msg.result);
+function protocolFailure(state: ServerState, error: Error): void {
+  console.error("[serena]", error.message);
+  void terminateServerState(state, error);
+}
+
+function handleMessage(state: ServerState, value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    protocolFailure(state, new Error("Serena MCP server sent an invalid JSON-RPC message"));
+    return;
+  }
+
+  const msg = value as Record<string, unknown>;
+  if (typeof msg.method === "string") {
+    if (typeof msg.id === "number" || typeof msg.id === "string" || msg.id === null) {
+      try {
+        if (msg.method === "ping") {
+          sendMessage(state, { jsonrpc: "2.0", id: msg.id, result: {} });
+        } else {
+          sendMessage(state, {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: -32601, message: `Unsupported server request: ${msg.method}` },
+          });
+        }
+      } catch (error) {
+        protocolFailure(state, asError(error, "Failed to answer Serena MCP server request"));
       }
     }
-  } catch { /* silently ignore */ }
+    return;
+  }
+
+  // Accept both number and string IDs (JSON-RPC 2.0 spec allows both)
+  if (typeof msg.id !== "number" && typeof msg.id !== "string") return;
+  const request = takePending(msg.id);
+  if (!request) return;
+
+  if (msg.error !== undefined && msg.error !== null) {
+    const rpcError = msg.error as { message?: unknown };
+    const message = typeof rpcError?.message === "string"
+      ? rpcError.message
+      : JSON.stringify(msg.error);
+    request.reject(new Error(message || `Serena MCP request failed: ${request.method}`));
+  } else {
+    request.resolve(msg.result);
+  }
+}
+
+function onData(state: ServerState, chunk: Buffer | string): void {
+  if (state.closed) return;
+  const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  state.buffer = state.buffer.length === 0 ? bytes : Buffer.concat([state.buffer, bytes]);
+
+  while (!state.closed) {
+    const headerEnd = state.buffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) {
+      if (state.buffer.length > MAX_HEADER_BYTES) {
+        protocolFailure(state, new Error("Serena MCP response header exceeded the size limit"));
+      }
+      return;
+    }
+
+    if (headerEnd > MAX_HEADER_BYTES) {
+      protocolFailure(state, new Error("Serena MCP response header exceeded the size limit"));
+      return;
+    }
+
+    const header = state.buffer.subarray(0, headerEnd).toString("ascii");
+    const match = header.match(/(?:^|\r\n)Content-Length:\s*(\d+)\s*(?:\r\n|$)/i);
+    if (!match) {
+      protocolFailure(state, new Error("Serena MCP response is missing Content-Length"));
+      return;
+    }
+
+    const length = Number(match[1]);
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_MESSAGE_BYTES) {
+      protocolFailure(state, new Error(`Invalid Serena MCP Content-Length: ${match[1]}`));
+      return;
+    }
+
+    const bodyStart = headerEnd + 4;
+    const bodyEnd = bodyStart + length;
+    if (state.buffer.length < bodyEnd) return;
+
+    const body = state.buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+    state.buffer = state.buffer.subarray(bodyEnd);
+    try {
+      handleMessage(state, JSON.parse(body));
+    } catch (error) {
+      protocolFailure(state, asError(error, "Serena MCP server sent invalid JSON"));
+      return;
+    }
+  }
+}
+
+function deactivateServerState(state: ServerState, error: Error): void {
+  if (state.closed) return;
+  state.closed = true;
+  state.ready = false;
+  state.buffer = Buffer.alloc(0);
+  state.child.stdout.removeAllListeners("data");
+  state.child.stderr.removeAllListeners("data");
+  rejectPendingForState(state, error);
+
+  if (server === state) server = null;
+  if (initialization?.state === state) initialization = null;
+}
+
+function hasExited(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(hasExited(child)), timeoutMs);
+    const finish = (exited: boolean) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    child.once("exit", onExit);
+  });
+}
+
+function terminateServerState(state: ServerState, error: Error): Promise<void> {
+  deactivateServerState(state, error);
+  if (state.termination) return state.termination;
+
+  state.termination = (async () => {
+    if (hasExited(state.child)) return;
+
+    try { state.child.stdin.end(); } catch { /* continue to signals */ }
+    if (await waitForExit(state.child, 750)) return;
+
+    try { state.child.kill("SIGTERM"); } catch { /* continue to SIGKILL */ }
+    if (await waitForExit(state.child, 1_500)) return;
+
+    try { state.child.kill("SIGKILL"); } catch { /* report below */ }
+    if (!(await waitForExit(state.child, 1_000))) {
+      console.error("[serena] Failed to terminate MCP server process");
+    }
+  })();
+  return state.termination;
+}
+
+function createServerState(root: string): ServerState {
+  const child = spawn("serena", ["start-mcp-server", "--project", root], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const state: ServerState = {
+    child,
+    root,
+    buffer: Buffer.alloc(0),
+    ready: false,
+    closed: false,
+    termination: null,
+  };
+
+  child.stdout.on("data", (chunk: Buffer) => onData(state, chunk));
+  child.stderr.on("data", (chunk: Buffer) => {
+    const text = chunk.toString();
+    if (/error/i.test(text)) console.error("[serena]", text.trim());
+  });
+
+  const onStreamError = (error: Error) => {
+    if (!state.closed) void terminateServerState(state, error);
+  };
+  child.stdin.on("error", onStreamError);
+  child.stdout.on("error", onStreamError);
+  child.stderr.on("error", onStreamError);
+  child.once("error", (error) => {
+    if (!state.closed) void terminateServerState(state, error);
+  });
+  child.once("exit", (code, signal) => {
+    if (state.closed) return;
+    const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
+    deactivateServerState(state, new Error(`Serena MCP server exited unexpectedly (${detail})`));
+  });
+
+  return state;
 }
 
 async function startServer(cwd: string): Promise<void> {
-  if (initPromise) return initPromise;
+  const root = findProjectRoot(cwd);
+  if (server?.root === root && server.ready && !server.closed) return;
+  if (initialization?.state.root === root) return initialization.promise;
 
-  // Kill any existing dead/dying process before creating a new one
-  if (proc) {
-    proc.stdout?.removeAllListeners("data");
-    proc.stderr?.removeAllListeners("data");
-    proc.removeAllListeners("error");
-    proc.removeAllListeners("exit");
-    try { proc.kill(); } catch { /* ok */ }
-    proc = null;
+  if (server) {
+    await terminateServerState(server, new Error("Serena MCP server project changed"));
   }
-  ready = false;
 
-  initPromise = new Promise((resolve, reject) => {
-    const root = findProjectRoot(cwd);
-    proc = spawn("serena", ["start-mcp-server", "--project", root], {
-      cwd: root,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    proc.stdout!.on("data", onData);
-    proc.stderr!.on("data", (chunk: Buffer) => {
-      // Serena may log to stderr during startup; check for URL
-      const text = chunk.toString();
-      if (text.includes("error") || text.includes("Error")) {
-        console.error("[serena]", text.trim());
-      }
-    });
-
-    const onError = (err: Error) => {
-      ready = false;
-      initPromise = null;
-      reject(err);
-    };
-    proc.once("error", onError);
-
-    proc.on("exit", (code) => {
-      ready = false;
-      initPromise = null;
-      if (code !== 0 && code !== null) {
-        // Process exited with an error — don't reject; will retry on next tool call
-      }
-    });
-
-    // Initialize MCP
-    mcpRequest("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "pi-coding-agent", version: "1.0.0" },
-    }).then(() => {
-      mcpNotify("initialized", {});
-      ready = true;
-      resolve();
-    }).catch(reject);
-
-    setTimeout(() => {
-      if (!ready) {
-        reject(new Error("Serena MCP server failed to start in 20s"));
-      }
-    }, 20_000);
-  });
-
-  return initPromise;
+  const state = createServerState(root);
+  server = state;
+  const promise = (async () => {
+    try {
+      await mcpRequest(state, "initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "pi-coding-agent", version: "1.0.0" },
+      }, INITIALIZE_TIMEOUT_MS);
+      mcpNotify(state, "initialized", {});
+      state.ready = true;
+    } catch (error) {
+      const initError = asError(error, "Failed to initialize Serena MCP server");
+      await terminateServerState(state, initError);
+      throw initError;
+    } finally {
+      if (initialization?.state === state) initialization = null;
+    }
+  })();
+  initialization = { state, promise };
+  return promise;
 }
 
-function stopServer(): void {
-  if (proc) {
-    // Remove all listeners to prevent leaks and unexpected callbacks
-    proc.stdout?.removeAllListeners("data");
-    proc.stderr?.removeAllListeners("data");
-    proc.removeAllListeners("error");
-    proc.removeAllListeners("exit");
-    try { mcpNotify("shutdown", {}); } catch { /* ok */ }
-    proc.kill();
-    proc = null;
-    ready = false;
-    initPromise = null;
-  }
+async function stopServer(): Promise<void> {
+  const state = server;
+  if (!state) return;
+  await terminateServerState(state, new Error("Serena MCP server stopped"));
 }
 
 // ── tool execution helper ──────────────────────────────────────────────────
 
-async function callSerenaTool(toolName: string, args: Record<string, any>, cwd: string): Promise<string> {
+function extractToolText(result: unknown): string {
+  const content = result && typeof result === "object" && !Array.isArray(result)
+    ? (result as { content?: unknown }).content
+    : undefined;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((item): item is { type: "text"; text: string } => (
+        !!item
+        && typeof item === "object"
+        && (item as { type?: unknown }).type === "text"
+        && typeof (item as { text?: unknown }).text === "string"
+      ))
+      .map((item) => item.text)
+      .join("\n");
+    if (text || content.length === 0) return text;
+  }
+
+  const serialized = JSON.stringify(result, null, 2);
+  return serialized ?? String(result ?? "");
+}
+
+async function callSerenaTool(
+  toolName: string,
+  args: Record<string, any>,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string> {
   await startServer(cwd);
-  const result = await mcpRequest("tools/call", {
+  const state = server;
+  if (!state?.ready || state.closed) throw new Error("Serena MCP server is not ready");
+
+  const result = await mcpRequest(state, "tools/call", {
     name: toolName,
     arguments: args,
-  });
-  // Extract text content from MCP result
-  const content = result?.content || result;
-  if (Array.isArray(content)) {
-    return content
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text)
-      .join("\n");
+  }, REQUEST_TIMEOUT_MS, signal);
+  const text = extractToolText(result);
+  if (
+    result
+    && typeof result === "object"
+    && !Array.isArray(result)
+    && (result as { isError?: unknown }).isError === true
+  ) {
+    throw new Error(text || `Serena tool failed: ${toolName}`);
   }
-  return JSON.stringify(result, null, 2);
+  return text;
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -306,19 +546,14 @@ export default function (pi: ExtensionAPI) {
       label: t.label,
       description: t.description,
       parameters: Type.Object(paramSchema),
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         try {
           // Map pi param names to serena param names
           const serenaParams: Record<string, any> = {};
           for (const [key, value] of Object.entries(params)) {
-            // Handle param name mapping
-            if (key === "query" && t.name === "serena_find_definition") {
-              serenaParams["query"] = value;
-            } else {
-              serenaParams[key] = value;
-            }
+            serenaParams[key] = value;
           }
-          const result = await callSerenaTool(serenaToolName, serenaParams, ctx.cwd);
+          const result = await callSerenaTool(serenaToolName, serenaParams, ctx.cwd, signal);
           return { content: [{ type: "text", text: result }], details: {} };
         } catch (e: any) {
           return { content: [{ type: "text", text: e.message }], details: {}, isError: true };

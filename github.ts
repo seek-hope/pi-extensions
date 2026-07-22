@@ -1,19 +1,119 @@
 /**
- * GitHub extension for pi — wraps the official gh CLI (github.com/cli/cli).
+ * GitHub extension for pi - wraps the official gh CLI (github.com/cli/cli).
  * Official upstream: https://github.com/cli/cli
  * Requires: gh CLI installed and authenticated (gh auth login)
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
+  truncateHead,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { execFileSync } from "node:child_process";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { readdirSync, statSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-function gh(args: string[], cwd: string): string {
-  return execFileSync("gh", args, {
-    cwd,
-    encoding: "utf-8",
-    maxBuffer: 10 * 1024 * 1024,
-    timeout: 30_000,
+const GH_TIMEOUT_MS = 30_000;
+const MAX_RESULTS = 1_000;
+
+function unknownErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+  return "unknown error";
+}
+
+async function truncateOutput(output: string): Promise<string> {
+  const truncation = truncateHead(output, {
+    maxLines: DEFAULT_MAX_LINES,
+    maxBytes: DEFAULT_MAX_BYTES,
   });
+  if (!truncation.truncated) {
+    return output;
+  }
+
+  const summary = `${truncation.outputLines} of ${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}`;
+  try {
+    const directory = await mkdtemp(join(tmpdir(), "pi-gh-"));
+    const outputPath = join(directory, "output.txt");
+    await writeFile(outputPath, output, { encoding: "utf-8", mode: 0o600 });
+    return `${truncation.content}\n\n[Output truncated: ${summary}. Full output saved to: ${outputPath}]`;
+  } catch {
+    return `${truncation.content}\n\n[Output truncated: ${summary}. Full output could not be saved.]`;
+  } finally {
+    // Clean up old temp dirs (>1h) to prevent accumulation
+    try {
+      const now = Date.now();
+      for (const entry of readdirSync(tmpdir())) {
+        if (!entry.startsWith("pi-gh-")) continue;
+        const full = join(tmpdir(), entry);
+        try { if (now - statSync(full).mtimeMs > 3_600_000) rmSync(full, { recursive: true, force: true }); } catch { /* ok */ }
+      }
+    } catch { /* best effort */ }
+  }
+}
+
+async function gh(
+  pi: ExtensionAPI,
+  args: string[],
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  let result;
+  try {
+    result = await pi.exec("gh", args, { cwd, signal, timeout: GH_TIMEOUT_MS });
+  } catch (error: unknown) {
+    throw new Error(`Failed to start GitHub CLI: ${unknownErrorMessage(error)}`);
+  }
+
+  if (result.killed) {
+    throw new Error(
+      signal?.aborted
+        ? "GitHub CLI command was cancelled"
+        : `GitHub CLI command timed out after ${GH_TIMEOUT_MS / 1_000} seconds`,
+    );
+  }
+  if (result.code !== 0) {
+    const message = result.stderr.trim() || result.stdout.trim();
+    throw new Error(message || `GitHub CLI exited with code ${result.code}`);
+  }
+
+  const output = result.stdout || result.stderr || "GitHub CLI command completed successfully.";
+  return truncateOutput(output);
+}
+
+function requiredNumber(kind: "issue" | "pull request", number: number | undefined): number {
+  if (number === undefined) {
+    throw new Error(`A ${kind} number is required for this action`);
+  }
+  return number;
+}
+
+function encodeRepository(repo: string): string {
+  const parts = repo.split("/");
+  if (parts.length !== 2 || parts.some((part) => !part)) {
+    throw new Error("Repository must use the owner/repo format");
+  }
+  return repo; // gh CLI handles URL encoding internally
+}
+
+function encodeContentPath(path: string): string {
+  if (path.startsWith("/")) {
+    throw new Error("File path must be relative to the repository root");
+  }
+
+  const parts = path.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error("File path contains an empty, '.' or '..' segment");
+  }
+  return path; // gh CLI handles URL encoding internally
 }
 
 export default function (pi: ExtensionAPI) {
@@ -22,26 +122,32 @@ export default function (pi: ExtensionAPI) {
     label: "GitHub Issue",
     description: "View or create GitHub issues using the official gh CLI",
     parameters: Type.Object({
-      action: Type.String({ description: "view, list, create, or close" }),
-      number: Type.Optional(Type.Number({ description: "Issue number (for view/close)" })),
-      title: Type.Optional(Type.String({ description: "Title (for create)" })),
+      action: StringEnum(["view", "list", "create", "close"] as const),
+      number: Type.Optional(Type.Integer({ minimum: 1, description: "Issue number (for view/close)" })),
+      title: Type.Optional(Type.String({ minLength: 1, description: "Title (for create)" })),
       body: Type.Optional(Type.String({ description: "Body text (for create)" })),
-      label: Type.Optional(Type.String({ description: "Labels to add (comma-separated)" })),
-      limit: Type.Optional(Type.Number({ description: "Max results for list (default 30)" })),
+      label: Type.Optional(Type.String({ minLength: 1, description: "Labels to add (comma-separated)" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_RESULTS, description: "Max results for list (default 30)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      try {
-        const args: string[] = ["issue", params.action];
-        if (params.number) args.push(String(params.number));
-        if (params.title) args.push("--title", params.title);
-        if (params.body) args.push("--body", params.body);
-        if (params.label) args.push("--label", params.label);
-        if (params.limit) args.push("--limit", String(params.limit));
-        const out = gh(args, ctx.cwd);
-        return { content: [{ type: "text", text: out }], details: {} };
-      } catch (e: any) {
-        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const args: string[] = ["issue", params.action];
+      switch (params.action) {
+        case "list":
+          if (params.limit !== undefined) args.push("--limit", String(params.limit));
+          break;
+        case "create":
+          if (!params.title?.trim()) throw new Error("A non-empty title is required to create an issue");
+          args.push("--title", params.title, "--body", params.body ?? "");
+          if (params.label !== undefined) args.push("--label", params.label);
+          break;
+        case "view":
+        case "close":
+          args.push(String(requiredNumber("issue", params.number)));
+          break;
       }
+
+      const out = await gh(pi, args, ctx.cwd, signal);
+      return { content: [{ type: "text", text: out }], details: {} };
     },
   });
 
@@ -50,28 +156,43 @@ export default function (pi: ExtensionAPI) {
     label: "GitHub PR",
     description: "View or create GitHub pull requests using the official gh CLI",
     parameters: Type.Object({
-      action: Type.String({ description: "view, list, create, status, checkout, or diff" }),
-      number: Type.Optional(Type.Number({ description: "PR number (for view/diff/checkout)" })),
-      base: Type.Optional(Type.String({ description: "Base branch (for create)" })),
-      head: Type.Optional(Type.String({ description: "Head branch (for create)" })),
-      title: Type.Optional(Type.String({ description: "Title (for create)" })),
+      action: StringEnum(["view", "list", "create", "status", "checkout", "diff"] as const),
+      number: Type.Optional(Type.Integer({ minimum: 1, description: "PR number (for view/diff/checkout)" })),
+      base: Type.Optional(Type.String({ minLength: 1, description: "Base branch (for create)" })),
+      head: Type.Optional(Type.String({ minLength: 1, description: "Head branch (for create)" })),
+      title: Type.Optional(Type.String({ minLength: 1, description: "Title (for create; commit data is used when omitted)" })),
       body: Type.Optional(Type.String({ description: "Body text (for create)" })),
-      limit: Type.Optional(Type.Number({ description: "Max results for list (default 30)" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_RESULTS, description: "Max results for list (default 30)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      try {
-        const args: string[] = ["pr", params.action];
-        if (params.number) args.push(String(params.number));
-        if (params.base) args.push("--base", params.base);
-        if (params.head) args.push("--head", params.head);
-        if (params.title) args.push("--title", params.title);
-        if (params.body) args.push("--body", params.body);
-        if (params.limit) args.push("--limit", String(params.limit));
-        const out = gh(args, ctx.cwd);
-        return { content: [{ type: "text", text: out }], details: {} };
-      } catch (e: any) {
-        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const args: string[] = ["pr", params.action];
+      switch (params.action) {
+        case "list":
+          if (params.limit !== undefined) args.push("--limit", String(params.limit));
+          break;
+        case "create":
+          if (params.base !== undefined) args.push("--base", params.base);
+          if (params.head !== undefined) args.push("--head", params.head);
+          if (params.title !== undefined) {
+            args.push("--title", params.title, "--body", params.body ?? "");
+          } else {
+            args.push("--fill");
+            if (params.body !== undefined) args.push("--body", params.body);
+          }
+          break;
+        case "checkout":
+          args.push(String(requiredNumber("pull request", params.number)));
+          break;
+        case "view":
+        case "diff":
+          if (params.number !== undefined) args.push(String(params.number));
+          break;
+        case "status":
+          break;
       }
+
+      const out = await gh(pi, args, ctx.cwd, signal);
+      return { content: [{ type: "text", text: out }], details: {} };
     },
   });
 
@@ -80,19 +201,19 @@ export default function (pi: ExtensionAPI) {
     label: "GitHub Search",
     description: "Search code, commits, issues, or repos on GitHub via gh CLI",
     parameters: Type.Object({
-      type: Type.String({ description: "code, commits, issues, prs, or repos" }),
-      query: Type.String({ description: "Search query" }),
-      limit: Type.Optional(Type.Number({ description: "Max results (default 30)" })),
+      type: StringEnum(["code", "commits", "issues", "prs", "repos"] as const),
+      query: Type.String({ minLength: 1, description: "Search query" }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_RESULTS, description: "Max results (default 30)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      try {
-        const args = ["search", params.type, params.query];
-        if (params.limit) args.push("--limit", String(params.limit));
-        const out = gh(args, ctx.cwd);
-        return { content: [{ type: "text", text: out }], details: {} };
-      } catch (e: any) {
-        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
-      }
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (!params.query.trim()) throw new Error("Search query must not be blank");
+
+      const args: string[] = ["search", params.type];
+      if (params.limit !== undefined) args.push("--limit", String(params.limit));
+      args.push("--", params.query);
+
+      const out = await gh(pi, args, ctx.cwd, signal);
+      return { content: [{ type: "text", text: out }], details: {} };
     },
   });
 
@@ -101,22 +222,19 @@ export default function (pi: ExtensionAPI) {
     label: "GitHub Read File",
     description: "Read a file from a GitHub repository via gh CLI",
     parameters: Type.Object({
-      repo: Type.Optional(Type.String({ description: "owner/repo (defaults to current repo)" })),
-      path: Type.String({ description: "File path in the repo" }),
-      branch: Type.Optional(Type.String({ description: "Branch/tag/commit (default: default branch)" })),
+      repo: Type.Optional(Type.String({ pattern: "^[^/\\s]+/[^/\\s]+$", description: "owner/repo (defaults to current repo)" })),
+      path: Type.String({ minLength: 1, description: "File path in the repo" }),
+      branch: Type.Optional(Type.String({ minLength: 1, description: "Branch/tag/commit (default: repository default branch)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      try {
-        const ref = params.branch || "HEAD";
-        const args = ["api", "-H", "Accept: application/vnd.github.raw", `/repos/{owner}/{repo}/contents/${params.path}?ref=${ref}`];
-        if (params.repo) {
-          args.splice(1, 0, `--repo=${params.repo}`);
-        }
-        const out = gh(args, ctx.cwd);
-        return { content: [{ type: "text", text: out }], details: {} };
-      } catch (e: any) {
-        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
-      }
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const repository = params.repo ? encodeRepository(params.repo) : "{owner}/{repo}";
+      const path = encodeContentPath(params.path);
+      const ref = params.branch === undefined ? "" : `?ref=${encodeURIComponent(params.branch)}`;
+      const endpoint = `/repos/${repository}/contents/${path}${ref}`;
+      const args = ["api", "-H", "Accept: application/vnd.github.raw+json", endpoint];
+
+      const out = await gh(pi, args, ctx.cwd, signal);
+      return { content: [{ type: "text", text: out }], details: {} };
     },
   });
 }
