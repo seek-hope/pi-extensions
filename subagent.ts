@@ -193,11 +193,13 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
     const proc = spawn("pi", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let resolved = false;
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    proc.on("close", () => resolve({ stdout, stderr }));
-    proc.on("error", () => resolve({ stdout, stderr: stderr || "spawn error" }));
-    setTimeout(() => { proc.kill(); resolve({ stdout, stderr: stderr || `timeout (${Math.round(killTimeout / 60_000)} min)` }); }, killTimeout);
+    const done = () => { if (!resolved) { resolved = true; clearTimeout(timer); resolve({ stdout, stderr }); } };
+    proc.on("close", done);
+    proc.on("error", () => done());
+    const timer = setTimeout(() => { proc.kill("SIGKILL"); done(); }, killTimeout);
   });
 }
 
@@ -338,13 +340,19 @@ function spawnSubAgent(
 
     // Kill process after timeout (min 20 min, configurable via options)
     const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
-    setTimeout(() => {
+    const killTimer = setTimeout(() => {
       if (agent.status === "running" && !settled) {
-        proc.kill();
+        // SIGTERM first, wait 5s, then SIGKILL
+        proc.kill("SIGTERM");
+        const forceKill = setTimeout(() => { try { proc.kill("SIGKILL"); } catch { /* already dead */ } }, 5_000);
         agent.error = `timeout (${Math.round(killTimeout / 60_000)} min)`;
         settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
       }
     }, killTimeout);
+
+    // Clear timeout on normal completion
+    const origSettle = settle;
+    settle = (result, status) => { clearTimeout(killTimer); origSettle(result, status); };
   });
 
   return { id, promise };
@@ -641,6 +649,8 @@ export default function (pi: ExtensionAPI) {
       const branch = branchName(params.id);
       if (gitQuiet(["status", "--porcelain"], ctx.cwd).trim()) { return { content: [{ type: "text", text: "Working tree has uncommitted changes. Commit or stash before merging." }], details: {}, isError: true }; }
       const ag = subAgents.get(params.id);
+      if (!ag) return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
+      if (ag.status === "running") return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
 
       // Try merge
       try {
@@ -724,7 +734,12 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const ag = subAgents.get(params.id);
-      if (ag) ag.status = "rejected";
+      if (!ag) return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
+      if (ag.status === "running") {
+        if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
+        ag.status = "cancelled";
+      }
+      ag.status = "rejected";
 
       cleanupWorktree(ctx.cwd, params.id, true);
       subAgents.delete(params.id);
@@ -898,14 +913,8 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are an exploration agent. You can ONLY read and search — you CANNOT write, edit, or delete anything. Focus on finding information quickly and reporting it concisely.",
       });
-      // Non-blocking: fire and collect later; auto-cleanup after completion
-      promise.then(() => {
-        subAgents.delete(id);
-        cleanupWorktree(ctx.cwd, id, true);
-      }).catch(() => {
-        subAgents.delete(id);
-        cleanupWorktree(ctx.cwd, id, true);
-      });
+      // Non-blocking: worktree preserved — use subagent_review then subagent_reject to clean up
+      promise.catch(() => {});
       return {
         content: [{
           type: "text",
@@ -942,14 +951,8 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are a planning agent. You explore the codebase to understand the current state, then design a step-by-step implementation plan. You do NOT modify any files — you only READ and PLAN. Your output should be a clear, actionable plan.",
       });
-      // Non-blocking: fire and collect later; auto-cleanup after completion
-      promise.then(() => {
-        subAgents.delete(id);
-        cleanupWorktree(ctx.cwd, id, true);
-      }).catch(() => {
-        subAgents.delete(id);
-        cleanupWorktree(ctx.cwd, id, true);
-      });
+      // Non-blocking: worktree preserved — use subagent_review then subagent_reject to clean up
+      promise.catch(() => {});
       return {
         content: [{
           type: "text",
@@ -1208,28 +1211,10 @@ export default function (pi: ExtensionAPI) {
           `Work in the current directory and make concrete edits to the files.`,
         ].join("\n");
 
-        // Fixer runs in the effective worktree (sub-agent worktree or main cwd)
-        const { id: fixerId, promise: fixPromise } = spawnSubAgent(fixPrompt, effectiveWorktree, {
-          model: _defaultModel || "deepseek-v4-pro",
-          tools: ["read", "edit", "write", "bash", "serena_search_pattern"], // edit-only, no subagent
-        });
-        const fixerOutput = await fixPromise;
-
-        // Merge fixer's work into the target branch (if auditing a sub-agent)
-        if (existingAgent && targetBranch) {
-          try {
-            // Save current HEAD before switching
-            const origHead = git(["rev-parse", "--abbrev-ref", "HEAD"], ctx.cwd).trim();
-            git(["checkout", targetBranch], ctx.cwd);
-            git(["merge", "--no-edit", branchName(fixerId)], ctx.cwd);
-            // Switch back to original HEAD
-            if (origHead && origHead !== targetBranch) {
-              git(["checkout", origHead], ctx.cwd);
-            }
-          } catch { /* best effort — if merge fails, fixer changes stay on fixer branch */ }
-        }
-        subAgents.delete(fixerId);
-        cleanupWorktree(ctx.cwd, fixerId, true);
+        // Fixer runs directly in the target directory (in-place, no new worktree)
+        const fixCwd = existingAgent ? existingAgent.worktreePath : ctx.cwd;
+        const fixerResult = await runSubProcess(fixPrompt, fixCwd, _defaultModel);
+        const fixerOutput = fixerResult.stdout + fixerResult.stderr;
 
         rounds[rounds.length - 1].fixerResult = fixerOutput.substring(0, 2000);
       }

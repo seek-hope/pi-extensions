@@ -20,15 +20,19 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
+const YDOTOOL_SOCKET = process.env.YDOTOOL_SOCKET || "/run/user/1000/.ydotool_socket";
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 function sh(cmd: string, timeout = 5_000): string {
-  try { return spawnSync("sh", ["-c", cmd], { encoding: "utf-8", maxBuffer: 50*1024*1024, timeout }).stdout.trim(); }
-  catch { return ""; }
+  const r = spawnSync("sh", ["-c", cmd], { encoding: "utf-8", maxBuffer: 50*1024*1024, timeout });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(r.stderr?.trim() || `Command exited with code ${r.status}: ${cmd.substring(0, 80)}`);
+  return r.stdout.trim();
 }
 
 function sudoSh(cmd: string, timeout = 5_000): string {
-  return sh(`sudo YDOTOOL_SOCKET=/tmp/.ydotool_socket ${cmd}`, timeout);
+  return sh(`YDOTOOL_SOCKET=${YDOTOOL_SOCKET} ${cmd}`, timeout);
 }
 
 /** Non-blocking promise-based sleep for use inside async execute() */
@@ -159,7 +163,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [
             { type: "text", text: `Screenshot captured (${(data.length / 1024).toFixed(0)} KB).` },
-            { type: "image_url", image_url: { url: `data:image/png;base64,${base64}` } },
+            { type: "image", data: base64, mimeType: "image/png" },
           ],
           details: { size: data.length },
         };
