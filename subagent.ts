@@ -184,7 +184,8 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 // ── depth tracking ─────────────────────────────────────────────────────────
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
-function runSubProcess(task: string, cwd: string, model?: string): Promise<{ stdout: string; stderr: string }> {
+function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string }> {
+  const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000);
   return new Promise((resolve) => {
     const args: string[] = ["-p", "--no-context-files", "--no-session"];
     if (model) args.push("--model", model);
@@ -196,7 +197,7 @@ function runSubProcess(task: string, cwd: string, model?: string): Promise<{ std
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
     proc.on("close", () => resolve({ stdout, stderr }));
     proc.on("error", () => resolve({ stdout, stderr: stderr || "spawn error" }));
-    setTimeout(() => { proc.kill(); resolve({ stdout, stderr: stderr || "timeout" }); }, 600_000);
+    setTimeout(() => { proc.kill(); resolve({ stdout, stderr: stderr || `timeout (${Math.round(killTimeout / 60_000)} min)` }); }, killTimeout);
   });
 }
 
@@ -231,6 +232,7 @@ function spawnSubAgent(
     model?: string;
     tools?: string[];
     systemPrompt?: string;
+    timeoutMs?: number; // override process kill timeout (floor: 20 min)
   }
 ): { id: string; promise: Promise<string> } {
   const depth = currentDepth();
@@ -334,14 +336,15 @@ function spawnSubAgent(
       settle(`[Sub-agent spawn error] ${err.message}`, "error");
     });
 
-    // 10 minute timeout
+    // Kill process after timeout (min 20 min, configurable via options)
+    const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
     setTimeout(() => {
       if (agent.status === "running" && !settled) {
         proc.kill();
-        agent.error = "timeout (10 min)";
-        settle(`[Sub-agent timeout]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
+        agent.error = `timeout (${Math.round(killTimeout / 60_000)} min)`;
+        settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
       }
-    }, 600_000);
+    }, killTimeout);
   });
 
   return { id, promise };
@@ -485,12 +488,14 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(Type.String({ description: "Model override (e.g. use the cheaper model variant for simple tasks)" })),
       tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
       systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max runtime in ms before hard kill (min: 20 min, default: 20 min)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const { id, promise } = spawnSubAgent(params.task, ctx.cwd, {
         model: params.model,
         tools: params.tools ? params.tools.split(",").map((t: string) => t.trim()) : undefined,
         systemPrompt: params.systemPrompt,
+        timeoutMs: params.timeoutMs,
       });
 
       // Fire and forget — return immediately
@@ -526,7 +531,7 @@ export default function (pi: ExtensionAPI) {
     description: "Wait for a sub-agent to complete. Returns the result and indicates whether changes were committed.",
     parameters: Type.Object({
       id: Type.String({ description: "Sub-agent ID" }),
-      timeoutMs: Type.Optional(Type.Number({ description: "Max wait ms (default: 600000 = 10 min)" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max wait ms (default: 1200000 = 20 min)" })),
     }),
     async execute(_id, params, _signal) {
       const ag = subAgents.get(params.id);
@@ -538,7 +543,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const deadline = Date.now() + (params.timeoutMs || 600_000);
+      const deadline = Date.now() + (params.timeoutMs || 1_200_000);
       while (ag.status === "running" && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 500));
       }
