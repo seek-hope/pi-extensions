@@ -34,8 +34,9 @@ let todo: TodoList = { items: [], updatedAt: 0 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function renderWidget(): void {
-  if (!_pi) return;
+function renderWidget(ctx?: any): void {
+  const ui = ctx?.ui ?? _pi?.ui;
+  if (!ui) return;
   if (todo.items.length === 0) {
     _pi.ui.setWidget("todo", undefined);
     return;
@@ -50,16 +51,18 @@ function renderWidget(): void {
 
   for (const item of todo.items) {
     const icon = STATUS_ICONS[item.status] || "○";
+    // Strip control characters from item content to prevent terminal injection
+    const safeContent = item.content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").replace(/\n/g, " ");
     if (item.status === "in_progress") {
-      lines.push(`│ ${icon} \x1b[1m${item.content}\x1b[0m`);
+      lines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
     } else if (item.status === "completed") {
-      lines.push(`│ ${icon} \x1b[2m${item.content}\x1b[0m`);
+      lines.push(`│ ${icon} \x1b[2m${safeContent}\x1b[0m`);
     } else if (item.status === "cancelled") {
-      lines.push(`│ ${icon} \x1b[2m\x1b[9m${item.content}\x1b[0m`);
+      lines.push(`│ ${icon} \x1b[2m\x1b[9m${safeContent}\x1b[0m`);
     } else {
-      lines.push(`│ ${icon} ${item.content}`);
+      lines.push(`│ ${icon} ${safeContent}`);
     }
-    if (lines.length >= 12) break; // Cap widget at 12 lines
+    if (lines.length >= 11) break; // 10 items max (header + 9 items + summary)
   }
 
   if (todo.items.length > 10) {
@@ -67,7 +70,7 @@ function renderWidget(): void {
   }
   lines.push(`└──────────────────────────────────────────`);
 
-  _pi.ui.setWidget("todo", lines);
+  ui.setWidget("todo", lines);
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -99,7 +102,7 @@ export default function (pi: ExtensionAPI) {
         status: Type.Optional(Type.String({ description: "Status: pending (default), in_progress, completed, cancelled" })),
       }), { description: "The complete todo list. Replaces all previous items." }),
     }),
-    async execute(_id, params, _signal) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       const validStatuses = new Set<TodoStatus>(["pending", "in_progress", "completed", "cancelled"]);
 
       // Validate and normalize
@@ -130,7 +133,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       todo = { items, updatedAt: Date.now() };
-      renderWidget();
+      renderWidget(ctx);
 
       // Count by status for response
       const counts: Record<string, number> = {};

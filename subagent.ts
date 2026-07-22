@@ -795,7 +795,7 @@ export default function (pi: ExtensionAPI) {
         results.push(...batchResults);
         for (const r of batchResults) {
           subAgents.delete(r.id);
-          cleanupWorktree(ctx.cwd, r.id, true);
+          // NOTE: worktree/branch preserved — caller reviews then merges/rejects to clean up
         }
       }
 
@@ -857,7 +857,7 @@ export default function (pi: ExtensionAPI) {
         context = result;
         results.push({ task, id, result, commitHash: ag?.commitHash });
         subAgents.delete(id);
-        cleanupWorktree(ctx.cwd, id, true);
+        // NOTE: worktree/branch preserved — caller merges to accept, rejects to clean up
       }
 
       const summary = [
