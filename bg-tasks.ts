@@ -20,6 +20,7 @@ const TASK_FILE = join(TASK_DIR, "tasks.json");
 interface Task {
   id: string;
   description: string;
+  cwd: string;
   status: "running" | "done" | "error" | "killed";
   startTime: number;
   endTime?: number;
@@ -55,11 +56,9 @@ function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): v
 // ── spawn background task ──────────────────────────────────────────────────
 
 function spawnTask(description: string, cwd: string, timeout: number): Task {
-  // Deduplicate: if identical task already running, return existing
+  // Deduplicate: if identical task (same description and cwd) already running, return existing
   for (const [, t] of tasks) {
-    if (t.status === "running" && t.description === description) {
-      // Same description but different cwd? Could be legitimately different.
-      // Use description as the dedup key (the AI is likely repeating the same command).
+    if (t.status === "running" && t.description === description && t.cwd === cwd) {
       return t;
     }
   }
@@ -92,7 +91,7 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
     throw new Error(`Failed to start tmux session for task ${id}`);
   }
 
-  const task: Task = { id, description, status: "running", startTime, logFile };
+  const task: Task = { id, description, cwd, status: "running", startTime, logFile };
   tasks.set(id, task);
   saveTasks(tasks);
 
