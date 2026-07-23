@@ -250,10 +250,6 @@ export default function (pi: ExtensionAPI) {
     detailWidgetActive = false;
     renderWidget(ctx);
   });
-    detailWidgetActive = false;
-    ctx.ui?.setWidget?.("todo-detail", undefined);
-    renderWidget(ctx);
-  });
 
   // ── session_shutdown: clear widgets and references ───────────────────
   pi.on("session_shutdown", () => {
