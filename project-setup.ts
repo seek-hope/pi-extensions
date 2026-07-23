@@ -89,6 +89,8 @@ export default function (pi: ExtensionAPI) {
     if (event.reason !== "startup" && event.reason !== "new") return;
 
     const cwd = ctx.cwd;
+    // Skip if cwd doesn't exist (e.g., deleted subagent worktree)
+    if (!existsSync(cwd)) return;
     const missing: Check[] = [];
 
     for (const check of checks) {
