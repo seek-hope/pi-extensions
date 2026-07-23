@@ -81,7 +81,10 @@ async function reviewLoop(
     cleanupWorktree(projectRoot(ctxCwd), reviewerId, true);
 
     // Abort if reviewer failed to spawn (error message instead of review)
-    if (reviewerOutput.startsWith("[Sub-agent error]") || reviewerOutput.startsWith("[Sub-agent denied]")) {
+    if (reviewerOutput.startsWith("[Sub-agent error") || 
+        reviewerOutput.startsWith("[Sub-agent denied") ||
+        reviewerOutput.startsWith("[Sub-agent timeout") ||
+        reviewerOutput.startsWith("[Sub-agent spawn error")) {
       return { iterations: i, clean: false, summary: `❌ Reviewer failed at round ${i}: ${reviewerOutput.substring(0, 200)}` };
     }
 
@@ -106,7 +109,8 @@ async function reviewLoop(
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
     }
-    if (fixerOutput.startsWith("[Sub-agent error") || fixerOutput.startsWith("[Sub-agent spawn error")) {
+    if (fixerOutput.startsWith("[Sub-agent error") || fixerOutput.startsWith("[Sub-agent spawn error") || 
+        fixerOutput.startsWith("[Sub-agent denied") || fixerOutput.startsWith("[Sub-agent timeout")) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
@@ -233,24 +237,28 @@ async function handleExecuteMode(
       ctxCwd
     );
     try {
-      await execPromise;
+      const execResult = await execPromise;
       const ag = subAgents.get(execId);
       if (ag) {
-        if (ag.status === "error") {
-          results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || "").substring(0, 100)})`);
+        if (ag.status === "error" || execResult.startsWith("[Sub-agent error") || execResult.startsWith("[Sub-agent denied") || execResult.startsWith("[Sub-agent timeout") || execResult.startsWith("[Sub-agent spawn error")) {
+          results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
           allClean = false;
         } else {
-          const ir = await handleImproveMode(execId, ctxCwd, undefined, maxIt);
-          results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
-          if (!ir.clean) allClean = false;
+          try {
+            const ir = await handleImproveMode(execId, ctxCwd, undefined, maxIt);
+            results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
+            if (!ir.clean) allClean = false;
+          } catch (e: any) {
+            results.push(`${i + 1}. ${item.description}: ✗ improve crashed (${(e.message || "").substring(0, 100)})`);
+            allClean = false;
+          }
         }
       } else {
         results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
         allClean = false;
       }
     } finally {
-      // Always clean up worktree, even if handleImproveMode throws
-      cleanupWorktree(projectRoot(ctxCwd), execId, true);
+      cleanupWorktree(projectRoot(ctxCwd), execId, false);
       subAgents.delete(execId);
     }
   }
@@ -401,7 +409,7 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
   }
 }
 
-// ── depth tracking ─────────────────────────────────────────────────────────
+// ── sub-process runner ───────────────────────────────────────────────────────
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
@@ -587,8 +595,6 @@ function spawnSubAgent(
 
   return { id, promise };
 }
-
-// ── refine summary helper ──────────────────────────────────────────────────
 
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -883,39 +889,55 @@ export default function (pi: ExtensionAPI) {
       const branch = branchName(params.id);
       if (gitQuiet(["status", "--porcelain"], ctx.cwd).trim()) { return { content: [{ type: "text", text: "Working tree has uncommitted changes. Commit or stash before merging." }], details: {}, isError: true }; }
       const ag = subAgents.get(params.id);
-      if (!ag) return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
-      if (ag.status === "running") return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
+      if (ag && ag.status === "running") return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
+
+      // Verify branch exists before attempting merge
+      try { git(["rev-parse", "--verify", branch], ctx.cwd); }
+      catch { return { content: [{ type: "text", text: `Branch ${branch} for sub-agent ${params.id} not found. It may have been cleaned up already.` }], details: {}, isError: true }; }
 
       // Try merge
       try {
-        // Check for conflicts first
-        const mergeCheck = gitQuiet(["merge", "--no-commit", "--no-ff", branch], ctx.cwd);
-        const hasConflicts = mergeCheck.includes("CONFLICT");
+        // Attempt merge — catch both conflicts and other errors
+        let mergeSucceeded = false;
+        let mergeError = "";
+        try {
+          git(["merge", "--no-commit", "--no-ff", branch], ctx.cwd);
+          mergeSucceeded = true;
+        } catch (e: any) {
+          mergeError = e.stderr || e.message || "";
+        }
 
-        if (hasConflicts) {
-          // Abort the merge attempt so user can inspect
+        if (!mergeSucceeded) {
+          const isConflict = mergeError.includes("CONFLICT");
+          // Abort to leave working tree clean
           gitQuiet(["merge", "--abort"], ctx.cwd);
 
-          // Show conflicting files
-          const conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctx.cwd);
+          if (isConflict) {
+            const conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctx.cwd);
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  `⚠ Merge conflicts detected for sub-agent ${params.id}`,
+                  `Branch: ${branch}`,
+                  "",
+                  "Conflicting files:",
+                  conflictFiles || "(check manually)",
+                  "",
+                  "The merge was aborted. You need to resolve conflicts manually:",
+                  `  git merge ${branch}`,
+                  "  # resolve conflicts",
+                  "  git add -A && git commit",
+                ].join("\n"),
+              }],
+              details: { hasConflicts: true, branch },
+            };
+          }
 
           return {
-            content: [{
-              type: "text",
-              text: [
-                `⚠ Merge conflicts detected for sub-agent ${params.id}`,
-                `Branch: ${branch}`,
-                "",
-                "Conflicting files:",
-                conflictFiles || "(check manually)",
-                "",
-                "The merge was aborted. You need to resolve conflicts manually:",
-                `  git merge ${branch}`,
-                "  # resolve conflicts",
-                "  git add -A && git commit",
-              ].join("\n"),
-            }],
-            details: { hasConflicts: true, branch },
+            content: [{ type: "text", text: `Merge failed for ${params.id}: ${mergeError.substring(0, 500)}` }],
+            details: {},
+            isError: true,
           };
         }
 
