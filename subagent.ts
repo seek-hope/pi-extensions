@@ -259,7 +259,7 @@ async function handleImproveMode(
     },
     async (issuesCount, reviewerOutput, _i) => {
       const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-      const { id: fixerId, promise } = spawnSubAgent(task, ctxCwd, { model: _cheapModel });
+      const { id: fixerId, promise } = spawnSubAgent(task, ctxCwd, { model: _cheapModel || _defaultModel });
       const output = await promise;
       // Merge fixer's changes back into the target worktree
       // If merge fails, report it — reviewLoop will detect the error and abort
@@ -897,7 +897,7 @@ export default function (pi: ExtensionAPI) {
           const { id: preId, promise: prePromise } = spawnSubAgent(
             `Analyze: ${params.task}. Read relevant files thoroughly. Note any issues found.`,
             ctx.cwd,
-            { model: _cheapModel, tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"] }
+            { model: _cheapModel || _defaultModel, tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"] }
           );
           const preResult = await prePromise;
           // Validate analyze step — abort if the agent failed
