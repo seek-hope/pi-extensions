@@ -6,12 +6,11 @@ project: extensions
 
 # Documentation paths — directories or individual files
 doc_dirs:
-  - docs
   - README.md
 
 # Code directories — each is scanned recursively for symbols
 code_dirs:
-  - src
+  - ./*.ts
 
 # Sync strategies per doc type:
 #   auto_update  — rewrite the doc section automatically
@@ -20,8 +19,8 @@ code_dirs:
 #   ignore       — skip this doc type entirely
 strategies:
   inline: auto_update       # docstrings in source code
-  standalone: auto_update   # markdown docs
-  generated: auto_update    # TypeDoc / OpenAPI / generated docs
+  standalone: mark_stale    # markdown docs — review before applying
+  generated: mark_stale     # TypeDoc / OpenAPI / generated docs
   architecture: mark_stale  # architecture decision records
 
 # Optional: Codegraph integration for richer symbol data

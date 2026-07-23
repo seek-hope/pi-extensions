@@ -57,27 +57,28 @@ function clearDetailWidget(ctx?: any): void {
 
 /**
  * Find the most recent todo_write result in the session branch and
- * restore `todo` from it.  Returns true when state was successfully
- * restored, false when no todo_write was found.
+ * restore `todo` from it.
  */
-function restoreFromBranch(ctx?: any): boolean {
+function restoreFromBranch(ctx?: any): void {
   todo = { items: [], updatedAt: 0 };
   try {
     const branch = (ctx as any)?.sessionManager?.getBranch?.();
     if (Array.isArray(branch)) {
-      for (const entry of branch) {
+      // Iterate in reverse so the most recent todo_write wins
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
         if (entry?.type !== "message") continue;
         const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
         // Array.isArray catches both populated and empty lists so that a
         // todo_write that cleared everything is honoured on restore.
         if (Array.isArray(details?.items)) {
           todo = { items: details.items, updatedAt: Date.now() };
+          break;
         }
       }
     }
-    return todo.items.length > 0;
   } catch {
-    return false;
+    // ignore — state stays as empty todo list
   }
 }
 
@@ -153,7 +154,12 @@ export default function (pi: ExtensionAPI) {
       }), { description: "The complete todo list. Replaces all previous items." }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const validStatuses = new Set<TodoStatus>(["pending", "in_progress", "completed", "cancelled"]);
+      // Type guard — narrows string to TodoStatus after validation
+      function isValidTodoStatus(s: string): s is TodoStatus {
+        return s === "pending" || s === "in_progress" || s === "completed" || s === "cancelled";
+      }
+
+      const validStatuses = new Set<string>(["pending", "in_progress", "completed", "cancelled"]);
       const warnings: string[] = [];
 
       // Validate and normalize
@@ -164,8 +170,8 @@ export default function (pi: ExtensionAPI) {
         let status: TodoStatus = "pending";
         if (item.status) {
           const s = item.status.trim().toLowerCase();
-          if (validStatuses.has(s as TodoStatus)) {
-            status = s as TodoStatus;
+          if (isValidTodoStatus(s)) {
+            status = s;
           } else {
             warnings.push(`Item ${i + 1}: invalid status "${item.status}" → defaulting to "pending"`);
           }
@@ -225,9 +231,15 @@ export default function (pi: ExtensionAPI) {
       const total = todo.items.length;
       const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
 
-      const sorted = [...todo.items].sort((a, b) => {
-        return statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status);
-      });
+      // Stable sort: primary key is status order, secondary is original index
+      const sorted = todo.items
+        .map((item, index) => ({ item, index }))
+        .sort((a, b) => {
+          const statusDiff = statusOrder.indexOf(a.item.status) - statusOrder.indexOf(b.item.status);
+          if (statusDiff !== 0) return statusDiff;
+          return a.index - b.index;
+        })
+        .map(({ item }) => item);
 
       // Build detail widget lines
       const detailLines: string[] = [];
