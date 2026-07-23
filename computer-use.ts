@@ -115,7 +115,10 @@ async function moveToVerified(x: number, y: number, bound: { width: number; heig
       // getCursorPos failed — may be transient; retry
     }
   }
-  // After 3 attempts, don't throw — we still moved; just not verified
+  throw new Error(
+    `Failed to move mouse to (${cx}, ${cy}) after 3 attempts. ` +
+    `Last known position: unable to verify. The mouse may not have moved correctly.`
+  );
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
