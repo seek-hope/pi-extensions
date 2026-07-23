@@ -54,6 +54,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
   let lastSize = 0;
   let unchanged = 0;
   let errors = 0;
+  const MAX_ERRORS = 5; // ~25s of failures before giving up
   let stopped = false;
 
   function check() {
@@ -77,7 +78,20 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
           try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
           const idx = remoteTasks.findIndex(t => t.logPath === logPath);
           if (idx >= 0) remoteTasks.splice(idx, 1);
-          shellExec(conn2, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
+          // Re-verify connection before fetching the log
+          const conn3 = findConnection(host);
+          if (!conn3 || !isConnected(conn3.key)) {
+            // Connection lost — task result unreachable; log path is all we can report
+            if (_sshPi) {
+              _sshPi.sendUserMessage([
+                { type: "text", text: `[SSH background task completed on ${host} but connection lost]` },
+                { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+                { type: "text", text: `Log on remote: ${logPath}` },
+              ], { deliverAs: "followUp" });
+            }
+            return;
+          }
+          shellExec(conn3, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
             if (_sshPi) {
               _sshPi.sendUserMessage([
                 { type: "text", text: `[SSH background task completed on ${host}]` },
@@ -96,8 +110,13 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       setTimeout(check, 5000);
     }).catch(() => {
       errors++;
-      if (errors < 30 && !stopped) { setTimeout(check, 5000); }
-      else { try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ } }
+      if (errors < MAX_ERRORS && !stopped) { setTimeout(check, 5000); }
+      else {
+        // Give up — clean up task entry and status
+        const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+        if (idx >= 0) remoteTasks.splice(idx, 1);
+        try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+      }
     });
   }
   setTimeout(check, 3000);
@@ -138,7 +157,11 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
       if (i + 1 < parts.length) { const v = parseInt(parts[i + 1]); if (!isNaN(v)) port = v; i += 2; }
       else { i++; } // -p at end: skip it
     }
-    else if (p.startsWith("-")) { i += (i + 1 < parts.length && !parts[i + 1].startsWith("-")) ? 2 : 1; }
+    else if (p.startsWith("-")) {
+      // Consume option and its value (if next token doesn't look like another flag)
+      if (i + 1 < parts.length && !parts[i + 1].startsWith("-")) { i += 2; }
+      else { i += 1; }
+    }
     else if (p.includes("@")) {
       // Split on the LAST @ for user/host boundary (user may contain @ in rare cases)
       const atIdx = p.lastIndexOf("@");
@@ -225,17 +248,18 @@ function ensureShell(conn: Connection): void {
 }
 
 function extractResponses(conn: Connection): void {
-  // Safety: if buffer grows too large without a valid marker, truncate
+  // Safety: if buffer grows too large without a valid marker, truncate from front
   const MAX_BUF = 2 * 1024 * 1024; // 2 MB
   if (conn.buf.length > MAX_BUF) {
-    // Find the last valid marker or truncate from the front
+    // Find the last valid marker or keep the most recent data
     const lastMarker = conn.buf.lastIndexOf("__END__");
     if (lastMarker > 0) {
       // Discard everything before the last marker (stale data)
       conn.buf = conn.buf.substring(lastMarker);
     } else {
-      // No marker at all — malformed output, truncate entirely
-      conn.buf = "";
+      // No marker at all — keep the most recent 1 MB to avoid losing a pending marker
+      const keep = Math.floor(MAX_BUF / 2);
+      conn.buf = conn.buf.substring(conn.buf.length - keep);
     }
   }
   while (true) {
@@ -259,7 +283,8 @@ function extractResponses(conn: Connection): void {
 function shellExec(conn: Connection, cmd: string, timeout: number): Promise<string> {
   return new Promise((resolve, reject) => {
     ensureShell(conn);
-    if (!conn.proc || !conn.proc.stdin?.writable) {
+    // Re-check: the process may have exited between ensureShell and now
+    if (!conn.proc || conn.proc.exitCode !== null || !conn.proc.stdin?.writable) {
       reject(new Error("SSH shell not available"));
       return;
     }
@@ -418,12 +443,22 @@ function closeConn(target: string, ctx: any): void {
       return;
     }
   }
-  // Fallback: substring match on alias or key
+  // Fallback: substring match — require exactly one match to avoid ambiguity
+  const substringMatches: Array<[string, Connection]> = [];
   for (const [key, c] of connections) {
-    if (c.key.includes(target) || c.alias.includes(target)) {
-      destroyConn(key, c, ctx);
-      return;
+    if (c.key.toLowerCase().includes(t) || c.alias.toLowerCase().includes(t)) {
+      substringMatches.push([key, c]);
     }
+  }
+  if (substringMatches.length === 1) {
+    const [key, c] = substringMatches[0];
+    destroyConn(key, c, ctx);
+    return;
+  }
+  if (substringMatches.length > 1) {
+    const names = substringMatches.map(([, c]) => c.key).join(", ");
+    ctx.ui.notify(`Ambiguous: "${target}" matches multiple connections (${names}). Be more specific.`, "warning");
+    return;
   }
   ctx.ui.notify(`No connection matching "${target}".`, "error");
 }
@@ -435,9 +470,23 @@ function destroyConn(key: string, c: Connection, ctx: any): void {
     try { p.reject(new Error("Connection closed")); } catch { /* ok */ }
   }
   c.pending.clear();
-  try { spawnSync("ssh", ["-o", `ControlPath=${c.socket}`, "-O", "exit", "x"], { stdio: "ignore", timeout: 10_000 }); } catch { /* ok */ }
-  try { rmSync(c.socket); } catch { /* ok */ }
+  let masterExited = false;
+  try {
+    const r = spawnSync("ssh", ["-o", `ControlPath=${c.socket}`, "-O", "exit", "x"], { stdio: "ignore", timeout: 10_000 });
+    masterExited = r.status === 0;
+  } catch { /* timeout or spawn error — master may still be running */ }
+  // Only delete the socket if the master was successfully exited.
+  // If exit failed/timeout, leave the socket so the master can still be managed.
+  if (masterExited || !existsSync(c.socket)) {
+    try { rmSync(c.socket); } catch { /* ok */ }
+  }
   connections.delete(key);
+  // Also clean up any remote tasks tied to this host
+  for (let i = remoteTasks.length - 1; i >= 0; i--) {
+    if (remoteTasks[i].host === c.alias || remoteTasks[i].host === c.key) {
+      remoteTasks.splice(i, 1);
+    }
+  }
   ctx.ui.notify(`Closed ${c.key}.`, "info");
 }
 
@@ -666,7 +715,15 @@ export default function (pi: ExtensionAPI) {
   // ── session_start: recover running remote tasks ─────────────────
   pi.on("session_start", async () => {
     syncFromDisk();
+    const now = Date.now();
+    const MAX_TASK_AGE = 60 * 60 * 1000; // 1 hour — older tasks are considered stale
     for (const t of [...remoteTasks]) {
+      if (now - t.startTime > MAX_TASK_AGE) {
+        // Task too old — clean up without polling
+        const idx = remoteTasks.findIndex(rt => rt.logPath === t.logPath);
+        if (idx >= 0) remoteTasks.splice(idx, 1);
+        continue;
+      }
       const conn = findConnection(t.host);
       if (conn && isConnected(conn.key)) {
         pollRemoteTask(conn, t.logPath, t.cmd, t.host);
