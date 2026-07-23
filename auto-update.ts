@@ -136,7 +136,7 @@ export default function (pi: ExtensionAPI) {
       if (remote && !remote.includes("Error")) {
         // Check if behind remote
         sh("git fetch origin main 2>/dev/null", EXT_DIR);
-        const behind = sh("git rev-list HEAD..origin/master --count 2>/dev/null", EXT_DIR).trim();
+        const behind = sh("git rev-list HEAD..origin/main --count 2>/dev/null", EXT_DIR).trim();
         if (behind && behind !== "0" && !behind.includes("Error")) {
           ctx.ui.notify(`Extensions: ${behind} commit(s) behind remote. Run /update-tools to sync.`, "warning");
         }

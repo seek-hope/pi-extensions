@@ -38,14 +38,12 @@ function renderWidget(ctx?: any): void {
   const ui = ctx?.ui ?? _pi?.ui;
   if (!ui) return;
   if (todo.items.length === 0) {
-    _pi.ui.setWidget("todo", undefined);
+    ui.setWidget("todo", undefined);
     return;
   }
 
   const total = todo.items.length;
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
-  const active = todo.items.find(i => i.status === "in_progress");
-
   const lines: string[] = [];
   lines.push(`┌─ Todo (${done}/${total}) ──────────────────────────`);
 

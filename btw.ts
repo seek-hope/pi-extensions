@@ -34,7 +34,6 @@ class ScrollViewer {
       return true;
     }
     if (data === "g") {
-      // First press: start of page; second press: start of content
       if (this.scroll > 0) { this.scroll = 0; this.invalidate(); }
       return true;
     }

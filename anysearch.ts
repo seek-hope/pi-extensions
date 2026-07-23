@@ -22,7 +22,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       try {
-        const apiKey = process.env.ANYSEARCH_API_KEY || "";
+        const apiKey = (process.env.ANYSEARCH_API_KEY || "").trim();
         const num = params.numResults ?? 5;
 
         const url = `${API_BASE}/v1/search`;
@@ -47,7 +47,11 @@ export default function (pi: ExtensionAPI) {
         });
 
         if (!res.ok) {
-          const err = await res.text();
+          let err = await res.text();
+          // Redact the API key if the server echoes it back in the error response
+          if (apiKey) {
+            err = err.replaceAll(apiKey, "[REDACTED]");
+          }
           return {
             content: [{
               type: "text",
@@ -63,10 +67,16 @@ export default function (pi: ExtensionAPI) {
         const text = JSON.stringify(data, null, 2);
         return { content: [{ type: "text", text }], details: {} };
       } catch (e: any) {
+        let msg = e.message || String(e);
+        // Redact the API key if it appears in a network error message (e.g., from a proxy)
+        const apiKey = (process.env.ANYSEARCH_API_KEY || "").trim();
+        if (apiKey) {
+          msg = msg.replaceAll(apiKey, "[REDACTED]");
+        }
         return {
           content: [{
             type: "text",
-            text: `AnySearch network error: ${e.message}\n\n` +
+            text: `AnySearch network error: ${msg}\n\n` +
               `API: ${API_BASE}\n` +
               `This may be caused by a network proxy blocking the connection. ` +
               `Check that ${API_BASE} is reachable from your environment.`,
