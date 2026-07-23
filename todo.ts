@@ -253,10 +253,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_shutdown: clear widgets and references ───────────────────
   pi.on("session_shutdown", () => {
-    if (_pi) {
-      _pi.ui.setWidget("todo", undefined);
-      _pi.ui.setWidget("todo-detail", undefined);
-    }
+    try {
+      _pi?.ui?.setWidget?.("todo", undefined);
+      _pi?.ui?.setWidget?.("todo-detail", undefined);
+    } catch { /* ignore */ }
     detailWidgetActive = false;
     todo = { items: [], updatedAt: 0 };
     _pi = null;
