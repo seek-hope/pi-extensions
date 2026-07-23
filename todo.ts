@@ -165,7 +165,6 @@ export default function (pi: ExtensionAPI) {
       }
 
       const statusOrder: TodoStatus[] = ["in_progress", "pending", "completed", "cancelled"];
-      const maxWidget = 8;
       const total = todo.items.length;
       const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
 
@@ -173,16 +172,9 @@ export default function (pi: ExtensionAPI) {
         return statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status);
       });
 
-      // Widget: first 8 items
-      const widgetLines = sorted.slice(0, maxWidget).map((item, i) =>
-        `│ ${i + 1}. ${STATUS_ICONS[item.status]} ${item.content}`
-      );
-      if (sorted.length > maxWidget) widgetLines.push(`│ ... ${sorted.length - maxWidget} more`);
-      ctx.ui.setWidget("todo-detail", widgetLines);
-
-      // Full list as text so user can scroll
+      // Full list as text — widget is managed by renderWidget() from todo_write
       const fullLines = sorted.map((item, i) =>
-        `${i + 1}. ${STATUS_ICONS[item.status]} [${item.status}] ${item.content}`
+        `${i + 1}. ${STATUS_ICONS[item.status]} ${item.content}`
       );
       const text = `=== Todo (${done}/${total}) ===\n\n` + fullLines.join("\n");
       ctx.ui.notify(text, "info");
