@@ -47,6 +47,7 @@ function saveTasks(tasks: Map<string, Task>): void {
 }
 
 const tasks = loadTasks();
+const pollingTasks = new Set<string>(); // tracks which task IDs are currently being polled
 let _pi: ExtensionAPI | null = null;
 
 function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): void {
@@ -56,10 +57,20 @@ function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): v
 // ── spawn background task ──────────────────────────────────────────────────
 
 function spawnTask(description: string, cwd: string, timeout: number): Task {
-  // Deduplicate: if identical task (same description and cwd) already running, return existing
+  // Deduplicate: if identical task (same description and cwd) already running, return existing.
+  // Verify the tmux session is actually still alive before deduplicating.
   for (const [, t] of tasks) {
     if (t.status === "running" && t.description === description && t.cwd === cwd) {
-      return t;
+      try {
+        execSync(`tmux has-session -t "${t.id}"`, { stdio: "pipe", timeout: 5_000 });
+        return t; // session confirmed alive — deduplicate
+      } catch {
+        // Session is dead — stale status. Mark it and continue to spawn a new one.
+        t.status = "error";
+        t.exitCode = -1;
+        t.endTime = Date.now();
+        saveTasks(tasks);
+      }
     }
   }
   const id = `task-${Date.now().toString(36)}`;
@@ -68,26 +79,24 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
 
   const startTime = Date.now();
 
-  // Write script to temp file to avoid shell escaping issues
-  // Use a unique, random heredoc delimiter to prevent injection via task content
-  const heredocMarker = `PIEOF_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const scriptFile = join(TASK_DIR, `${id}.sh`);
-  const script = [
+  // Write the task command to a standalone script file — avoids shell escaping
+  // and heredoc-marker collision issues entirely.
+  const taskScript = join(TASK_DIR, `${id}.sh`);
+  const wrapperScript = [
     `cd '${cwd.replace(/'/g, "'\\''")}'`,
-    `cat > /tmp/_bgtask_${id}.sh << '${heredocMarker}'`,
-    description,
-    `${heredocMarker}`,
-    `( bash /tmp/_bgtask_${id}.sh ) > "${logFile}" 2>&1`,
-    `echo "EXIT_CODE=$?" >> "${logFile}"`,
-    `rm -f /tmp/_bgtask_${id}.sh`,
+    `bash '${taskScript.replace(/'/g, "'\\''")}' > "${logFile.replace(/'/g, "'\\''")}" 2>&1`,
+    `echo "EXIT_CODE=$?" >> "${logFile.replace(/'/g, "'\\''")}"`,
   ].join("\n");
-  writeFileSync(scriptFile, script);
+  writeFileSync(taskScript, description);
+  const wrapperFile = join(TASK_DIR, `${id}_wrapper.sh`);
+  writeFileSync(wrapperFile, wrapperScript);
 
   try {
-    execSync(`tmux new-session -d -s "${id}" "bash ${scriptFile} ; rm -f ${scriptFile}" 2>/dev/null`, { timeout: 10_000 });
+    execSync(`tmux new-session -d -s "${id}" "bash '${wrapperFile.replace(/'/g, "'\\''")}' ; rm -f '${wrapperFile.replace(/'/g, "'\\''")}' '${taskScript.replace(/'/g, "'\\''")}'" 2>/dev/null`, { timeout: 10_000 });
   } catch {
     // tmux spawn failed — clean up and throw
-    try { unlinkSync(scriptFile); } catch { /* ok */ }
+    try { unlinkSync(taskScript); } catch { /* ok */ }
+    try { unlinkSync(wrapperFile); } catch { /* ok */ }
     throw new Error(`Failed to start tmux session for task ${id}`);
   }
 
@@ -105,6 +114,10 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
         try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
         t.status = "killed";
         t.endTime = Date.now();
+        pollingTasks.delete(id);
+        // Clean up script files that the tmux session would have removed on normal exit
+        try { unlinkSync(wrapperFile); } catch { /* ok */ }
+        try { unlinkSync(taskScript); } catch { /* ok */ }
         saveTasks(tasks);
         updateTaskWidget();
       }
@@ -135,6 +148,10 @@ function killTask(id: string): boolean {
   try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
   task.status = "killed";
   task.endTime = Date.now();
+  pollingTasks.delete(id);
+  // Clean up script files that the tmux session would have removed on normal exit
+  try { unlinkSync(join(TASK_DIR, `${id}.sh`)); } catch { /* ok */ }
+  try { unlinkSync(join(TASK_DIR, `${id}_wrapper.sh`)); } catch { /* ok */ }
   saveTasks(tasks);
   updateTaskWidget();
   return true;
@@ -160,37 +177,75 @@ function updateTaskWidget(): void {
 }
 
 function pollCompletion(id: string): void {
+  // Prevent duplicate polling chains for the same task
+  if (pollingTasks.has(id)) return;
+  pollingTasks.add(id);
+
   const check = () => {
     const task = tasks.get(id);
-    if (!task || task.status !== "running") return;
+    if (!task || task.status !== "running") {
+      pollingTasks.delete(id);
+      return;
+    }
+    // Use stdio:'pipe' so we can distinguish "session not found" (exit 1)
+    // from other tmux failures (tmux not installed, etc.)
+    let sessionExists = false;
     try {
-      execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+      execSync(`tmux has-session -t "${id}"`, { stdio: "pipe", timeout: 5_000 });
+      sessionExists = true;
+    } catch (e: any) {
+      // exit code 1 = session does not exist (normal completion)
+      // any other exit code = tmux error (don't assume task completed)
+      if (e.status !== 1) {
+        // tmux error — retry later rather than falsely marking task complete
+        updateTaskWidget();
+        setTimeout(check, 5000);
+        return;
+      }
+      // session doesn't exist — proceed to finalize
+    }
+
+    if (sessionExists) {
       // Still running
       updateTaskWidget();
       setTimeout(check, 5000);
-    } catch {
-      // Session ended — atomically get output and update status
-      const current = tasks.get(id);
-      if (!current || current.status !== "running") return;
-      getTaskOutput(current);  // sets status to done/error
-      saveTasks(tasks);
-      let output = "";
-      try { output = readFileSync(current.logFile, "utf-8"); } catch { /* file may have been removed */ }
-      const emoji = current.status === "done" ? "✅" : "❌";
-      updateTaskWidget();
-      notifyUser(`${emoji} Background task ${id} completed (${current.status})`, current.status === "done" ? "info" : "error");
-      // Send result as new user input so AI can process it
-      try {
-        if (_pi && current.status !== "killed") {
-          const msg = [
-            { type: "text", text: `[Background task ${id} completed (${current.status})]` },
-            { type: "text", text: `Task: ${current.description.substring(0, 200)}` },
-            { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
-          ];
-          _pi.sendUserMessage(msg, { deliverAs: "followUp" });
-        }
-      } catch { /* ignore */ }
+      return;
     }
+
+    // Session ended — atomically get output and update status
+    const current = tasks.get(id);
+    if (!current || current.status !== "running") {
+      pollingTasks.delete(id);
+      return;
+    }
+    getTaskOutput(current);  // attempts to set status to done/error from EXIT_CODE
+
+    // If status is still "running" after getTaskOutput, the log lacks EXIT_CODE
+    // (e.g. script was killed before writing it). Mark as error.
+    if (current.status === "running") {
+      current.status = "error";
+      current.exitCode = -1;
+      current.endTime = Date.now();
+    }
+
+    pollingTasks.delete(id);
+    saveTasks(tasks);
+    let output = "";
+    try { output = readFileSync(current.logFile, "utf-8"); } catch { /* file may have been removed */ }
+    const emoji = current.status === "done" ? "✅" : "❌";
+    updateTaskWidget();
+    notifyUser(`${emoji} Background task ${id} completed (${current.status})`, current.status === "done" ? "info" : "error");
+    // Send result as new user input so AI can process it
+    try {
+      if (_pi && current.status !== "killed") {
+        const msg = [
+          { type: "text", text: `[Background task ${id} completed (${current.status})]` },
+          { type: "text", text: `Task: ${current.description.substring(0, 200)}` },
+          { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
+        ];
+        _pi.sendUserMessage(msg, { deliverAs: "followUp" });
+      }
+    } catch { /* ignore */ }
   };
   setTimeout(check, 5000);
 }
@@ -204,15 +259,30 @@ export default function (pi: ExtensionAPI) {
   function syncTasks(): void {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
+      let sessionExists = false;
       try {
-        execSync(`tmux has-session -t "${id}" 2>/dev/null`, { stdio: "ignore", timeout: 5_000 });
+        execSync(`tmux has-session -t "${id}"`, { stdio: "pipe", timeout: 5_000 });
+        sessionExists = true;
+      } catch (e: any) {
+        // exit code 1 = session does not exist (task completed while we were away)
+        // any other exit code = tmux error — skip this task, don't guess
+        if (e.status !== 1) continue;
+      }
+      if (sessionExists) {
         // Still running — resume polling
         pollCompletion(id);
-      } catch {
+      } else {
         // Session gone — check log for exit code
         try {
           getTaskOutput(task);
         } catch { /* log file may be gone */ }
+        // If still "running" after getTaskOutput, the log file is missing
+        // or lacks EXIT_CODE. Mark as error to prevent perpetual "running" state.
+        if (task.status === "running") {
+          task.status = "error";
+          task.exitCode = -1;
+          task.endTime = Date.now();
+        }
         saveTasks(tasks);
       }
     }
@@ -247,11 +317,14 @@ export default function (pi: ExtensionAPI) {
       if (!task) { ctx.ui.notify(`Task ${id} not found.`, "error"); return; }
 
       const output = getTaskOutput(task);
+      // Persist any status change that getTaskOutput may have applied
+      saveTasks(tasks);
+      const lines = output.split("\n");
       ctx.ui.setWidget("task-" + id, [
         `┌─ ${id} [${task.status}] ${(task.exitCode != null ? ` exit=${task.exitCode}` : "")}`,
-        ...output.split("\n").slice(0, 10).map((l: string) => `│ ${l.substring(0, 100)}`),
-        output.split("\n").length > 10 ? `│ ... (${output.split("\n").length} lines total, /read ${task.logFile} for full)` : "",
-        `└─`.replace(/_/g, "─"),
+        ...lines.slice(0, 10).map((l: string) => `│ ${l.substring(0, 100)}`),
+        lines.length > 10 ? `│ ... (${lines.length} lines total, /read ${task.logFile} for full)` : "",
+        `└─`,
       ].filter(Boolean));
     },
   });
