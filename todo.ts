@@ -35,6 +35,52 @@ let detailWidgetActive = false;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/**
+ * Strip ANSI escape sequences (CSI + SGR) and C0 control characters from
+ * content before rendering into the widget.  Prevents user-supplied escape
+ * codes from corrupting widget layout or injecting formatting.
+ */
+function sanitizeContent(raw: string): string {
+  return raw
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")   // CSI / SGR sequences
+    .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "") // remaining C0 controls (bare ESC, CR, etc.)
+    .replace(/\t/g, " ")
+    .replace(/\n/g, " ");
+}
+
+/** Clear the full-detail widget and sync the toggle flag. */
+function clearDetailWidget(ctx?: any): void {
+  detailWidgetActive = false;
+  ctx?.ui?.setWidget?.("todo-detail", undefined);
+  _pi?.ui?.setWidget?.("todo-detail", undefined);
+}
+
+/**
+ * Find the most recent todo_write result in the session branch and
+ * restore `todo` from it.  Returns true when state was successfully
+ * restored, false when no todo_write was found.
+ */
+function restoreFromBranch(ctx?: any): boolean {
+  todo = { items: [], updatedAt: 0 };
+  try {
+    const branch = (ctx as any)?.sessionManager?.getBranch?.();
+    if (Array.isArray(branch)) {
+      for (const entry of branch) {
+        if (entry?.type !== "message") continue;
+        const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
+        // Array.isArray catches both populated and empty lists so that a
+        // todo_write that cleared everything is honoured on restore.
+        if (Array.isArray(details?.items)) {
+          todo = { items: details.items, updatedAt: Date.now() };
+        }
+      }
+    }
+    return todo.items.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function renderWidget(ctx?: any): void {
   const ui = ctx?.ui ?? _pi?.ui;
   if (!ui) return;
@@ -48,7 +94,7 @@ function renderWidget(ctx?: any): void {
   const total = todo.items.length;
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
 
-  // Show active items first: in_progress, then pending
+  // Show active items first: in_progress, then pending (stable sort preserves order)
   const sorted = [...active].sort((a, b) => {
     if (a.status === "in_progress" && b.status !== "in_progress") return -1;
     if (b.status === "in_progress" && a.status !== "in_progress") return 1;
@@ -62,11 +108,7 @@ function renderWidget(ctx?: any): void {
   for (let i = 0; i < limit; i++) {
     const item = sorted[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    // Strip control chars (including CR, excluding TAB/LF), then flatten whitespace
-    const safeContent = item.content
-      .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
-      .replace(/\t/g, " ")
-      .replace(/\n/g, " ");
+    const safeContent = sanitizeContent(item.content);
     if (item.status === "in_progress") {
       lines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
     } else {
@@ -137,11 +179,14 @@ export default function (pi: ExtensionAPI) {
       const inProgress = items.filter(i => i.status === "in_progress");
       if (inProgress.length > 1) {
         // Auto-fix: keep the last one as in_progress, demote the rest to pending
+        let demoted = 0;
         for (let i = 0; i < items.length; i++) {
           if (items[i].status === "in_progress" && items[i] !== inProgress[inProgress.length - 1]) {
             items[i].status = "pending";
+            demoted++;
           }
         }
+        warnings.push(`Auto-fixed: demoted ${demoted} extra in_progress item(s) → pending (only one allowed).`);
       }
 
       todo = { items, updatedAt: Date.now() };
@@ -161,8 +206,7 @@ export default function (pi: ExtensionAPI) {
       ];
 
       // Clear detail widget since todo was updated
-      detailWidgetActive = false;
-      ctx.ui?.setWidget?.("todo-detail", undefined);
+      clearDetailWidget(ctx);
 
       return { content: [{ type: "text", text: summary.join("\n") }], details: { count: items.length, counts, items: items.map(i => ({ content: i.content, status: i.status })) } };
     },
@@ -190,10 +234,7 @@ export default function (pi: ExtensionAPI) {
       detailLines.push(`┌─ Todo detail (${done}/${total} done) ─────────────`);
       for (const item of sorted) {
         const icon = STATUS_ICONS[item.status];
-        const safeContent = item.content
-          .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
-          .replace(/\t/g, " ")
-          .replace(/\n/g, " ");
+        const safeContent = sanitizeContent(item.content);
         if (item.status === "in_progress") {
           detailLines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
         } else {
@@ -219,46 +260,35 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: restore widget on resume ─────────────────────────
   pi.on("session_start", async (_event, ctx) => {
-    // Restore state from last todo_write result
-    try {
-      const branch = (ctx as any).sessionManager?.getBranch?.();
-      if (Array.isArray(branch)) {
-        for (const entry of branch) {
-          if (entry?.type !== "message") continue;
-          const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
-          if (details?.items?.length) todo = { items: details.items, updatedAt: Date.now() };
-        }
-      }
-    } catch { /* best effort — sessionManager may not be available */ }
-    detailWidgetActive = false;
+    // Ensure _pi is alive (may have been nulled by a prior shutdown)
+    _pi = _pi ?? pi;
+
+    // Restore state from the most recent todo_write in the session branch
+    restoreFromBranch(ctx);
+    // Always start with the compact widget (not the detail view)
+    clearDetailWidget(ctx);
     renderWidget(ctx);
   });
 
   // ── session_tree: rebuild state after tree navigation ────────────────
   pi.on("session_tree", async (_event, ctx) => {
-    todo = { items: [], updatedAt: 0 };
-    try {
-      const branch = (ctx as any).sessionManager?.getBranch?.();
-      if (Array.isArray(branch)) {
-        for (const entry of branch) {
-          if (entry?.type !== "message") continue;
-          const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
-          if (details?.items?.length) todo = { items: details.items, updatedAt: Date.now() };
-        }
-      }
-    } catch { /* best effort */ }
-    detailWidgetActive = false;
+    _pi = _pi ?? pi;
+    restoreFromBranch(ctx);
+    clearDetailWidget(ctx);
     renderWidget(ctx);
   });
 
-  // ── session_shutdown: clear widgets and references ───────────────────
+  // ── session_shutdown: clear widgets and release references ───────────
   pi.on("session_shutdown", () => {
     try {
       _pi?.ui?.setWidget?.("todo", undefined);
       _pi?.ui?.setWidget?.("todo-detail", undefined);
-    } catch { /* ignore */ }
+    } catch { /* ignore — ui may already be torn down */ }
     detailWidgetActive = false;
     todo = { items: [], updatedAt: 0 };
+    // Release the ExtensionAPI ref so the GC can collect it between sessions.
+    // session_start / session_tree will restore it from the module-scoped `pi`
+    // captured in the event-handler closures.
     _pi = null;
   });
 }

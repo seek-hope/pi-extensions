@@ -42,30 +42,52 @@ interface RemoteBgTask {
   host: string;
   logPath: string;
   cmd: string;
+  pid: string | null;
   startTime: number;
+  active: boolean; // whether a poll loop is currently running for this task
 }
 const remoteTasks: RemoteBgTask[] = [];
 
 // Poll remote background task and inject result when done
-function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: string): void {
-  if (!remoteTasks.some(t => t.logPath === logPath)) {
-    remoteTasks.push({ host, logPath, cmd, startTime: Date.now() });
+function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: string, pid: string | null): void {
+  // Prevent duplicate poll loops for the same task
+  const existing = remoteTasks.find(t => t.logPath === logPath);
+  if (existing) {
+    if (existing.active) return; // already polling
+    existing.active = true;
+  } else {
+    remoteTasks.push({ host, logPath, cmd, pid, startTime: Date.now(), active: true });
   }
+
   let lastSize = 0;
   let unchanged = 0;
   let errors = 0;
   const MAX_ERRORS = 5; // ~25s of failures before giving up
   let stopped = false;
 
+  function cleanup() {
+    if (!stopped) {
+      stopped = true;
+      const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+      if (idx >= 0) remoteTasks.splice(idx, 1);
+      try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+    }
+  }
+
   function check() {
     if (stopped) return;
     // Verify connection still alive before polling
     const conn2 = findConnection(host);
     if (!conn2 || !isConnected(conn2.key)) {
-      // Connection lost — clean up orphaned task
-      const idx = remoteTasks.findIndex(t => t.logPath === logPath);
-      if (idx >= 0) remoteTasks.splice(idx, 1);
-      try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+      // Connection lost — task result unreachable; log path is all we can report
+      if (_sshPi) {
+        _sshPi.sendUserMessage([
+          { type: "text", text: `[SSH background task on ${host} lost connection]` },
+          { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+          { type: "text", text: `Log on remote: ${logPath}` },
+        ], { deliverAs: "followUp" });
+      }
+      cleanup();
       return;
     }
     shellExec(conn2, `wc -c < '${logPath}' 2>/dev/null || echo 0`, 10_000).then(result => {
@@ -73,33 +95,26 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       const size = parseInt(result.trim(), 10) || 0;
       if (size === lastSize) {
         unchanged++;
-        if (unchanged >= 30) { // 2.5 min of stable output before declaring done
-          stopped = true;
-          try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
-          const idx = remoteTasks.findIndex(t => t.logPath === logPath);
-          if (idx >= 0) remoteTasks.splice(idx, 1);
-          // Re-verify connection before fetching the log
-          const conn3 = findConnection(host);
-          if (!conn3 || !isConnected(conn3.key)) {
-            // Connection lost — task result unreachable; log path is all we can report
-            if (_sshPi) {
-              _sshPi.sendUserMessage([
-                { type: "text", text: `[SSH background task completed on ${host} but connection lost]` },
-                { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
-                { type: "text", text: `Log on remote: ${logPath}` },
-              ], { deliverAs: "followUp" });
+        // After 5 iterations (25s) of stable file size, verify the process is truly done
+        if (unchanged >= 5) {
+          // Check if the background PID (if known) is still alive
+          const pidCheck = pid ? `kill -0 ${pid} 2>/dev/null && echo alive || echo dead` : "echo unknown";
+          shellExec(conn2, pidCheck, 8_000).then(pidResult => {
+            if (stopped) return;
+            const stillAlive = pidResult.trim() === "alive";
+            if (stillAlive) {
+              // Process still running — just slow/no output. Reset unchanged counter.
+              unchanged = 0;
+              try { _sshPi?.ui?.setStatus?.("ssh-bg", `🔄 SSH bg task running on ${host} (quiet)`); } catch { /* ok */ }
+              setTimeout(check, 5000);
+            } else {
+              // Process is dead (or PID unknown and size stable for long enough)
+              declareDone(conn2);
             }
-            return;
-          }
-          shellExec(conn3, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
-            if (_sshPi) {
-              _sshPi.sendUserMessage([
-                { type: "text", text: `[SSH background task completed on ${host}]` },
-                { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
-                { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
-              ], { deliverAs: "followUp" });
-            }
-          }).catch(() => {});
+          }).catch(() => {
+            // PID check failed — assume done since size is stable
+            declareDone(conn2);
+          });
           return;
         }
       } else {
@@ -111,14 +126,39 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
     }).catch(() => {
       errors++;
       if (errors < MAX_ERRORS && !stopped) { setTimeout(check, 5000); }
-      else {
-        // Give up — clean up task entry and status
-        const idx = remoteTasks.findIndex(t => t.logPath === logPath);
-        if (idx >= 0) remoteTasks.splice(idx, 1);
-        try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
-      }
+      else { cleanup(); }
     });
   }
+
+  function declareDone(c: Connection) {
+    if (stopped) return;
+    stopped = true;
+    try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+    const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+    if (idx >= 0) remoteTasks.splice(idx, 1);
+    // Re-verify connection before fetching the log
+    const conn3 = findConnection(host);
+    if (!conn3 || !isConnected(conn3.key)) {
+      if (_sshPi) {
+        _sshPi.sendUserMessage([
+          { type: "text", text: `[SSH background task completed on ${host} but connection lost]` },
+          { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+          { type: "text", text: `Log on remote: ${logPath}` },
+        ], { deliverAs: "followUp" });
+      }
+      return;
+    }
+    shellExec(c, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
+      if (_sshPi) {
+        _sshPi.sendUserMessage([
+          { type: "text", text: `[SSH background task completed on ${host}]` },
+          { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+          { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
+        ], { deliverAs: "followUp" });
+      }
+    }).catch(() => {});
+  }
+
   setTimeout(check, 3000);
 }
 
@@ -290,25 +330,53 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     }
     const reqId = ++conn.reqId;
     const rand = Math.random().toString(36).slice(2, 10);
+    let settled = false;
+    const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+
     const timer = setTimeout(() => {
-      if (conn.pending.has(reqId)) {
-        const entry = conn.pending.get(reqId)!;
-        conn.pending.delete(reqId);
-        if (entry.timer) clearTimeout(entry.timer);
-        const partial = conn.buf;
-        entry.reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${partial.substring(0, 1000)}`));
-      }
+      done(() => {
+        if (conn.pending.has(reqId)) {
+          const entry = conn.pending.get(reqId)!;
+          conn.pending.delete(reqId);
+          if (entry.timer) clearTimeout(entry.timer);
+          const partial = conn.buf;
+          entry.reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${partial.substring(0, 1000)}`));
+        }
+      });
     }, timeout);
+
+    // Wire up a one-shot error handler on stdin to catch pipe errors
+    const onStdinError = (err: Error) => {
+      done(() => {
+        clearTimeout(timer);
+        conn.pending.delete(reqId);
+        reject(new Error(`SSH stdin error: ${err.message}`));
+      });
+    };
+    conn.proc.stdin!.once("error", onStdinError);
+
     conn.pending.set(reqId, { resolve, reject, rand, timer });
+
     // Pass command directly via stdin — the shell reads lines and executes them
     // Don't wrap in quotes (that would treat semicolons literally)
-    const wrote = conn.proc.stdin.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
-    if (!wrote) {
-      // Backpressure: wait for drain before giving up
-      conn.proc.stdin.once("drain", () => {
-        // Data flushed — keep waiting for response
+    try {
+      const wrote = conn.proc.stdin!.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
+      if (!wrote) {
+        // Backpressure: wait for drain, but also listen for errors during drain
+        conn.proc.stdin!.once("drain", () => {
+          // Data flushed successfully — response will arrive via extractResponses
+          conn.proc.stdin!.removeListener("error", onStdinError);
+        });
+        // If the process dies during drain, the exit handler on the proc will reject
+      } else {
+        conn.proc.stdin!.removeListener("error", onStdinError);
+      }
+    } catch (writeErr: any) {
+      done(() => {
+        clearTimeout(timer);
+        conn.pending.delete(reqId);
+        reject(new Error(`SSH write failed: ${writeErr.message}`));
       });
-      // Still reject after timeout if response never arrives
     }
   });
 }
@@ -436,9 +504,14 @@ function findConnection(host: string): Connection | undefined {
 
 function closeConn(target: string, ctx: any): void {
   const t = target.toLowerCase();
+  // Empty target matches everything via substring — reject early
+  if (!t) {
+    ctx.ui.notify(`Usage: /ssh close <host>. Provide a hostname or alias.`, "warning");
+    return;
+  }
   // Exact match on alias or key first (case-insensitive)
   for (const [key, c] of connections) {
-    if (c.alias.toLowerCase() === t || c.key.toLowerCase() === t || c.key === target || c.alias === target) {
+    if (c.alias.toLowerCase() === t || c.key.toLowerCase() === t) {
       destroyConn(key, c, ctx);
       return;
     }
@@ -593,14 +666,18 @@ export default function (pi: ExtensionAPI) {
 
           // Long-running task: register BEFORE await to prevent concurrent dedup misses
           const logPath = `/tmp/pi-bg-${Date.now().toString(36)}.log`;
-          remoteTasks.push({ host: params.host, logPath, cmd: params.command, startTime: Date.now() });
+          remoteTasks.push({ host: params.host, logPath, cmd: params.command, pid: null, startTime: Date.now(), active: false });
 
           const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
           const result = await shellExec(conn, bgCmd, 15000);
           conn.lastUse = Date.now();
 
+          // Extract PID from result for liveness checks during polling
+          const pidMatch = result.match(/PID=(\d+)/);
+          const pid = pidMatch ? pidMatch[1] : null;
+
           // Poll remote log and inject result when done
-          pollRemoteTask(conn, logPath, params.command, params.host);
+          pollRemoteTask(conn, logPath, params.command, params.host, pid);
 
           return {
             content: [{
@@ -717,20 +794,30 @@ export default function (pi: ExtensionAPI) {
     syncFromDisk();
     const now = Date.now();
     const MAX_TASK_AGE = 60 * 60 * 1000; // 1 hour — older tasks are considered stale
-    for (const t of [...remoteTasks]) {
+    // Build a set of logPaths to remove (avoids findIndex-in-loop fragility)
+    const toRemove = new Set<string>();
+    for (const t of remoteTasks) {
       if (now - t.startTime > MAX_TASK_AGE) {
-        // Task too old — clean up without polling
-        const idx = remoteTasks.findIndex(rt => rt.logPath === t.logPath);
-        if (idx >= 0) remoteTasks.splice(idx, 1);
+        toRemove.add(t.logPath);
         continue;
       }
       const conn = findConnection(t.host);
       if (conn && isConnected(conn.key)) {
-        pollRemoteTask(conn, t.logPath, t.cmd, t.host);
+        // Reset active flag so pollRemoteTask starts a fresh loop
+        t.active = false;
+        pollRemoteTask(conn, t.logPath, t.cmd, t.host, t.pid);
       } else {
-        // Orphaned task — clean up
-        const idx = remoteTasks.findIndex(rt => rt.logPath === t.logPath);
-        if (idx >= 0) remoteTasks.splice(idx, 1);
+        toRemove.add(t.logPath);
+      }
+    }
+    // Batch-remove stale/orphaned tasks
+    if (toRemove.size > 0) {
+      for (let i = remoteTasks.length - 1; i >= 0; i--) {
+        if (toRemove.has(remoteTasks[i].logPath)) remoteTasks.splice(i, 1);
+      }
+      // Clear status if no tasks remain
+      if (remoteTasks.length === 0) {
+        try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
       }
     }
   });
