@@ -219,35 +219,37 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: restore widget on resume ─────────────────────────
   pi.on("session_start", async (_event, ctx) => {
-    // Reconstruct state from last todo_write result in the current branch
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "message") continue;
-      const msg = entry.message;
-      if (msg.role === "toolResult" && msg.toolName === "todo_write") {
-        const details = msg.details as { items?: TodoItem[]; updatedAt?: number } | undefined;
-        if (details?.items) {
-          todo = { items: details.items, updatedAt: details.updatedAt || Date.now() };
+    // Restore state from last todo_write result
+    try {
+      const branch = (ctx as any).sessionManager?.getBranch?.();
+      if (Array.isArray(branch)) {
+        for (const entry of branch) {
+          if (entry?.type !== "message") continue;
+          const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
+          if (details?.items?.length) todo = { items: details.items, updatedAt: Date.now() };
         }
       }
-    }
+    } catch { /* best effort — sessionManager may not be available */ }
     detailWidgetActive = false;
     renderWidget(ctx);
   });
 
   // ── session_tree: rebuild state after tree navigation ────────────────
   pi.on("session_tree", async (_event, ctx) => {
-    // Reset and reconstruct for the new branch point
     todo = { items: [], updatedAt: 0 };
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "message") continue;
-      const msg = entry.message;
-      if (msg.role === "toolResult" && msg.toolName === "todo_write") {
-        const details = msg.details as { items?: TodoItem[]; updatedAt?: number } | undefined;
-        if (details?.items) {
-          todo = { items: details.items, updatedAt: details.updatedAt || Date.now() };
+    try {
+      const branch = (ctx as any).sessionManager?.getBranch?.();
+      if (Array.isArray(branch)) {
+        for (const entry of branch) {
+          if (entry?.type !== "message") continue;
+          const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
+          if (details?.items?.length) todo = { items: details.items, updatedAt: Date.now() };
         }
       }
-    }
+    } catch { /* best effort */ }
+    detailWidgetActive = false;
+    renderWidget(ctx);
+  });
     detailWidgetActive = false;
     ctx.ui?.setWidget?.("todo-detail", undefined);
     renderWidget(ctx);
