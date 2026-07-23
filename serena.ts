@@ -363,7 +363,11 @@ async function startServer(cwd: string): Promise<void> {
         capabilities: {},
         clientInfo: { name: "pi-coding-agent", version: "1.0.0" },
       }, INITIALIZE_TIMEOUT_MS);
-      mcpNotify(state, "initialized", {});
+      try {
+        mcpNotify(state, "initialized", {});
+      } catch {
+        // Non-critical: failure to send initialized notification is not fatal
+      }
       state.ready = true;
     } catch (error) {
       const initError = asError(error, "Failed to initialize Serena MCP server");
