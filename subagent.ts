@@ -780,7 +780,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
       "Use mode='analyze' for research/exploration tasks — it self-improves the analysis quality.",
-      "Use mode='improve' after a sub-agent completes, to auto-polish via review→fix loop.",
+      "Use subagent_spawn with mode='improve' on an EXISTING sub-agent ID (spawn first, then improve).",
       "Use mode='execute' with a todo list to churn through tasks, each with its own improve loop.",
       "Without mode: simple fire-and-forget spawn. Use subagent_review then merge/reject.",
       "Always review sub-agent output before merging — never merge blindly.",
@@ -808,7 +808,10 @@ export default function (pi: ExtensionAPI) {
 
       // ── IMPROVE mode ────────────────────────────────────────────────
       if (params.mode === "improve") {
-        const result = await handleImproveMode(params.subagentId || null, ctx.cwd, params.criteria, maxIt);
+        if (!params.subagentId) {
+          return { content: [{ type: "text", text: "improve mode requires subagentId — spawn a sub-agent first, then improve it." }], details: {}, isError: true };
+        }
+        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, maxIt);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
       }
 
