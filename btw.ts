@@ -54,7 +54,7 @@ class ScrollViewer {
 
   private visibleLines(): number {
     // Terminal height minus header/footer/borders (~6 lines overhead)
-    return Math.max(5, process.stdout.rows - 8);
+    const rows = process.stdout.rows || 24; return Math.max(5, rows - 8);
   }
 
   render(width: number): string[] {

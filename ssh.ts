@@ -72,7 +72,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       const size = parseInt(result.trim(), 10) || 0;
       if (size === lastSize) {
         unchanged++;
-        if (unchanged >= 5) {
+        if (unchanged >= 30) { // 2.5 min of stable output before declaring done
           stopped = true;
           try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
           const idx = remoteTasks.findIndex(t => t.logPath === logPath);

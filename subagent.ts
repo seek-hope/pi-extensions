@@ -1225,6 +1225,9 @@ export default function (pi: ExtensionAPI) {
         const fixerResult = await runSubProcess(fixPrompt, fixCwd, _defaultModel);
         const fixerOutput = fixerResult.stdout + fixerResult.stderr;
 
+        // Commit fixes so next review round sees corrected code
+        if (existingAgent) commitWorktree(fixCwd, existingAgent.id, `audit fix round ${r}`);
+
         rounds[rounds.length - 1].fixerResult = fixerOutput.substring(0, 2000);
       }
 
