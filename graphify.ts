@@ -6,9 +6,7 @@ import { Type } from "typebox";
 import { execFileSync } from "node:child_process";
 
 function run(args: string[]): string {
-  try {
-    return execFileSync("graphify", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 120_000 }).trim();
-  } catch (e: any) { return e.stderr || e.message || ""; }
+  return execFileSync("graphify", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 120_000 }).trim();
 }
 
 export default function (pi: ExtensionAPI) {
