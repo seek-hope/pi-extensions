@@ -147,7 +147,10 @@ export default function (pi: ExtensionAPI) {
         }),
       ];
 
-      return { content: [{ type: "text", text: summary.join("\n") }], details: { count: items.length, counts } };
+      // Clear detail widget since todo was updated
+      ctx.ui?.setWidget?.("todo-detail", undefined);
+
+      return { content: [{ type: "text", text: summary.join("\n") }], details: { count: items.length, counts, items: items.map(i => ({ content: i.content, status: i.status })) } };
     },
   });
 

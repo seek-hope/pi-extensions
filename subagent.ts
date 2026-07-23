@@ -780,14 +780,20 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       let tasks: string[];
-      try { tasks = JSON.parse(params.tasks); } catch {
+      try {
+        const parsed = JSON.parse(params.tasks);
+        if (!Array.isArray(parsed) || parsed.some((t: any) => typeof t !== "string")) {
+          return { content: [{ type: "text", text: "tasks must be a JSON array of strings." }], details: {}, isError: true };
+        }
+        tasks = parsed;
+      } catch {
         tasks = params.tasks.split("\n").filter((t: string) => t.trim());
       }
       if (tasks.length === 0) {
         return { content: [{ type: "text", text: "No tasks provided." }], details: {}, isError: true };
       }
 
-      const maxCon = params.maxConcurrency || 5;
+      const maxCon = Math.max(Math.floor(params.maxConcurrency || 5), 1);
       const results: { task: string; id: string; result: string; status: string; elapsed: number; commitHash?: string }[] = [];
 
       for (let i = 0; i < tasks.length; i += maxCon) {
@@ -1037,6 +1043,9 @@ export default function (pi: ExtensionAPI) {
         const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
         const issuesCount = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
 
+        // Require both CLEAN:true AND FOUND:0 to pass
+        const shouldPass = isClean && issuesCount === 0;
+
         iterations.push({
           iter: i,
           reviewerResult: reviewerOutput.substring(0, 3000),
@@ -1045,7 +1054,7 @@ export default function (pi: ExtensionAPI) {
           clean: isClean,
         });
 
-        if (isClean || issuesCount === 0) {
+        if (shouldPass) {
           // Done!
           const summary = buildRefineSummary(params.id, ag, iterations, true);
           return { content: [{ type: "text", text: summary }], details: { iterations: i, clean: true } };
@@ -1181,7 +1190,7 @@ export default function (pi: ExtensionAPI) {
 
         rounds.push({ round: r, issuesFound, reviewerResult: reviewerOutput.substring(0, 3000), fixerResult: "", clean: isClean });
 
-        if (isClean || issuesFound === 0) {
+        if (isClean && issuesFound === 0) {
           const summary = [
             `┌─ Audit Complete ─────────────────────────────`,
             `│ Target: ${targetDesc}`,
@@ -1275,7 +1284,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
       }
       ag.status = "cancelled";
-      ag.proc?.kill();
+      if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
       cleanupWorktree(ctx.cwd, params.id, true);
       subAgents.delete(params.id);
       return { content: [{ type: "text", text: `Sub-agent ${params.id} cancelled. Worktree and branch removed.` }], details: {} };

@@ -49,34 +49,36 @@ function getCursorPos(): { x: number; y: number } {
   throw new Error(`Unable to parse cursor position from hyprctl output: "${out}"`);
 }
 
-function getScreenBounds(): { width: number; height: number; monitors: string } {
+function getScreenBounds(): { width: number; height: number; monitors: string; minX: number; minY: number } {
   const out = sh("hyprctl monitors");
   if (!out) throw new Error("hyprctl monitors returned no output");
-  let maxX = 0, maxY = 0;
-  const re = /(\d+)x(\d+)@[\d.]+ at (\d+)x(\d+)/g;
+  let minX = 0, minY = 0, maxX = 0, maxY = 0;
+  const re = /(-?\d+)x(-?\d+)@[\d.]+ at (-?\d+)x(-?\d+)/g;
   let m;
   while ((m = re.exec(out)) !== null) {
     const w = parseInt(m[1]), h = parseInt(m[2]);
     const x = parseInt(m[3]), y = parseInt(m[4]);
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
     maxX = Math.max(maxX, x + w);
     maxY = Math.max(maxY, y + h);
   }
-  return { width: maxX || 2560, height: maxY || 1440, monitors: out };
+  return { width: Math.max(maxX - minX, 2560), height: Math.max(maxY - minY, 1440), monitors: out, minX, minY };
 }
 
-/** Convert normalized coordinates (0-1000 scale) to absolute pixel coords */
-function normalizeToPixel(nx: number, ny: number, bound: { width: number; height: number }) {
+/** Convert normalized (0-1000) coords to absolute pixel, accounting for monitor origin offset */
+function normalizeToPixel(nx: number, ny: number, bound: { width: number; height: number; minX: number; minY: number }) {
   return {
-    x: Math.round((nx / 1000) * bound.width),
-    y: Math.round((ny / 1000) * bound.height),
+    x: Math.round((nx / 1000) * bound.width + bound.minX),
+    y: Math.round((ny / 1000) * bound.height + bound.minY),
   };
 }
 
-/** Clamp coordinates to screen bounds */
-function clamp(x: number, y: number, bound: { width: number; height: number }) {
+/** Clamp to screen bounds accounting for non-zero origin */
+function clamp(x: number, y: number, bound: { width: number; height: number; minX: number; minY: number }) {
   return {
-    x: Math.max(0, Math.min(x, bound.width - 1)),
-    y: Math.max(0, Math.min(y, bound.height - 1)),
+    x: Math.max(bound.minX, Math.min(x, bound.minX + bound.width - 1)),
+    y: Math.max(bound.minY, Math.min(y, bound.minY + bound.height - 1)),
   };
 }
 
@@ -204,7 +206,8 @@ export default function (pi: ExtensionAPI) {
         }
 
         await moveToVerified(tx, ty, bound);
-        return { content: [{ type: "text", text: `Moved to (${tx}, ${ty})` }], details: { x: tx, y: ty } };
+        const final = clamp(tx, ty, bound);
+        return { content: [{ type: "text", text: `Moved to (${final.x}, ${final.y})` }], details: { x: final.x, y: final.y } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Move failed: ${e.message}` }], details: {}, isError: true };
       }
@@ -325,8 +328,10 @@ export default function (pi: ExtensionAPI) {
 
         for (const p of parts) {
           const trimmed = p.trim();
-          if (["ctrl", "alt", "shift", "super"].includes(trimmed)) {
-            modifiers.push(trimmed);
+          if (["ctrl", "alt", "shift", "super", "logo", "win"].includes(trimmed)) {
+            // Map common names to wtype's expected names
+            const modName = trimmed === "super" || trimmed === "win" ? "logo" : trimmed;
+            modifiers.push(modName);
           } else {
             keys.push(trimmed);
           }
@@ -367,7 +372,7 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: "Scroll amount is 0 — nothing to do." }], details: { amount: 0 } };
         }
         const dir = params.amount > 0 ? 4 : 5; // 4=up, 5=down
-        const count = Math.min(Math.abs(params.amount), 20); // Cap at 20 for sanity
+        const count = Math.min(Math.ceil(Math.abs(params.amount)), 20); // Round up fractional, cap at 20
         for (let i = 0; i < count; i++) {
           await ydotoolRetry(`ydotool click ${dir}`, 3, 50);
         }
