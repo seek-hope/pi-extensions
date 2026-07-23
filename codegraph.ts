@@ -13,7 +13,7 @@ function run(args: string[], cwd: string): string {
     cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
-    timeout: 60_000,
+    timeout: 120_000,
   });
 }
 
