@@ -545,7 +545,7 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
   const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000);
   const depth = currentDepth();
   return new Promise((resolve) => {
-    const args: string[] = ["-p", "--no-context-files", "--no-session"];
+    const args: string[] = ["-p"];
     if (model) args.push("--model", model);
     args.push(task);
     const proc = spawn("pi", args, {
@@ -689,11 +689,7 @@ function spawnSubAgent(
   subAgents.set(id, agent);
 
   const promise = new Promise<string>((resolve) => {
-    const args: string[] = [
-      "-p",
-      "--no-context-files",
-      "--no-session",
-    ];
+    const args: string[] = ["-p"];
     if (options?.model) args.push("--model", options.model);
     if (options?.tools) {
       const toolsArg = Array.isArray(options.tools) ? options.tools.join(",") : options.tools;
