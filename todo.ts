@@ -88,13 +88,11 @@ export default function (pi: ExtensionAPI) {
       "Each item has a status: pending (not started), in_progress (currently working on), " +
       "completed (done), cancelled (no longer needed).\n\n" +
       "Only ONE item should be in_progress at a time. Complete current items before starting new ones.",
+    promptSnippet: "Plan tasks before executing: todo_write → work → mark done.",
     promptGuidelines: [
-      "Use todo_write BEFORE starting complex multi-step tasks to create a plan.",
-      "Mark items as in_progress when you start working on them, completed when done.",
-      "Only ONE item in_progress at a time. Finish or pause before starting another.",
-      "If the plan changes, update the todo list — add, remove, or reorder items as needed.",
-      "At the end of a session, all items should be completed or cancelled.",
-      "Keep item descriptions short and action-oriented (e.g., 'Fix login bug' not 'Work on auth').",
+      "MANDATORY: Use todo_write BEFORE any task with 3+ steps. Plan first, then execute.",
+      "Mark exactly ONE item in_progress at a time. Complete before starting next.",
+      "Update status as you work: pending → in_progress → completed/cancelled.",
     ],
     parameters: Type.Object({
       items: Type.Array(Type.Object({
