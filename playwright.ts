@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
 const PROCESS_TIMEOUT_MS = 60_000;
-const MAX_BUFFER_BYTES = 64 * 1024;
+const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 const GLOBAL_NODE_MODULES = join(homedir(), ".npm", "lib", "node_modules");
 const NODE_PATH = [GLOBAL_NODE_MODULES, process.env.NODE_PATH].filter(Boolean).join(delimiter);
 
