@@ -51,9 +51,6 @@ function branchName(id: string): string {
 
 // ── Unified Review Loop Engine ─────────────────────────────────────────────
 
-/** Modes for the unified subagent workflow */
-type LoopMode = "analyze" | "improve" | "execute";
-
 interface LoopResult {
   iterations: number;
   clean: boolean;
@@ -81,23 +78,38 @@ async function reviewLoop(
     });
     const reviewerOutput = await reviewPromise;
     subAgents.delete(reviewerId);
+    cleanupWorktree(projectRoot(ctxCwd), reviewerId, true);
+
+    // Abort if reviewer failed to spawn (error message instead of review)
+    if (reviewerOutput.startsWith("[Sub-agent error]") || reviewerOutput.startsWith("[Sub-agent denied]")) {
+      return { iterations: i, clean: false, summary: `❌ Reviewer failed at round ${i}: ${reviewerOutput.substring(0, 200)}` };
+    }
 
     const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
     const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
     const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
     const issuesCount = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
+    // Guard: CLEAN: false but FOUND: 0 is contradictory — ensure at least 1 fix iteration
+    const actualIssuesCount = (!isClean && issuesCount === 0) ? 1 : issuesCount;
 
-    iterations.push({ iter: i, issuesFound: issuesCount, clean: isClean });
+    iterations.push({ iter: i, issuesFound: actualIssuesCount, clean: isClean });
 
-    if (isClean && issuesCount === 0) {
+    if (isClean && actualIssuesCount === 0) {
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
       return { iterations: i, clean: true, summary: `✅ CLEAN after ${i} rounds\n` + summary };
     }
 
-    const fixerOutput = await runAction(issuesCount, reviewerOutput, i);
-    if (commitPrefix) commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${issuesCount} issue(s)`);
+    const fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i);
+    // Detect fixer failure — empty output or spawn errors
+    if (!fixerOutput || fixerOutput.trim().length === 0) {
+      return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
+    }
+    if (fixerOutput.startsWith("[Sub-agent error") || fixerOutput.startsWith("[Sub-agent spawn error")) {
+      return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
+    }
+    if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
   }
 
   const summary = iterations.map(it =>
@@ -105,8 +117,6 @@ async function reviewLoop(
   ).join("\n");
   return { iterations: maxIterations, clean: false, summary: `⚠ MAX ROUNDS (${maxIterations})\n` + summary };
 }
-
-// ── git helpers ─────────────────────────────────────────────────────────────
 
 // ── Mode Handlers ───────────────────────────────────────────────────────
 
@@ -122,6 +132,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): P
   });
   let analysis = await rPromise;
   subAgents.delete(rId);
+  cleanupWorktree(projectRoot(ctxCwd), rId, true);
 
   // Phase 2: review loop — improve analysis quality iteratively
   const result = await reviewLoop(
@@ -133,13 +144,15 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): P
       `If CLEAN: true, just write "CLEAN: true".`,
     ].join("\n"),
     async (_c, reviewerOutput, _i) => {
-      const { promise } = spawnSubAgent(
+      const { id: fixerId, promise } = spawnSubAgent(
         `Improve this analysis based on feedback. Produce a complete final analysis. DO NOT modify files.\n\n` +
         `Feedback: ${reviewerOutput.substring(0, 4000)}`,
         ctxCwd,
         { model: _defaultModel, tools: ["read", "bash", "serena_search_pattern"] }
       );
       const improved = await promise;
+      subAgents.delete(fixerId);
+      cleanupWorktree(projectRoot(ctxCwd), fixerId, true);
       analysis = improved; // update for next review round
       return improved;
     },
@@ -160,13 +173,31 @@ async function handleImproveMode(
     return { iterations: 0, clean: false, summary: "Sub-agent still running." };
   }
 
-  const workCwd = existing?.worktreePath || ctxCwd;
-  const diffContent = targetAgentId ? getDiff(ctxCwd, targetAgentId) : null;
+  // If targetAgentId given but agent not in map, try to reconstruct worktree path
+  let workCwd: string;
+  if (existing) {
+    workCwd = existing.worktreePath;
+  } else if (targetAgentId) {
+    const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", targetAgentId);
+    if (existsSync(reconstructed)) {
+      workCwd = reconstructed;
+    } else {
+      // Branch may have been cleaned up already
+      try { git(["rev-parse", "--verify", branchName(targetAgentId)], ctxCwd); } catch {
+        return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} not found (branch cleaned up).` };
+      }
+      return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} branch exists but worktree is missing.` };
+    }
+  } else {
+    workCwd = ctxCwd;
+  }
+
   const reviewCriteria = criteria || "Check correctness, security, performance, style, edge cases, and completeness.";
 
   return reviewLoop(
     ctxCwd, workCwd,
     (_i) => {
+      const diffContent = targetAgentId ? getDiff(ctxCwd, targetAgentId) : null;
       const parts = [`Review criteria: ${reviewCriteria}`];
       if (diffContent) parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
@@ -175,10 +206,14 @@ async function handleImproveMode(
     async (issuesCount, reviewerOutput, _i) => {
       const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits.`;
       const r = await runSubProcess(task, workCwd, _cheapModel);
-      return r.stdout + r.stderr;
+      const output = r.stdout + r.stderr;
+      if (r.exitCode !== 0 && (!output || output.trim().length === 0)) {
+        return `[Sub-agent error] Fixer exited with code ${r.exitCode}: ${r.stderr.substring(0, 200)}`;
+      }
+      return output;
     },
     maxIt,
-    targetAgentId || "improve"
+    targetAgentId ? `improve-${targetAgentId}` : "improve"
   );
 }
 
@@ -193,22 +228,30 @@ async function handleExecuteMode(
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    // Execute
     const { id: execId, promise: execPromise } = spawnSubAgent(
       `Execute: ${item.description}. Make changes as needed.`,
       ctxCwd
     );
-    await execPromise;
-
-    // Improve
-    const ag = subAgents.get(execId);
-    if (ag) {
-      const ir = await handleImproveMode(execId, ctxCwd, undefined, maxIt);
-      results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
-      if (!ir.clean) allClean = false;
-    } else {
-      results.push(`${i + 1}. ${item.description}: ✗ failed`);
-      allClean = false;
+    try {
+      await execPromise;
+      const ag = subAgents.get(execId);
+      if (ag) {
+        if (ag.status === "error") {
+          results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || "").substring(0, 100)})`);
+          allClean = false;
+        } else {
+          const ir = await handleImproveMode(execId, ctxCwd, undefined, maxIt);
+          results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
+          if (!ir.clean) allClean = false;
+        }
+      } else {
+        results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
+        allClean = false;
+      }
+    } finally {
+      // Always clean up worktree, even if handleImproveMode throws
+      cleanupWorktree(projectRoot(ctxCwd), execId, true);
+      subAgents.delete(execId);
     }
   }
 
@@ -264,7 +307,11 @@ function ensureGitRepo(projectRoot: string): string {
   }
 
   // Force init
-  git(["init"], projectRoot);
+  try {
+    git(["init"], projectRoot);
+  } catch (e: any) {
+    throw new Error(`git init failed: ${e.stderr || e.message}`);
+  }
   // Create initial commit so worktree add works
   try {
     git(["add", "-A", "--ignore-errors"], projectRoot);
@@ -302,9 +349,16 @@ function createWorktree(projectRoot: string, id: string): string {
   catch (e: any) { throw new Error(`Failed to create branch ${branch}: ${e.message || e}`); }
 
   // Create worktree (stderr contains progress; check for fatals)
-  const addOut = gitQuiet(["worktree", "add", wtDir, branch], projectRoot);
-  if (addOut.toLowerCase().includes("fatal") || addOut.toLowerCase().includes("error:")) {
-    throw new Error(`Worktree add failed: ${addOut.trim()}`);
+  // Wrap in try-catch to clean up the orphan branch if worktree add fails
+  try {
+    const addOut = gitQuiet(["worktree", "add", wtDir, branch], projectRoot);
+    if (addOut.toLowerCase().includes("fatal") || addOut.toLowerCase().includes("error:")) {
+      throw new Error(`Worktree add failed: ${addOut.trim()}`);
+    }
+  } catch (e: any) {
+    // Branch was created but worktree failed — clean up the orphan branch
+    gitQuiet(["branch", "-D", branch], projectRoot);
+    throw e;
   }
 
   return wtDir;
@@ -350,7 +404,7 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 // ── depth tracking ─────────────────────────────────────────────────────────
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
-function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string }> {
+function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000);
   return new Promise((resolve) => {
     const args: string[] = ["-p", "--no-context-files", "--no-session"];
@@ -360,12 +414,13 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
     let stdout = "";
     let stderr = "";
     let resolved = false;
+    let exitCode: number | null = null;
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    const done = () => { if (!resolved) { resolved = true; clearTimeout(timer); resolve({ stdout, stderr }); } };
-    proc.on("close", done);
+    const done = () => { if (!resolved) { resolved = true; clearTimeout(timer); resolve({ stdout, stderr, exitCode }); } };
+    proc.on("close", (code) => { exitCode = code; done(); });
     proc.on("error", () => done());
-    const timer = setTimeout(() => { proc.kill("SIGKILL"); done(); }, killTimeout);
+    const timer = setTimeout(() => { proc.kill("SIGKILL"); exitCode = -1; done(); }, killTimeout);
   });
 }
 
@@ -416,7 +471,16 @@ function spawnSubAgent(
   const startTime = Date.now();
 
   // Use original project root (set by top-level pi), not worktree cwd
-  const root = ensureGitRepo(projectRoot(cwd));
+  let root: string;
+  try {
+    root = ensureGitRepo(projectRoot(cwd));
+  } catch (e: any) {
+    const errMsg = `Failed to initialize git repository: ${e.message}`;
+    return {
+      id,
+      promise: Promise.resolve(`[Sub-agent error] ${errMsg}`),
+    };
+  }
   let worktreePath: string;
   try {
     worktreePath = createWorktree(root, id);
@@ -600,7 +664,7 @@ export default function (pi: ExtensionAPI) {
           if (!ag) { ctx.ui.notify(`No sub-agent: ${rest}`, "error"); return; }
           ag.status = "cancelled";
           ag.proc?.kill();
-          cleanupWorktree(ctx.cwd, rest, true);
+          cleanupWorktree(projectRoot(ctx.cwd), rest, true);
           subAgents.delete(rest);
           ctx.ui.notify(`Sub-agent ${rest} cancelled and cleaned up.`, "info");
           return;
@@ -902,7 +966,7 @@ export default function (pi: ExtensionAPI) {
         if (ag) ag.status = "merged";
 
         // Clean up worktree (keep branch for history)
-        cleanupWorktree(ctx.cwd, params.id, false);
+        cleanupWorktree(projectRoot(ctx.cwd), params.id, false);
         subAgents.delete(params.id);
 
         return {
@@ -951,7 +1015,7 @@ export default function (pi: ExtensionAPI) {
       }
       ag.status = "rejected";
 
-      cleanupWorktree(ctx.cwd, params.id, true);
+      cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
       subAgents.delete(params.id);
 
       return {
@@ -1129,14 +1193,22 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are an exploration agent. You can ONLY read and search — you CANNOT write, edit, or delete anything. Focus on finding information quickly and reporting it concisely.",
       });
-      // Non-blocking: worktree preserved — use subagent_review then subagent_reject to clean up
-      promise.catch(() => {});
+      // Wait and auto-cleanup (read-only, no changes to merge)
+      const result = await promise;
+      cleanupWorktree(projectRoot(ctx.cwd), id, true);
+      subAgents.delete(id);
       return {
         content: [{
           type: "text",
-          text: `Explore agent spawned. ID: ${id}\nTask: ${params.task}\n\nUse subagent_wait("${id}") to collect the result.`,
+          text: [
+            `=== Explore: ${params.task} ===`,
+            "",
+            result || "(empty result)",
+            "",
+            `Agent ${id} cleaned up.`,
+          ].join("\n"),
         }],
-        details: { subagentId: id },
+        details: { subagentId: id, result: result?.substring(0, 2000) },
       };
     },
   });
@@ -1167,14 +1239,22 @@ export default function (pi: ExtensionAPI) {
         tools: "read,bash,codegraph_search,codegraph_explore,serena_find_symbol,serena_search_pattern",
         systemPrompt: "You are a planning agent. You explore the codebase to understand the current state, then design a step-by-step implementation plan. You do NOT modify any files — you only READ and PLAN. Your output should be a clear, actionable plan.",
       });
-      // Non-blocking: worktree preserved — use subagent_review then subagent_reject to clean up
-      promise.catch(() => {});
+      // Wait and auto-cleanup (read-only, produces no files to merge)
+      const result = await promise;
+      cleanupWorktree(projectRoot(ctx.cwd), id, true);
+      subAgents.delete(id);
       return {
         content: [{
           type: "text",
-          text: `Plan agent spawned. ID: ${id}\nTask: ${params.task}\n\nUse subagent_wait("${id}") to collect the plan.`,
+          text: [
+            `=== Plan: ${params.task} ===`,
+            "",
+            result || "(empty plan)",
+            "",
+            `Agent ${id} cleaned up. Use the plan above to guide implementation.`,
+          ].join("\n"),
         }],
-        details: { subagentId: id },
+        details: { subagentId: id, result: result?.substring(0, 2000) },
       };
     },
   });
@@ -1245,22 +1325,24 @@ export default function (pi: ExtensionAPI) {
         });
         const reviewerOutput = await reviewPromise;
         subAgents.delete(reviewerId);
-        cleanupWorktree(ctx.cwd, reviewerId, true);
+        cleanupWorktree(projectRoot(ctx.cwd), reviewerId, true);
 
         // Parse reviewer output
         const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
         const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
         const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
         const issuesCount = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
+        // Guard: CLEAN: false but FOUND: 0 is contradictory — ensure at least 1 fix iteration
+        const actualIssuesCount = (!isClean && issuesCount === 0) ? 1 : issuesCount;
 
         // Require both CLEAN:true AND FOUND:0 to pass
-        const shouldPass = isClean && issuesCount === 0;
+        const shouldPass = isClean && actualIssuesCount === 0;
 
         iterations.push({
           iter: i,
           reviewerResult: reviewerOutput.substring(0, 3000),
           fixerResult: "",
-          issuesFound: issuesCount,
+          issuesFound: actualIssuesCount,
           clean: isClean,
         });
 
@@ -1391,16 +1473,18 @@ export default function (pi: ExtensionAPI) {
         });
         const reviewerOutput = await reviewPromise;
         subAgents.delete(reviewerId);
-        cleanupWorktree(ctx.cwd, reviewerId, true);
+        cleanupWorktree(projectRoot(ctx.cwd), reviewerId, true);
 
         const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
         const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
         const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
         const issuesFound = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
+        // Guard: CLEAN: false but FOUND: 0 is contradictory — ensure at least 1 fix iteration
+        const actualIssuesFound = (!isClean && issuesFound === 0) ? 1 : issuesFound;
 
-        rounds.push({ round: r, issuesFound, reviewerResult: reviewerOutput.substring(0, 3000), fixerResult: "", clean: isClean });
+        rounds.push({ round: r, issuesFound: actualIssuesFound, reviewerResult: reviewerOutput.substring(0, 3000), fixerResult: "", clean: isClean });
 
-        if (isClean && issuesFound === 0) {
+        if (isClean && actualIssuesFound === 0) {
           const summary = [
             `┌─ Audit Complete ─────────────────────────────`,
             `│ Target: ${targetDesc}`,
@@ -1498,7 +1582,7 @@ export default function (pi: ExtensionAPI) {
       }
       ag.status = "cancelled";
       if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
-      cleanupWorktree(ctx.cwd, params.id, true);
+      cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
       subAgents.delete(params.id);
       return { content: [{ type: "text", text: `Sub-agent ${params.id} cancelled. Worktree and branch removed.` }], details: {} };
     },
