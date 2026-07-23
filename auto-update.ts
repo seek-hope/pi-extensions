@@ -63,7 +63,7 @@ export default function (pi: ExtensionAPI) {
       // 5. Update gh CLI (system)
       ctx.ui.notify("Updating gh CLI...", "info");
       results.push("\n=== gh CLI ===");
-      results.push(sh("gh --version 2>&1 && (sudo apt update -qq && sudo apt install -y gh 2>&1) || echo 'apt not available, manual update required'"));
+      results.push(sh("gh --version 2>&1 && (sudo apt update -qq -o APT::Status-Fd=0 && sudo apt install -y gh 2>&1) || echo 'apt not available, manual update required'"));
 
       // 6. Update rust-analyzer
       results.push("\n=== rust-analyzer ===");
@@ -118,7 +118,7 @@ export default function (pi: ExtensionAPI) {
         run("System: ydotool (mouse)", () => sh("pacman -Q ydotool 2>&1 || echo 'not via pacman'"));
         run("System: wtype (keyboard)", () => sh("pacman -Q wtype 2>&1 || echo 'not via pacman'"));
         run("System: tmux", () => sh("tmux -V 2>&1"));
-        run("gh CLI", () => sh("(sudo apt update -qq 2>/dev/null && sudo apt install -y gh 2>&1) || echo 'gh version:' $(gh --version | head -1)"));
+        run("gh CLI", () => sh("(sudo apt update -qq -o APT::Status-Fd=0 2>/dev/null && sudo apt install -y gh 2>&1) || echo 'gh version:' $(gh --version | head -1)"));
         run("rust-analyzer", () => sh("rustup component add rust-analyzer 2>&1 || echo 'version:' $(rust-analyzer --version 2>&1 | head -1)"));
         run("clangd", () => sh("clangd --version 2>&1 | head -1"));
       }
