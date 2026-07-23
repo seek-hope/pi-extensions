@@ -52,7 +52,16 @@ let _cheapModel: string | undefined;
 try {
   const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf-8"));
   _defaultModel = cfg.defaultModel;
-  _cheapModel = _defaultModel?.replace(/pro/i, "flash") || _defaultModel;
+  // Derive a cheaper/faster model for analyze/exploration tasks:
+  // 1. Use explicit cheapModel from settings if available
+  // 2. Fall back to replacing "pro" → "flash" (common naming convention across providers)
+  // 3. If neither produces a different model, cheapModel stays undefined (default model is used)
+  if (cfg.cheapModel && typeof cfg.cheapModel === "string") {
+    _cheapModel = cfg.cheapModel;
+  } else if (_defaultModel) {
+    const derived = _defaultModel.replace(/pro/i, "flash");
+    _cheapModel = derived !== _defaultModel ? derived : undefined;
+  }
 } catch (e: any) { /* settings file may not exist yet */ }
 
 function branchName(id: string): string {
@@ -198,17 +207,20 @@ async function handleImproveMode(
     workCwd = existing.worktreePath;
   } else if (targetAgentId) {
     const safe = safeId(targetAgentId);
-    const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", safe);
+    // Use hash-based fallback if safeId fails — ensures deterministic paths
+    // Use the same fallback logic as branchName() to reconstruct the worktree path
+    const dirComponent = safe || `fallback-${createHash("sha1").update(targetAgentId).digest("hex").substring(0, 12)}`;
+    const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", dirComponent);
     if (existsSync(reconstructed)) {
       // Verify the branch still exists — worktree without branch is useless
-      try { git(["rev-parse", "--verify", branchName(safe)], ctxCwd); }
+      try { git(["rev-parse", "--verify", branchName(targetAgentId)], ctxCwd); }
       catch {
         return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree exists but branch is missing.` };
       }
       workCwd = reconstructed;
     } else {
       // Branch may have been cleaned up already
-      try { git(["rev-parse", "--verify", branchName(safe)], ctxCwd); } catch {
+      try { git(["rev-parse", "--verify", branchName(targetAgentId)], ctxCwd); } catch {
         return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} not found (branch cleaned up).` };
       }
       return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} branch exists but worktree is missing.` };
@@ -229,12 +241,13 @@ async function handleImproveMode(
       return parts.join("\n");
     },
     async (issuesCount, reviewerOutput, _i) => {
-      const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits.`;
-      const r = await runSubProcess(task, workCwd, _cheapModel);
-      const output = r.stdout + r.stderr;
-      if (r.exitCode !== 0 && (!output || output.trim().length === 0)) {
-        return `[Sub-agent error] Fixer exited with code ${r.exitCode}: ${r.stderr.substring(0, 200)}`;
-      }
+      const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
+      const { id: fixerId, promise } = spawnSubAgent(task, ctxCwd, { model: _cheapModel });
+      const output = await promise;
+      // Merge fixer's changes back into the target worktree
+      try { git(["merge", "--no-edit", branchName(fixerId)], workCwd); } catch { /* best effort */ }
+      subAgents.delete(fixerId);
+      cleanupWorktree(projectRoot(ctxCwd), fixerId, true);
       return output;
     },
     maxIt,
@@ -274,10 +287,11 @@ async function handleExecuteMode(
             results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
             if (!ir.clean) allClean = false;
             // Auto-merge the improved branch into main
+            let mergeHadConflicts = false;
             try {
               const branch = branchName(execId);
               try { git(["rev-parse", "--verify", branch], ctxCwd); }
-              catch { /* branch missing, skip merge */ }
+              catch { /* branch missing, skip merge */ cleanupWorktree(root, execId, true); continue; }
               // Stash any dirty state before merging
               if (gitQuiet(["status", "--porcelain"], ctxCwd).trim()) {
                 gitQuiet(["add", "-A"], ctxCwd);
@@ -289,12 +303,16 @@ async function handleExecuteMode(
               } catch {
                 // Conflict or merge error — abort and leave branch for manual review
                 gitQuiet(["merge", "--abort"], ctxCwd);
+                mergeHadConflicts = true;
                 results.push(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
               }
             } catch { /* merge subsystem failed */ }
             // Clean up worktree + branch + map entry after merge attempt
-            cleanupWorktree(root, execId, true);
-            subAgents.delete(execId);
+            // (skip if conflicts — branch is intentionally retained for manual review)
+            if (!mergeHadConflicts) {
+              cleanupWorktree(root, execId, true);
+              subAgents.delete(execId);
+            }
           } catch (e: any) {
             results.push(`${i + 1}. ${item.description}: ✗ improve crashed (${(e.message || "").substring(0, 100)})`);
             allClean = false;
@@ -383,7 +401,7 @@ function ensureGitRepo(projectRoot: string): string {
 function createWorktree(projectRoot: string, id: string): string {
   const safe = safeId(id);
   if (!safe) throw new Error(`Invalid sub-agent id for worktree: "${id.substring(0, 40)}"`);
-  const branch = branchName(safe);
+  const branch = branchName(id);
   const wtDir = join(projectRoot, ".pi", "subagent", safe);
 
   // Ensure .pi/subagent directory exists
@@ -473,7 +491,7 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
   return new Promise((resolve) => {
     const args: string[] = ["-p", "--no-context-files", "--no-session"];
     if (model) args.push("--model", model);
-    args.push(task);
+    args.push("--", task);
     const proc = spawn("pi", args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -615,7 +633,7 @@ function spawnSubAgent(
       args.push("--tools", toolsArg);
     }
     if (options?.systemPrompt) args.push("--system-prompt", options.systemPrompt);
-    args.push(task);
+    args.push("--", task);
 
     const proc = spawn("pi", args, {
       cwd: worktreePath,
@@ -635,20 +653,32 @@ function spawnSubAgent(
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
     let settled = false;
-    function settle(result: string, status: "done" | "error") {
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    let killTimer: NodeJS.Timeout;
+
+    function settle(result: string, status: "done" | "error" | "cancelled") {
       if (settled) return;
       settled = true;
+      clearTimeout(killTimer);
+      if (forceKillTimer) { clearTimeout(forceKillTimer); forceKillTimer = null; }
       agent.status = status;
       agent.endTime = Date.now();
       resolve(result);
     }
 
     proc.on("close", (code) => {
-      if (agent.status === "cancelled") return;
       if (settled) return;
-      // Guard: if entry was removed from global map (e.g. by subagent_parallel cleanup),
-      // don't auto-commit — worktree may already be cleaned up
-      if (!subAgents.has(id)) return;
+      // Guard: if entry was removed from global map, settle anyway to prevent hanging promises.
+      // Skip auto-commit since the worktree may already be cleaned up.
+      if (!subAgents.has(id)) {
+        settle(id + " externally cleaned up", "cancelled");
+        return;
+      }
+      // Cancellation handled: settle so the promise resolves instead of hanging
+      if (agent.status === "cancelled") {
+        settle("[Sub-agent cancelled]", "cancelled");
+        return;
+      }
 
       if (code === 0) {
         agent.result = stdout.trim();
@@ -668,8 +698,7 @@ function spawnSubAgent(
 
     // Kill process after timeout (min 20 min, configurable via options)
     const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
-    let forceKillTimer: NodeJS.Timeout | null = null;
-    const killTimer = setTimeout(() => {
+    killTimer = setTimeout(() => {
       if (agent.status === "running" && !settled) {
         // Escalation: SIGTERM → 10s grace → SIGKILL
         proc.kill("SIGTERM");
@@ -681,14 +710,6 @@ function spawnSubAgent(
         settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
       }
     }, killTimeout);
-
-    // Clear both timers on normal completion
-    const origSettle = settle;
-    settle = (result, status) => {
-      clearTimeout(killTimer);
-      if (forceKillTimer) { clearTimeout(forceKillTimer); forceKillTimer = null; }
-      origSettle(result, status);
-    };
   });
 
   return { id, promise };
@@ -815,7 +836,17 @@ export default function (pi: ExtensionAPI) {
             ctx.cwd,
             { model: _cheapModel, tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"] }
           );
-          await prePromise;
+          const preResult = await prePromise;
+          // Validate analyze step — abort if the agent failed
+          if (preResult.startsWith("[Sub-agent error") || preResult.startsWith("[Sub-agent spawn error") || preResult.startsWith("[Sub-agent timeout")) {
+            cleanupWorktree(projectRoot(ctx.cwd), preId, true);
+            subAgents.delete(preId);
+            return {
+              content: [{ type: "text", text: `❌ Analysis failed: ${preResult.substring(0, 300)}. Cannot proceed with improve mode.` }],
+              details: { mode: "improve_failed", reason: preResult.substring(0, 200) },
+              isError: true,
+            };
+          }
           targetId = preId;
           ownSpawn = true;
         }
@@ -1000,11 +1031,16 @@ export default function (pi: ExtensionAPI) {
 
         if (!mergeSucceeded) {
           const isConflict = mergeError.includes("CONFLICT");
+
+          // Capture conflicting files BEFORE aborting the merge
+          let conflictFiles = "";
+          if (isConflict) {
+            conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctx.cwd);
+          }
           // Abort to leave working tree clean
           gitQuiet(["merge", "--abort"], ctx.cwd);
 
           if (isConflict) {
-            const conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctx.cwd);
             return {
               content: [{
                 type: "text",
@@ -1081,15 +1117,18 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const ag = subAgents.get(params.id);
-      if (!ag) return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
-      if (ag.status === "running") {
-        if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
-        ag.status = "cancelled";
+      // Attempt cleanup even if agent is not in the map (e.g., after subagent_parallel)
+      // by checking if the worktree/branch exists
+      if (ag) {
+        if (ag.status === "running") {
+          if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
+          ag.status = "cancelled";
+        }
+        ag.status = "rejected";
       }
-      ag.status = "rejected";
 
       cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
-      subAgents.delete(params.id);
+      if (ag) subAgents.delete(params.id);
 
       return {
         content: [{
@@ -1161,10 +1200,8 @@ export default function (pi: ExtensionAPI) {
         });
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
-        for (const r of batchResults) {
-          subAgents.delete(r.id);
-          // NOTE: worktree/branch preserved — caller reviews then merges/rejects to clean up
-        }
+        // NOTE: agents kept in map so subagent_merge/subagent_reject tools can operate.
+        // Caller must review then merge or reject each sub-agent to clean up worktrees/branches.
       }
 
       const summary = [
