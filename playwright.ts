@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
 const PROCESS_TIMEOUT_MS = 60_000;
-const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const GLOBAL_NODE_MODULES = join(homedir(), ".npm", "lib", "node_modules");
 const NODE_PATH = [GLOBAL_NODE_MODULES, process.env.NODE_PATH].filter(Boolean).join(delimiter);
 
@@ -56,7 +56,25 @@ function serialize(value) {
 async function snapshot(page, maxBytes) {
   const title = await page.title();
   const body = page.locator("body");
-  const tree = await body.count() > 0 ? await body.ariaSnapshot({ mode: "ai" }) : "";
+  let tree = "";
+  if (await body.count() > 0) {
+    // Try ariaSnapshot with mode: "ai" (Playwright >= 1.59)
+    // Fall back to ariaSnapshot without mode (Playwright 1.49-1.58)
+    // Fall back to basic text extraction (older Playwright)
+    try {
+      tree = await body.ariaSnapshot({ mode: "ai" });
+    } catch {
+      try {
+        tree = await body.ariaSnapshot();
+      } catch {
+        try {
+          tree = await page.evaluate(() => document.body?.innerText || "");
+        } catch {
+          tree = "";
+        }
+      }
+    }
+  }
   return truncateUtf8("Title: " + title + "\n\n" + tree, maxBytes);
 }
 
@@ -75,7 +93,7 @@ async function findTarget(page, target, action) {
     // A human-readable target is not necessarily a valid CSS selector.
   }
 
-  const roleMatch = target.match(/^(.+?)\s+(button|link|checkbox|radio|textbox|input|field|combobox)$/i);
+  const roleMatch = target.match(/^(.+)\s+(button|link|checkbox|radio|textbox|input|field|combobox|heading|tab|menuitem|option|listitem|switch|searchbox|spinbutton|slider|progressbar|separator|table|row|cell|grid|dialog|navigation|alert|tooltip|menu|img|treeitem)$/i);
   const role = roleMatch && ["input", "field"].includes(roleMatch[2].toLowerCase())
     ? "textbox"
     : roleMatch && roleMatch[2].toLowerCase();
@@ -83,11 +101,11 @@ async function findTarget(page, target, action) {
 
   const candidates = action === "fill"
     ? [
+        roleLocator,
         page.getByLabel(target, { exact: true }),
         page.getByPlaceholder(target, { exact: true }),
         page.getByRole("textbox", { name: target, exact: true }),
         page.getByRole("combobox", { name: target, exact: true }),
-        roleLocator,
       ]
     : [
         roleLocator,
@@ -110,10 +128,14 @@ async function main() {
 
   if (!request || typeof request !== "object") throw new Error("Invalid browser request");
   if (typeof request.url !== "string" || request.url.trim() === "") throw new Error("A non-empty URL is required");
-  // Only allow http/https URLs
-  const urlLower = request.url.trim().toLowerCase();
+  // Only allow http/https URLs and reject control characters
+  const trimmedUrl = request.url.trim();
+  if (/[\x00-\x1f\x7f]/.test(trimmedUrl)) {
+    throw new Error("URL contains invalid control characters.");
+  }
+  const urlLower = trimmedUrl.toLowerCase();
   if (!urlLower.startsWith("http://") && !urlLower.startsWith("https://")) {
-    throw new Error("Only http/https URLs are allowed. Got: " + request.url.substring(0, 50));
+    throw new Error("Only http/https URLs are allowed. Got: " + trimmedUrl.substring(0, 50));
   }
 
   let browser;
@@ -123,7 +145,7 @@ async function main() {
     context.setDefaultTimeout(ACTION_TIMEOUT_MS);
     const page = await context.newPage();
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-    await page.goto(request.url, { waitUntil: "domcontentloaded" });
+    await page.goto(trimmedUrl, { waitUntil: "domcontentloaded" });
 
     switch (request.action) {
       case "snapshot":
@@ -178,8 +200,27 @@ function errorText(error: unknown): string {
   }
 }
 
+const URL_REGEX = /^https?:\/\/([^\s/:]+)(:\d+)?(\/[^\s]*)?$/i;
+
+function validateUrl(url: unknown): string {
+  if (typeof url !== "string" || url.trim() === "") {
+    throw new Error("A non-empty URL is required.");
+  }
+  const trimmed = url.trim();
+  // Reject URLs with control characters or newlines that could bypass checks
+  if (/[\x00-\x1f\x7f]/.test(trimmed)) {
+    throw new Error("URL contains invalid control characters.");
+  }
+  if (!URL_REGEX.test(trimmed)) {
+    throw new Error("Only valid http/https URLs are allowed. Got: " + trimmed.substring(0, 50));
+  }
+  return trimmed;
+}
+
 function runPlaywright(request: PlaywrightRequest, cwd: string, signal?: AbortSignal): Promise<string> {
   if (signal?.aborted) return Promise.reject(new Error("Playwright operation cancelled."));
+  // Validate URL early before spawning the child process
+  request = { ...request, url: validateUrl(request.url) };
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -215,7 +256,7 @@ function runPlaywright(request: PlaywrightRequest, cwd: string, signal?: AbortSi
           } else if (error.killed) {
             finish(new Error(`Playwright operation timed out after ${PROCESS_TIMEOUT_MS / 1_000} seconds.`));
           } else if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-            finish(new Error(`Playwright output exceeded ${MAX_BUFFER_BYTES / 1024} KB buffer. Use a more specific selector or script.`));
+            finish(new Error(`Playwright output exceeded ${MAX_BUFFER_BYTES / (1024 * 1024)} MB buffer. Use a more specific selector or script.`));
           } else {
             finish(new Error((stderrText || error.message).slice(0, 12_000)));
           }

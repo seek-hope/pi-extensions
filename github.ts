@@ -19,6 +19,8 @@ import { join } from "node:path";
 
 const GH_TIMEOUT_MS = 30_000;
 const MAX_RESULTS = 1_000;
+const CLEANUP_INTERVAL_MS = 300_000; // 5 minutes between temp dir scans
+let lastCleanupTime = 0;
 
 function unknownErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) {
@@ -48,15 +50,20 @@ async function truncateOutput(output: string): Promise<string> {
   } catch {
     return `${truncation.content}\n\n[Output truncated: ${summary}. Full output could not be saved.]`;
   } finally {
-    // Clean up old temp dirs (>1h) to prevent accumulation
-    try {
-      const now = Date.now();
-      for (const entry of readdirSync(tmpdir())) {
-        if (!entry.startsWith("pi-gh-")) continue;
-        const full = join(tmpdir(), entry);
-        try { if (now - statSync(full).mtimeMs > 3_600_000) rmSync(full, { recursive: true, force: true }); } catch { /* ok */ }
-      }
-    } catch { /* best effort */ }
+    // Clean up old temp dirs (>1h) to prevent accumulation.
+    // Throttled: only scan every CLEANUP_INTERVAL_MS to avoid blocking the event loop
+    // on every gh CLI call when /tmp has thousands of entries.
+    const now = Date.now();
+    if (now - lastCleanupTime > CLEANUP_INTERVAL_MS) {
+      lastCleanupTime = now;
+      try {
+        for (const entry of readdirSync(tmpdir())) {
+          if (!entry.startsWith("pi-gh-")) continue;
+          const full = join(tmpdir(), entry);
+          try { if (now - statSync(full).mtimeMs > 3_600_000) rmSync(full, { recursive: true, force: true }); } catch { /* ok */ }
+        }
+      } catch { /* best effort */ }
+    }
   }
 }
 
@@ -113,7 +120,9 @@ function encodeContentPath(path: string): string {
   if (parts.some((part) => !part || part === "." || part === "..")) {
     throw new Error("File path contains an empty, '.' or '..' segment");
   }
-  return path; // gh CLI handles URL encoding internally
+  // URL-encode each path segment so special characters (spaces, #, ?, etc.)
+  // don't break the /repos/{owner}/{repo}/contents/{path} endpoint URL.
+  return parts.map((part) => encodeURIComponent(part)).join("/");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -137,7 +146,8 @@ export default function (pi: ExtensionAPI) {
           break;
         case "create":
           if (!params.title?.trim()) throw new Error("A non-empty title is required to create an issue");
-          args.push("--title", params.title, "--body", params.body ?? "");
+          args.push("--title", params.title);
+          if (params.body !== undefined) args.push("--body", params.body);
           if (params.label !== undefined) args.push("--label", params.label);
           break;
         case "view":
@@ -174,10 +184,16 @@ export default function (pi: ExtensionAPI) {
           if (params.base !== undefined) args.push("--base", params.base);
           if (params.head !== undefined) args.push("--head", params.head);
           if (params.title !== undefined) {
-            args.push("--title", params.title, "--body", params.body ?? "");
+            args.push("--title", params.title);
+            if (params.body !== undefined) args.push("--body", params.body);
+          } else if (params.body !== undefined) {
+            throw new Error(
+              "A title is required when providing a body for PR creation. " +
+              "Use --fill (omit both title and body) to auto-generate from commits, " +
+              "or provide a title alongside the body.",
+            );
           } else {
             args.push("--fill");
-            if (params.body !== undefined) args.push("--body", params.body);
           }
           break;
         case "checkout":

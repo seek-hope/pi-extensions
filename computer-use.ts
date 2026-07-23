@@ -15,12 +15,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, unlinkSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
 
-const YDOTOOL_SOCKET = process.env.YDOTOOL_SOCKET || "/run/user/1000/.ydotool_socket";
+
+const YDOTOOL_SOCKET = process.env.YDOTOOL_SOCKET
+  || (process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/.ydotool_socket` : "/run/user/1000/.ydotool_socket");
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -52,7 +50,7 @@ function getCursorPos(): { x: number; y: number } {
 function getScreenBounds(): { width: number; height: number; monitors: string; minX: number; minY: number } {
   const out = sh("hyprctl monitors");
   if (!out) throw new Error("hyprctl monitors returned no output");
-  let minX = 0, minY = 0, maxX = 0, maxY = 0;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   const re = /(-?\d+)x(-?\d+)@[\d.]+ at (-?\d+)x(-?\d+)/g;
   let m;
   while ((m = re.exec(out)) !== null) {
@@ -102,7 +100,7 @@ async function ydotoolRetry(action: string, attempts = 3, delayMs = 200): Promis
 }
 
 /** Move mouse and verify position (retry if not at target) */
-async function moveToVerified(x: number, y: number, bound: { width: number; height: number }): Promise<void> {
+async function moveToVerified(x: number, y: number, bound: { width: number; height: number; minX: number; minY: number }): Promise<void> {
   const { x: cx, y: cy } = clamp(x, y, bound);
   for (let attempt = 0; attempt < 3; attempt++) {
     sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
@@ -137,46 +135,41 @@ export default function (pi: ExtensionAPI) {
       })),
     }),
     async execute(_id, params, _signal) {
-      const file = `${tmpdir()}/pi-screenshot-${randomUUID()}.png`;
+      // Validate and convert region early
+      let geometry: string | undefined;
+      if (params.region) {
+        const parts = params.region.split(",");
+        if (parts.length !== 4) {
+          return { content: [{ type: "text", text: "Invalid region: expected 'x,y,w,h' with exactly 4 comma-separated numbers." }], details: {}, isError: true };
+        }
+        const nums = parts.map(Number);
+        for (let i = 0; i < 4; i++) {
+          if (isNaN(nums[i])) {
+            return { content: [{ type: "text", text: `Invalid region: '${parts[i]}' is not a valid number.` }], details: {}, isError: true };
+          }
+        }
+        const [x, y, w, h] = nums;
+        if (w <= 0 || h <= 0) {
+          return { content: [{ type: "text", text: `Invalid region: width and height must be positive (got ${w}x${h}).` }], details: {}, isError: true };
+        }
+        // grim expects "<x>,<y> <w>x<h>"
+        geometry = `${x},${y} ${w}x${h}`;
+      }
+
       try {
-        if (params.region) {
-          const parts = params.region.split(",");
-          if (parts.length !== 4) {
-            return { content: [{ type: "text", text: "Invalid region: expected 'x,y,w,h' with exactly 4 comma-separated numbers." }], details: {}, isError: true };
-          }
-          const nums = parts.map(Number);
-          for (let i = 0; i < 4; i++) {
-            if (isNaN(nums[i])) {
-              return { content: [{ type: "text", text: `Invalid region: '${parts[i]}' is not a valid number.` }], details: {}, isError: true };
-            }
-          }
-          const [x, y, w, h] = nums;
-          if (w <= 0 || h <= 0) {
-            return { content: [{ type: "text", text: `Invalid region: width and height must be positive (got ${w}x${h}).` }], details: {}, isError: true };
-          }
-          sh(`grim -g "${x},${y} ${w}x${h}" "${file}"`);
-        } else {
-          sh(`grim "${file}"`);
-        }
-
-        if (!existsSync(file)) {
-          return { content: [{ type: "text", text: "Screenshot failed: file not created." }], details: {}, isError: true };
-        }
-
-        const data = readFileSync(file);
+        // Pipe grim to stdout (PNG) — no temp file, no cleanup needed
+        const grimArgs = geometry ? ["-g", geometry, "-"] : ["-"];
+        const data = execFileSync("grim", grimArgs, { maxBuffer: 50 * 1024 * 1024, timeout: 10_000 });
         const base64 = data.toString("base64");
         return {
           content: [
             { type: "text", text: `Screenshot captured (${(data.length / 1024).toFixed(0)} KB).` },
-            { type: "image", data: base64, mimeType: "image/png" },
+            { type: "image", data: `data:image/png;base64,${base64}`, mimeType: "image/png" },
           ],
           details: { size: data.length },
         };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Screenshot failed: ${e.message}` }], details: {}, isError: true };
-      } finally {
-        // Always clean up temp file
-        try { unlinkSync(file); } catch { /* already gone */ }
       }
     },
   });

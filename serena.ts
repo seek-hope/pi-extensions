@@ -42,6 +42,7 @@ let server: ServerState | null = null;
 let initialization: { state: ServerState; promise: Promise<void> } | null = null;
 let messageId = 0;
 const pending = new Map<number, PendingRequest>();
+let startMutex: Promise<void> = Promise.resolve();
 
 function findProjectRoot(cwd: string): string {
   let dir = cwd;
@@ -158,11 +159,16 @@ function mcpRequest(
 }
 
 function mcpNotify(state: ServerState, method: string, params?: unknown): void {
-  sendMessage(state, { jsonrpc: "2.0", method, params: params ?? {} });
+  try {
+    sendMessage(state, { jsonrpc: "2.0", method, params: params ?? {} });
+  } catch {
+    // Notifications are fire-and-forget; a closed transport is not an error.
+  }
 }
 
 function protocolFailure(state: ServerState, error: Error): void {
-  console.error("[serena]", error.message);
+  // Avoid console.error in TUI context — errors propagate via pending
+  // request rejections and the exit handler.
   void terminateServerState(state, error);
 }
 
@@ -301,7 +307,7 @@ function terminateServerState(state: ServerState, error: Error): Promise<void> {
 
     try { state.child.kill("SIGKILL"); } catch { /* report below */ }
     if (!(await waitForExit(state.child, 1_000))) {
-      console.error("[serena] Failed to terminate MCP server process");
+      // Process did not exit; it will be left to the OS to clean up.
     }
   })();
   return state.termination;
@@ -323,8 +329,9 @@ function createServerState(root: string): ServerState {
 
   child.stdout.on("data", (chunk: Buffer) => onData(state, chunk));
   child.stderr.on("data", (chunk: Buffer) => {
-    const text = chunk.toString();
-    if (/error/i.test(text)) console.error("[serena]", text.trim());
+    // Serena may write diagnostics to stderr; errors are already surfaced
+    // through protocol failures and promise rejections, so we avoid
+    // console.error here to prevent TUI corruption.
   });
 
   const onStreamError = (error: Error) => {
@@ -350,35 +357,47 @@ async function startServer(cwd: string): Promise<void> {
   if (server?.root === root && server.ready && !server.closed) return;
   if (initialization?.state.root === root) return initialization.promise;
 
-  if (server) {
-    await terminateServerState(server, new Error("Serena MCP server project changed"));
-  }
+  // Serialise startup & teardown to prevent races where two callers both
+  // see server === null and both spawn a child, leaking one process.
+  const prevMutex = startMutex;
+  let releaseMutex: () => void;
+  startMutex = new Promise<void>((r) => { releaseMutex = r; });
 
-  const state = createServerState(root);
-  server = state;
-  const promise = (async () => {
-    try {
-      await mcpRequest(state, "initialize", {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "pi-coding-agent", version: "1.0.0" },
-      }, INITIALIZE_TIMEOUT_MS);
-      try {
-        mcpNotify(state, "initialized", {});
-      } catch {
-        // Non-critical: failure to send initialized notification is not fatal
-      }
-      state.ready = true;
-    } catch (error) {
-      const initError = asError(error, "Failed to initialize Serena MCP server");
-      await terminateServerState(state, initError);
-      throw initError;
-    } finally {
-      if (initialization?.state === state) initialization = null;
+  try {
+    await prevMutex;
+
+    // Re-check now that we hold the lock.
+    if (server?.root === root && server.ready && !server.closed) return;
+    if (initialization?.state.root === root) return initialization.promise;
+
+    if (server) {
+      await terminateServerState(server, new Error("Serena MCP server project changed"));
     }
-  })();
-  initialization = { state, promise };
-  return promise;
+
+    const state = createServerState(root);
+    server = state;
+    const promise = (async () => {
+      try {
+        await mcpRequest(state, "initialize", {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "pi-coding-agent", version: "1.0.0" },
+        }, INITIALIZE_TIMEOUT_MS);
+        mcpNotify(state, "initialized", {});
+        state.ready = true;
+      } catch (error) {
+        const initError = asError(error, "Failed to initialize Serena MCP server");
+        await terminateServerState(state, initError);
+        throw initError;
+      } finally {
+        if (initialization?.state === state) initialization = null;
+      }
+    })();
+    initialization = { state, promise };
+    return promise;
+  } finally {
+    releaseMutex!();
+  }
 }
 
 async function stopServer(): Promise<void> {
@@ -533,11 +552,25 @@ export default function (pi: ExtensionAPI) {
     serena_search_pattern: "search_for_pattern",
     serena_overview: "get_symbols_overview",
     serena_diagnostics: "get_diagnostics_for_file",
-    serena_find_definition: "find_declaration",
+    serena_find_definition: "find_symbol",
     serena_rename_symbol: "rename_symbol",
     serena_onboarding: "onboarding",
     serena_get_config: "get_current_config",
   };
+
+  // Map pi camelCase param names to Serena snake_case param names.
+  const paramNameMap: Record<string, string> = {
+    query: "name_path_pattern",
+    relativePath: "relative_path",
+    includeBody: "include_body",
+    symbol: "name_path",
+    newName: "new_name",
+    pattern: "substring_pattern",
+  };
+
+  // Tools where the caseSensitive flag should be applied when false
+  // by prepending "(?i)" to the regex pattern.
+  const caseInsensitiveTools = new Set(["serena_search_pattern"]);
 
   for (const t of tools) {
     const paramSchema: Record<string, any> = {};
@@ -545,8 +578,9 @@ export default function (pi: ExtensionAPI) {
       paramSchema[key] = type;
     }
     const serenaToolName = toolNameMap[t.name] || t.name.replace("serena_", "");
+    const toolName = t.name;
     pi.registerTool({
-      name: t.name,
+      name: toolName,
       label: t.label,
       description: t.description,
       parameters: Type.Object(paramSchema),
@@ -555,7 +589,18 @@ export default function (pi: ExtensionAPI) {
           // Map pi param names to serena param names
           const serenaParams: Record<string, any> = {};
           for (const [key, value] of Object.entries(params)) {
-            serenaParams[key] = value;
+            if (value === undefined) continue;
+            // caseSensitive is handled separately below; never forwarded.
+            if (key === "caseSensitive") continue;
+            const mapped = paramNameMap[key] || key;
+            serenaParams[mapped] = value;
+          }
+          // Apply caseSensitive flag for regex-based search tools.
+          if (caseInsensitiveTools.has(toolName) && params.caseSensitive === false) {
+            const patternKey = paramNameMap["pattern"] || "substring_pattern";
+            if (typeof serenaParams[patternKey] === "string") {
+              serenaParams[patternKey] = "(?i)" + serenaParams[patternKey];
+            }
           }
           const result = await callSerenaTool(serenaToolName, serenaParams, ctx.cwd, signal);
           return { content: [{ type: "text", text: result }], details: {} };
