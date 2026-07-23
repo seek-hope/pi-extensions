@@ -1116,16 +1116,11 @@ export default function (pi: ExtensionAPI) {
   // ── subagent_chain ─────────────────────────────────────────────────────
   pi.registerTool({
     name: "subagent_chain",
-    label: "Chain Sub-agents",
+    label: "[DEPRECATED] Chain",
     description:
       "Run sub-agents sequentially, each in its own worktree. " +
       "Each sub-agent receives the previous agent's output as context.",
     promptSnippet: "Run sub-agents in sequence — each one builds on the previous output.",
-    promptGuidelines: [
-      "Use subagent_chain for multi-step pipelines: research → summarize, generate → review → refine.",
-      "Each step receives the previous step's output as context automatically.",
-      "Use subagent_chain when later steps depend on the output of earlier steps.",
-    ],
     parameters: Type.Object({
       tasks: Type.String({ description: "JSON array of task strings, executed in order" }),
       model: Type.Optional(Type.String({ description: "Model override" })),
@@ -1172,7 +1167,7 @@ export default function (pi: ExtensionAPI) {
   // ── subagent_explore (Claude Code Explore agent pattern) ───────────────
   pi.registerTool({
     name: "subagent_explore",
-    label: "Explore Agent",
+    label: "[DEPRECATED] Explore",
     description:
       "Spawn a read-only exploration sub-agent optimized for searching, reading, and analyzing code. " +
       "Uses the cheaper model by default for cost efficiency. " +
@@ -1216,7 +1211,7 @@ export default function (pi: ExtensionAPI) {
   // ── subagent_plan (Claude Code / Codex Plan Mode pattern) ──────────────
   pi.registerTool({
     name: "subagent_plan",
-    label: "Plan Agent",
+    label: "[DEPRECATED] Plan",
     description:
       "Spawn a planning sub-agent that explores the codebase, designs an approach, and returns a step-by-step plan WITHOUT making any changes. " +
       "Use this before large refactors or complex implementations to get a reviewed plan first.",
@@ -1262,7 +1257,7 @@ export default function (pi: ExtensionAPI) {
   // ── subagent_refine (NEW) ──────────────────────────────────────────────
   pi.registerTool({
     name: "subagent_refine",
-    label: "Refine Sub-agent",
+    label: "[DEPRECATED] Refine",
     description:
       "Review a completed sub-agent's work, auto-fix issues, and re-review " +
       "in a loop until no problems remain or max iterations is reached. " +
@@ -1386,7 +1381,7 @@ export default function (pi: ExtensionAPI) {
   // ── subagent_audit (fresh-eye review loop) ───────────────────────────
   pi.registerTool({
     name: "subagent_audit",
-    label: "Audit Loop",
+    label: "[DEPRECATED] Audit",
     description:
       "Run an iterative review→fix→review loop with fresh-eye protocol. " +
       "Each reviewer is a fresh sub-agent with no knowledge of previous rounds — " +
