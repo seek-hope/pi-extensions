@@ -52,8 +52,7 @@ export default function (pi: ExtensionAPI) {
             content: [{
               type: "text",
               text: `AnySearch API error (${res.status}): ${err}\n\n` +
-                `API: ${API_BASE}\n` +
-                `Key: ${apiKey ? apiKey.substring(0, 12) + "..." : "(anonymous)"}`,
+                `API: ${API_BASE}`,
             }],
             details: {},
             isError: true,
