@@ -292,8 +292,9 @@ async function handleExecuteMode(
                 results.push(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
               }
             } catch { /* merge subsystem failed */ }
-            // Clean up worktree + branch after merge attempt
+            // Clean up worktree + branch + map entry after merge attempt
             cleanupWorktree(root, execId, true);
+            subAgents.delete(execId);
           } catch (e: any) {
             results.push(`${i + 1}. ${item.description}: ✗ improve crashed (${(e.message || "").substring(0, 100)})`);
             allClean = false;
@@ -805,19 +806,32 @@ export default function (pi: ExtensionAPI) {
 
       // ── IMPROVE mode ────────────────────────────────────────────────
       if (params.mode === "improve") {
-        // If no subagentId, first spawn a sub-agent to analyze the code, then improve that
+        // If no subagentId, spawn a temporary sub-agent to analyze first, then improve it
         let targetId = params.subagentId || null;
+        let ownSpawn = false; // track whether we created the target ourselves
         if (!targetId) {
-          // Phase 0: analyze the codebase first so we have a target to improve
           const { id: preId, promise: prePromise } = spawnSubAgent(
-            `Analyze: ${params.task}. Read relevant files thoroughly. Make notes about issues found.`,
+            `Analyze: ${params.task}. Read relevant files thoroughly. Note any issues found.`,
             ctx.cwd,
             { model: _cheapModel, tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"] }
           );
           await prePromise;
           targetId = preId;
+          ownSpawn = true;
         }
         const result = await handleImproveMode(targetId!, ctx.cwd, params.criteria, maxIt);
+        // Clean up: no subagentId should persist after completion
+        try {
+          const ag = subAgents.get(targetId!);
+          if (ag && ag.status !== "running") {
+            // Auto-merge if we own the target (else just clean up the review loop artifacts)
+            if (ownSpawn) {
+              try { git(["merge", "--no-edit", branchName(targetId!)], ctx.cwd); } catch { /* merge can fail, branch still cleaned below */ }
+            }
+            cleanupWorktree(projectRoot(ctx.cwd), targetId!, true);
+            subAgents.delete(targetId!);
+          }
+        } catch { /* best effort cleanup */ }
         return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
       }
 
