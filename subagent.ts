@@ -49,6 +49,172 @@ function branchName(id: string): string {
   return `pi/subagent/${id}`;
 }
 
+// ── Unified Review Loop Engine ─────────────────────────────────────────────
+
+/** Modes for the unified subagent workflow */
+type LoopMode = "analyze" | "improve" | "execute";
+
+interface LoopResult {
+  iterations: number;
+  clean: boolean;
+  summary: string;
+}
+
+/**
+ * Core review→action→review loop shared by all three modes.
+ */
+async function reviewLoop(
+  ctxCwd: string,
+  workCwd: string,
+  buildReviewTask: (i: number) => string,
+  runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
+  maxIterations = 5,
+  commitPrefix = "loop"
+): Promise<LoopResult> {
+  const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
+
+  for (let i = 1; i <= maxIterations; i++) {
+    const reviewTask = buildReviewTask(i);
+    const { id: reviewerId, promise: reviewPromise } = spawnSubAgent(reviewTask, ctxCwd, {
+      model: _defaultModel,
+      tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"],
+    });
+    const reviewerOutput = await reviewPromise;
+    subAgents.delete(reviewerId);
+
+    const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
+    const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
+    const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
+    const issuesCount = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
+
+    iterations.push({ iter: i, issuesFound: issuesCount, clean: isClean });
+
+    if (isClean && issuesCount === 0) {
+      const summary = iterations.map(it =>
+        `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
+      ).join("\n");
+      return { iterations: i, clean: true, summary: `✅ CLEAN after ${i} rounds\n` + summary };
+    }
+
+    const fixerOutput = await runAction(issuesCount, reviewerOutput, i);
+    if (commitPrefix) commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${issuesCount} issue(s)`);
+  }
+
+  const summary = iterations.map(it =>
+    `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
+  ).join("\n");
+  return { iterations: maxIterations, clean: false, summary: `⚠ MAX ROUNDS (${maxIterations})\n` + summary };
+}
+
+// ── git helpers ─────────────────────────────────────────────────────────────
+
+// ── Mode Handlers ───────────────────────────────────────────────────────
+
+/**
+ * ANALYZE: read-only exploration → review → improve → loop → final report.
+ */
+async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): Promise<LoopResult> {
+  // Phase 1: initial exploration with cheap model
+  const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
+  const { id: rId, promise: rPromise } = spawnSubAgent(initTask, ctxCwd, {
+    model: _cheapModel,
+    tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol", "codegraph_search", "codegraph_explore"],
+  });
+  let analysis = await rPromise;
+  subAgents.delete(rId);
+
+  // Phase 2: review loop — improve analysis quality iteratively
+  const result = await reviewLoop(
+    ctxCwd, ctxCwd,
+    (_i) => [
+      `Review this analysis. Identify gaps, inaccuracies, or missing details.`,
+      `--- ANALYSIS ---`, analysis.substring(0, 24000), `--- END ---`,
+      `FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue>`,
+      `If CLEAN: true, just write "CLEAN: true".`,
+    ].join("\n"),
+    async (_c, reviewerOutput, _i) => {
+      const { promise } = spawnSubAgent(
+        `Improve this analysis based on feedback. Produce a complete final analysis. DO NOT modify files.\n\n` +
+        `Feedback: ${reviewerOutput.substring(0, 4000)}`,
+        ctxCwd,
+        { model: _defaultModel, tools: ["read", "bash", "serena_search_pattern"] }
+      );
+      const improved = await promise;
+      analysis = improved; // update for next review round
+      return improved;
+    },
+    maxIt, ""
+  );
+  return result;
+}
+
+/**
+ * IMPROVE: review diff → fix → re-review loop.
+ */
+async function handleImproveMode(
+  targetAgentId: string | null, ctxCwd: string,
+  criteria: string | undefined, maxIt: number
+): Promise<LoopResult> {
+  const existing = targetAgentId ? subAgents.get(targetAgentId) : null;
+  if (existing && existing.status === "running") {
+    return { iterations: 0, clean: false, summary: "Sub-agent still running." };
+  }
+
+  const workCwd = existing?.worktreePath || ctxCwd;
+  const diffContent = targetAgentId ? getDiff(ctxCwd, targetAgentId) : null;
+  const reviewCriteria = criteria || "Check correctness, security, performance, style, edge cases, and completeness.";
+
+  return reviewLoop(
+    ctxCwd, workCwd,
+    (_i) => {
+      const parts = [`Review criteria: ${reviewCriteria}`];
+      if (diffContent) parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
+      parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
+      return parts.join("\n");
+    },
+    async (issuesCount, reviewerOutput, _i) => {
+      const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits.`;
+      const r = await runSubProcess(task, workCwd, _cheapModel);
+      return r.stdout + r.stderr;
+    },
+    maxIt,
+    targetAgentId || "improve"
+  );
+}
+
+/**
+ * EXECUTE: walk todo items; each: execute → improve loop → next.
+ */
+async function handleExecuteMode(
+  items: { description: string }[], ctxCwd: string, maxIt: number
+): Promise<{ results: string[]; allClean: boolean }> {
+  const results: string[] = [];
+  let allClean = true;
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    // Execute
+    const { id: execId, promise: execPromise } = spawnSubAgent(
+      `Execute: ${item.description}. Make changes as needed.`,
+      ctxCwd
+    );
+    await execPromise;
+
+    // Improve
+    const ag = subAgents.get(execId);
+    if (ag) {
+      const ir = await handleImproveMode(execId, ctxCwd, undefined, maxIt);
+      results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
+      if (!ir.clean) allClean = false;
+    } else {
+      results.push(`${i + 1}. ${item.description}: ✗ failed`);
+      allClean = false;
+    }
+  }
+
+  return { results, allClean };
+}
+
 // ── git helpers ─────────────────────────────────────────────────────────────
 
 function git(args: string[], cwd: string): string {
@@ -473,32 +639,76 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── subagent_spawn ─────────────────────────────────────────────────────
+  // ── subagent_spawn (unified entry) ─────────────────────────────────────
   pi.registerTool({
     name: "subagent_spawn",
     label: "Spawn Sub-agent",
     description:
-      "Spawn a sub-agent in an isolated git worktree. " +
-      "The sub-agent works independently; when done, its changes are committed to a branch. " +
-      "Use subagent_review to inspect the diff, subagent_merge to accept, or subagent_reject to discard. " +
-      "If the project has no git repo, one is created automatically.",
-    promptSnippet: "Spawn a sub-agent to handle a self-contained task in an isolated git worktree.",
+      "Spawn a sub-agent in an isolated git worktree. Supports 3 workflow modes:\n" +
+      "- `analyze`: read-only exploration → review → improve → final report (no code changes)\n" +
+      "- `improve`: review diff → fix → re-review loop until clean (needs existing sub-agent ID)\n" +
+      "- `execute`: walk todo items; each: execute → improve loop → next (needs todo items list)\n" +
+      "Without mode, works as simple fire-and-forget spawn (backward compatible).",
+    promptSnippet: "Spawn a sub-agent (analyze/improve/execute).",
     promptGuidelines: [
       "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
-      "Use subagent_spawn with the cheaper model variant for simple tasks like searching or reading files.",
-      "When a user asks for multiple independent changes, spawn a subagent for each one with subagent_parallel.",
-      "Always review sub-agent output with subagent_review before merging — never merge blindly.",
-      "After spawning (spawn, explore, plan), use subagent_wait to collect the result, then subagent_review/reject/merge.",
-      "For exploration use subagent_explore (read-only, cheap). For planning use subagent_plan (design without implementing).",
+      "Use mode='analyze' for research/exploration tasks — it self-improves the analysis quality.",
+      "Use mode='improve' after a sub-agent completes, to auto-polish via review→fix loop.",
+      "Use mode='execute' with a todo list to churn through tasks, each with its own improve loop.",
+      "Without mode: simple fire-and-forget spawn. Use subagent_review then merge/reject.",
+      "Always review sub-agent output before merging — never merge blindly.",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
-      model: Type.Optional(Type.String({ description: "Model override (e.g. use the cheaper model variant for simple tasks)" })),
+      mode: Type.Optional(Type.String({ description: "Workflow: 'analyze', 'improve', or 'execute'. Omit for simple spawn." })),
+      model: Type.Optional(Type.String({ description: "Model override" })),
       tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
       systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt" })),
-      timeoutMs: Type.Optional(Type.Number({ description: "Max runtime in ms before hard kill (min: 20 min, default: 20 min)" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms (min: 20 min, default: 20 min)" })),
+      subagentId: Type.Optional(Type.String({ description: "Existing sub-agent ID (improve mode)" })),
+      criteria: Type.Optional(Type.String({ description: "Review criteria (improve mode)" })),
+      maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 5, max: 5)" })),
+      todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      const maxIt = Math.min(params.maxIterations || 5, 5);
+
+      // ── ANALYZE mode ────────────────────────────────────────────────
+      if (params.mode === "analyze") {
+        const result = await handleAnalyzeMode(params.task, ctx.cwd, maxIt);
+        return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
+      }
+
+      // ── IMPROVE mode ────────────────────────────────────────────────
+      if (params.mode === "improve") {
+        const result = await handleImproveMode(params.subagentId || null, ctx.cwd, params.criteria, maxIt);
+        return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
+      }
+
+      // ── EXECUTE mode ────────────────────────────────────────────────
+      if (params.mode === "execute") {
+        let items: { description: string }[];
+        try {
+          const parsed = JSON.parse(params.todoItems || "[]");
+          if (!Array.isArray(parsed)) throw new Error("not array");
+          items = parsed;
+        } catch {
+          return { content: [{ type: "text", text: "todoItems must be a JSON array of {description: string}." }], details: {}, isError: true };
+        }
+        if (items.length === 0) {
+          return { content: [{ type: "text", text: "No todo items provided." }], details: {}, isError: true };
+        }
+        const result = await handleExecuteMode(items, ctx.cwd, maxIt);
+        const summary = [
+          `┌─ Execute Complete ──────────────────────`,
+          ...result.results.map(r => `│ ${r}`),
+          `└──────────────────────────────────────────`,
+          result.allClean ? "All items passed." : "Some items need attention.",
+        ].join("\n");
+        return { content: [{ type: "text", text: summary }], details: { allClean: result.allClean } };
+      }
+
+      // ── DEFAULT: simple fire-and-forget spawn ────────────────────────
       const { id, promise } = spawnSubAgent(params.task, ctx.cwd, {
         model: params.model,
         tools: params.tools ? params.tools.split(",").map((t: string) => t.trim()) : undefined,
