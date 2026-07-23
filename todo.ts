@@ -37,34 +37,39 @@ let todo: TodoList = { items: [], updatedAt: 0 };
 function renderWidget(ctx?: any): void {
   const ui = ctx?.ui ?? _pi?.ui;
   if (!ui) return;
-  if (todo.items.length === 0) {
+
+  const active = todo.items.filter(i => i.status === "pending" || i.status === "in_progress");
+  if (active.length === 0) {
     ui.setWidget("todo", undefined);
     return;
   }
 
   const total = todo.items.length;
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
-  const maxItems = total <= 8 ? total : 7; // header+footer=2, more-line=1 → 10 max
+  const maxItems = active.length <= 8 ? active.length : 7;
   const lines: string[] = [];
-  lines.push(`┌─ Todo (${done}/${total}) ──────────────────────────`);
+  lines.push(`┌─ Todo (${done}/${total} done) ────────────────`);
 
-  for (let i = 0; i < Math.min(total, maxItems); i++) {
-    const item = todo.items[i];
+  // Show active items first: in_progress, then pending
+  const sorted = [...active].sort((a, b) => {
+    if (a.status === "in_progress" && b.status !== "in_progress") return -1;
+    if (b.status === "in_progress" && a.status !== "in_progress") return 1;
+    return 0;
+  });
+
+  for (let i = 0; i < Math.min(sorted.length, maxItems); i++) {
+    const item = sorted[i];
     const icon = STATUS_ICONS[item.status] || "○";
     const safeContent = item.content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").replace(/\n/g, " ");
     if (item.status === "in_progress") {
       lines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
-    } else if (item.status === "completed") {
-      lines.push(`│ ${icon} \x1b[2m${safeContent}\x1b[0m`);
-    } else if (item.status === "cancelled") {
-      lines.push(`│ ${icon} \x1b[2m\x1b[9m${safeContent}\x1b[0m`);
     } else {
       lines.push(`│ ${icon} ${safeContent}`);
     }
   }
 
-  if (total > maxItems) {
-    lines.push(`│ ... (${total - maxItems} more, /todo for full)`);
+  if (sorted.length > maxItems) {
+    lines.push(`│ ... ${sorted.length - maxItems} more active, /todo for full`);
   }
   lines.push(`└──────────────────────────────────────────`);
 
