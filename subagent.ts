@@ -780,7 +780,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
       "Use mode='analyze' for research/exploration tasks — it self-improves the analysis quality.",
-      "Use subagent_spawn with mode='improve' on an EXISTING sub-agent ID (spawn first, then improve).",
+      "Use subagent_spawn with mode='improve' to review and fix any work (from spawn, analyze, execute, or manual edits). Requires subagentId.",
       "Use mode='execute' with a todo list to churn through tasks, each with its own improve loop.",
       "Without mode: simple fire-and-forget spawn. Use subagent_review then merge/reject.",
       "Always review sub-agent output before merging — never merge blindly.",
@@ -792,7 +792,7 @@ export default function (pi: ExtensionAPI) {
       tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
       systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt" })),
       timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms (min: 20 min, default: 20 min)" })),
-      subagentId: Type.Optional(Type.String({ description: "Existing sub-agent ID (improve mode)" })),
+      subagentId: Type.Optional(Type.String({ description: "Target sub-agent ID to review and improve (any source)" })),
       criteria: Type.Optional(Type.String({ description: "Review criteria (improve mode)" })),
       maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 5, max: 5)" })),
       todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
