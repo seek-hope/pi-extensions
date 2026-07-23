@@ -42,7 +42,9 @@ let detailWidgetActive = false;
  */
 function sanitizeContent(raw: string): string {
   return raw
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")   // CSI / SGR sequences
+    .replace(/\x1b\[[0-9;?>=]*[a-zA-Z]/g, "")   // CSI sequences (include ? > = params)
+    .replace(/\x1b\].*?(?:\x07|\x1b\\)/g, "")   // OSC sequences
+    .replace(/\x1b[PX^_].*?\x1b\\/g, "")        // DCS, SOS, PM, APC
     .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "") // remaining C0 controls (bare ESC, CR, etc.)
     .replace(/\t/g, " ")
     .replace(/\n/g, " ");
@@ -102,7 +104,8 @@ function renderWidget(ctx?: any): void {
     return 0;
   });
 
-  const limit = Math.min(sorted.length, 7);
+  const MAX_VISIBLE_ITEMS = 7;
+  const limit = Math.min(sorted.length, MAX_VISIBLE_ITEMS);
   const lines: string[] = [];
   lines.push(`┌─ Todo (${done}/${total} done) ────────────────`);
 
@@ -159,7 +162,6 @@ export default function (pi: ExtensionAPI) {
         return s === "pending" || s === "in_progress" || s === "completed" || s === "cancelled";
       }
 
-      const validStatuses = new Set<string>(["pending", "in_progress", "completed", "cancelled"]);
       const warnings: string[] = [];
 
       // Validate and normalize
@@ -169,7 +171,7 @@ export default function (pi: ExtensionAPI) {
 
         let status: TodoStatus = "pending";
         if (item.status) {
-          const s = item.status.trim().toLowerCase();
+          const s = String(item.status).trim().toLowerCase();
           if (isValidTodoStatus(s)) {
             status = s;
           } else {
@@ -177,22 +179,30 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        const truncated = content.length > 200;
-        return { content: content.substring(0, 200) + (truncated ? "…" : ""), status };
+        const needsTruncation = content.length > 200;
+        return { content: content.substring(0, 200) + (needsTruncation ? "…" : ""), status };
       });
 
       // Enforce: only one in_progress
       const inProgress = items.filter(i => i.status === "in_progress");
       if (inProgress.length > 1) {
         // Auto-fix: keep the last one as in_progress, demote the rest to pending
+        const lastInProgressIdx = items.reduce((last, item, idx) =>
+          item.status === "in_progress" ? idx : last, -1);
         let demoted = 0;
         for (let i = 0; i < items.length; i++) {
-          if (items[i].status === "in_progress" && items[i] !== inProgress[inProgress.length - 1]) {
+          if (items[i].status === "in_progress" && i !== lastInProgressIdx) {
             items[i].status = "pending";
             demoted++;
           }
         }
         warnings.push(`Auto-fixed: demoted ${demoted} extra in_progress item(s) → pending (only one allowed).`);
+      }
+
+      // Cap items to prevent widget bloat
+      if (items.length > 100) {
+        warnings.push(`List capped at 100 items (${items.length} provided). The first 100 items were kept.`);
+        items.length = 100;
       }
 
       todo = { items, updatedAt: Date.now() };
@@ -202,14 +212,17 @@ export default function (pi: ExtensionAPI) {
       const counts: Record<string, number> = {};
       for (const item of items) { counts[item.status] = (counts[item.status] || 0) + 1; }
 
-      const summary = [
-        `Todo list updated (${items.length} items):`,
-        ...Object.entries(counts).map(([s, n]) => {
-          const icon = STATUS_ICONS[s as TodoStatus] || "○";
-          return `  ${icon} ${n} ${s.replace("_", " ")}`;
-        }),
-        ...(warnings.length > 0 ? ["", "⚠ warnings:", ...warnings.map(w => `  ${w}`)] : []),
-      ];
+      const summary = items.length === 0
+        ? ["Todo list cleared."]
+        : [
+            `Todo list updated (${items.length} items):`,
+            ...Object.entries(counts).map(([s, n]) => {
+              const icon = STATUS_ICONS[s as TodoStatus] || "○";
+              return `  ${icon} ${n} ${s.replace("_", " ")}`;
+            }),
+            ...(warnings.length > 0 ? ["", "⚠ warnings:", ...warnings.map(w => `  ${w}`)] : []),
+          ];
+
 
       // Clear detail widget since todo was updated
       clearDetailWidget(ctx);
@@ -222,20 +235,28 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("todo", {
     description: "Show the current todo list",
     handler: async (_args, ctx) => {
+      const ui = ctx?.ui ?? _pi?.ui;
+      if (!ui) return;
+
       if (todo.items.length === 0) {
-        ctx.ui.notify("No todo items yet. Use todo_write to create a plan.", "info");
+        ui.notify("No todo items yet. Use todo_write to create a plan.", "info");
         return;
       }
 
       const statusOrder: TodoStatus[] = ["in_progress", "pending", "completed", "cancelled"];
+      // Map unknown statuses to one past the last known rank so they sort last
+      const statusRank = (s: string): number => {
+        const idx = statusOrder.indexOf(s as TodoStatus);
+        return idx === -1 ? statusOrder.length : idx;
+      };
       const total = todo.items.length;
       const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
 
-      // Stable sort: primary key is status order, secondary is original index
+      // Stable sort: primary key is status rank, secondary is original index
       const sorted = todo.items
         .map((item, index) => ({ item, index }))
         .sort((a, b) => {
-          const statusDiff = statusOrder.indexOf(a.item.status) - statusOrder.indexOf(b.item.status);
+          const statusDiff = statusRank(a.item.status) - statusRank(b.item.status);
           if (statusDiff !== 0) return statusDiff;
           return a.index - b.index;
         })
@@ -258,14 +279,14 @@ export default function (pi: ExtensionAPI) {
 
       if (detailWidgetActive) {
         // Toggle off
-        ctx.ui.setWidget("todo-detail", undefined);
+        ui.setWidget("todo-detail", undefined);
         detailWidgetActive = false;
-        ctx.ui.notify(`Todo detail hidden (${done}/${total} done)`, "info");
+        ui.notify(`Todo detail hidden (${done}/${total} done)`, "info");
       } else {
         // Show detail
-        ctx.ui.setWidget("todo-detail", detailLines);
+        ui.setWidget("todo-detail", detailLines);
         detailWidgetActive = true;
-        ctx.ui.notify(`Todo detail shown (${done}/${total} done). /todo to hide.`, "info");
+        ui.notify(`Todo detail shown (${done}/${total} done). /todo to hide.`, "info");
       }
     },
   });

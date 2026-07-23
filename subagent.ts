@@ -33,6 +33,19 @@ interface SubAgent {
 
 const subAgents = new Map<string, SubAgent>();
 
+/** Eviction age: terminal-state agents older than this are auto-removed from the map */
+const EVICTION_AGE_MS = 10 * 60 * 1000; // 10 minutes
+
+/** Remove stale terminal-state agents from the map to prevent unbounded growth */
+function evictTerminalAgents(): void {
+  const now = Date.now();
+  for (const [id, ag] of subAgents) {
+    if (["done", "error", "merged", "rejected"].includes(ag.status) && ag.endTime && (now - ag.endTime) > EVICTION_AGE_MS) {
+      subAgents.delete(id);
+    }
+  }
+}
+
 function shortId(): string {
   return `sa-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
@@ -97,6 +110,7 @@ async function reviewLoop(
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
   for (let i = 1; i <= maxIterations; i++) {
+    evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
     const r = await runSubProcess(reviewTask, ctxCwd, _defaultModel);
@@ -117,9 +131,12 @@ async function reviewLoop(
     // Guard: CLEAN: false but FOUND: 0 is contradictory — ensure at least 1 fix iteration
     const actualIssuesCount = (!isClean && issuesCount === 0) ? 1 : issuesCount;
 
-    iterations.push({ iter: i, issuesFound: actualIssuesCount, clean: isClean });
+    // When CLEAN: true, mark actualIssuesCount as 0 regardless of FOUND value
+    const actualIssuesCountForIter = isClean ? 0 : actualIssuesCount;
 
-    if (isClean && actualIssuesCount === 0) {
+    iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
+
+    if (isClean) {
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -245,9 +262,19 @@ async function handleImproveMode(
       const { id: fixerId, promise } = spawnSubAgent(task, ctxCwd, { model: _cheapModel });
       const output = await promise;
       // Merge fixer's changes back into the target worktree
-      try { git(["merge", "--no-edit", branchName(fixerId)], workCwd); } catch { /* best effort */ }
+      // If merge fails, report it — reviewLoop will detect the error and abort
+      let mergeSucceeded = false;
+      try {
+        git(["merge", "--no-edit", branchName(fixerId)], workCwd);
+        mergeSucceeded = true;
+      } catch {
+        gitQuiet(["merge", "--abort"], workCwd);
+      }
       subAgents.delete(fixerId);
       cleanupWorktree(projectRoot(ctxCwd), fixerId, true);
+      if (!mergeSucceeded) {
+        return `[Sub-agent error] Merge of fixer ${fixerId} failed — fixer changes cannot be applied.`;
+      }
       return output;
     },
     maxIt,
@@ -266,12 +293,14 @@ async function handleExecuteMode(
   let allClean = true;
   const root = projectRoot(ctxCwd);
 
-  for (let i = 0; i < items.length; i++) {
+  itemLoop: for (let i = 0; i < items.length; i++) {
+    evictTerminalAgents(); // periodic cleanup of stale agent records
     const item = items[i];
     const { id: execId, promise: execPromise } = spawnSubAgent(
       `Execute: ${item.description}. Make changes as needed.`,
       ctxCwd
     );
+    let retainForManualReview = false;
     try {
       const execResult = await execPromise;
       const ag = subAgents.get(execId);
@@ -291,20 +320,26 @@ async function handleExecuteMode(
             try {
               const branch = branchName(execId);
               try { git(["rev-parse", "--verify", branch], ctxCwd); }
-              catch { /* branch missing, skip merge */ cleanupWorktree(root, execId, true); continue; }
-              // Stash any dirty state before merging
+              catch { /* branch missing, skip merge */ cleanupWorktree(root, execId, true); continue itemLoop; }
+              // Stash any dirty state before merging (safer than checkpoint commits)
+              let stashed = false;
               if (gitQuiet(["status", "--porcelain"], ctxCwd).trim()) {
-                gitQuiet(["add", "-A"], ctxCwd);
-                gitQuiet(["commit", "-m", `pi: checkpoint before auto-merge ${execId}`, "--allow-empty"], ctxCwd);
+                gitQuiet(["stash", "push", "-m", `pi: auto-stash before merge ${execId}`], ctxCwd);
+                stashed = true;
               }
               try {
                 git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
                 git(["commit", "-m", `pi: auto-merge ${execId}: ${item.description.substring(0, 60)}`, "--no-edit"], ctxCwd);
+                // Pop stash on successful merge
+                if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
               } catch {
                 // Conflict or merge error — abort and leave branch for manual review
                 gitQuiet(["merge", "--abort"], ctxCwd);
                 mergeHadConflicts = true;
+                retainForManualReview = true;
                 results.push(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
+                // Pop stash back (merge was aborted, so working tree is clean)
+                if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
               }
             } catch { /* merge subsystem failed */ }
             // Clean up worktree + branch + map entry after merge attempt
@@ -325,7 +360,7 @@ async function handleExecuteMode(
         cleanupWorktree(root, execId, true);
       }
     } finally {
-      subAgents.delete(execId);
+      if (!retainForManualReview) subAgents.delete(execId);
     }
   }
 
@@ -376,8 +411,32 @@ function ensureGitRepo(projectRoot: string): string {
           rmSync(gitDir, { recursive: true, force: true });
         } catch { /* can't remove, will fail below */ }
       }
-      // Otherwise keep existing .git and try to recover below
+      // HEAD exists but rev-parse failed — try to repair before falling through
+      if (existsSync(gitDir)) {
+        // Attempt recovery: if basic git commands work, the failure was transient
+        try {
+          git(["symbolic-ref", "HEAD"], projectRoot);
+          return projectRoot;
+        } catch {
+          // Recovery failed — force-remove as last resort
+          try {
+            rmSync(gitDir, { recursive: true, force: true });
+          } catch {
+            throw new Error(
+              `Cannot initialize git repo at ${projectRoot}: .git is corrupted and cannot be removed.`
+            );
+          }
+        }
+      }
     }
+  }
+
+  // Guard: if .git still exists (unremovable corrupted repo), error out
+  // instead of falling through to git init which would also fail
+  if (existsSync(gitDir)) {
+    throw new Error(
+      `Cannot initialize git repo at ${projectRoot}: .git still exists after repair attempt.`
+    );
   }
 
   // Force init
@@ -409,7 +468,8 @@ function createWorktree(projectRoot: string, id: string): string {
 
   // Remove stale worktree if exists
   gitQuiet(["worktree", "remove", "--force", wtDir], projectRoot);
-  // Remove stale branch if exists (skip if active)
+  // Remove stale branch if exists (force delete — stale branches from crashed
+  // sub-agents should be replaced, not preserved)
   gitQuiet(["branch", "-D", branch], projectRoot);
 
   // Ensure HEAD is valid (needed for branch creation)
@@ -424,17 +484,13 @@ function createWorktree(projectRoot: string, id: string): string {
   try { git(["rev-parse", "--verify", branch], projectRoot); }
   catch (e: any) { throw new Error(`Failed to create branch ${branch}: ${e.message || e}`); }
 
-  // Create worktree (stderr contains progress; check for fatals)
-  // Wrap in try-catch to clean up the orphan branch if worktree add fails
+  // Create worktree — use git() directly to detect failure by exit code, not string matching
   try {
-    const addOut = gitQuiet(["worktree", "add", wtDir, branch], projectRoot);
-    if (addOut.toLowerCase().includes("fatal") || addOut.toLowerCase().includes("error:")) {
-      throw new Error(`Worktree add failed: ${addOut.trim()}`);
-    }
+    git(["worktree", "add", wtDir, branch], projectRoot);
   } catch (e: any) {
     // Branch was created but worktree failed — clean up the orphan branch
-    gitQuiet(["branch", "-D", branch], projectRoot);
-    throw e;
+    gitQuiet(["branch", "-d", branch], projectRoot);
+    throw new Error(`Worktree add failed: ${e.stderr || e.message}`);
   }
 
   return wtDir;
@@ -478,7 +534,7 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
   // Always try to remove the directory — git worktree remove may leave stale dirs behind
   try { rmSync(wtDir, { recursive: true, force: true }); } catch { /* ok */ }
   if (deleteBranch) {
-    try { git(["branch", "-D", branch], projectRoot); } catch { /* ok */ }
+    try { git(["branch", "-d", branch], projectRoot); } catch { /* ok */ }
   }
 }
 
@@ -517,7 +573,11 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
       }
     };
     proc.on("close", (code) => { exitCode = code; done(); });
-    proc.on("error", () => done());
+    proc.on("error", (err: Error) => {
+      stderr = `[spawn error] ${err.message}`;
+      exitCode = -2;
+      done();
+    });
     const timer = setTimeout(() => {
       proc.kill("SIGTERM");
       forceKillTimer = setTimeout(() => { forceKillTimer = null; try { proc.kill("SIGKILL"); } catch { /* ok */ } }, 10_000);
@@ -543,7 +603,13 @@ function resolveGitRoot(cwd: string): string {
   } catch {
     // Check if we're inside a git worktree (git rev-parse fails in subdirs of a worktree sometimes)
     try {
-      return git(["rev-parse", "--git-common-dir"], cwd).trim().replace(/\/\.git$/, "");
+      const commonDir = git(["rev-parse", "--git-common-dir"], cwd).trim();
+      // --git-common-dir returns ".git" (relative) in a regular repo
+      // or an absolute path to the shared .git in a worktree
+      if (commonDir === ".git") {
+        return cwd;
+      }
+      return commonDir.replace(/\/\.git$/, "");
     } catch {
       // Last resort: walk up looking for .git
       let dir = cwd;
@@ -583,6 +649,7 @@ function spawnSubAgent(
     };
   }
 
+  evictTerminalAgents(); // prevent unbounded map growth
   const id = shortId();
   const startTime = Date.now();
 
