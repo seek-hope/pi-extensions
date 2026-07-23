@@ -33,7 +33,13 @@ export default function (pi: ExtensionAPI) {
           }),
           signal: _signal,
         });
-        const data: any = await res.json();
+        let data: any;
+        try {
+          data = await res.json();
+        } catch {
+          const body = await res.text();
+          throw new Error(`HuggingFace API returned non-JSON response (${res.status}): ${body.substring(0, 500)}`);
+        }
         const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
         return { content: [{ type: "text", text }], details: {} };
       } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
@@ -67,7 +73,13 @@ export default function (pi: ExtensionAPI) {
           }),
           signal: _signal,
         });
-        const data: any = await res.json();
+        let data: any;
+        try {
+          data = await res.json();
+        } catch {
+          const body = await res.text();
+          throw new Error(`HuggingFace API returned non-JSON response (${res.status}): ${body.substring(0, 500)}`);
+        }
         const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
         return { content: [{ type: "text", text }], details: {} };
       } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
@@ -103,7 +115,13 @@ export default function (pi: ExtensionAPI) {
           }),
           signal: _signal,
         });
-        const data: any = await res.json();
+        let data: any;
+        try {
+          data = await res.json();
+        } catch {
+          const body = await res.text();
+          throw new Error(`HuggingFace API returned non-JSON response (${res.status}): ${body.substring(0, 500)}`);
+        }
         const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
         return { content: [{ type: "text", text }], details: {} };
       } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
