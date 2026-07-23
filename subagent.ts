@@ -773,26 +773,23 @@ export default function (pi: ExtensionAPI) {
     description:
       "Spawn a sub-agent in an isolated git worktree. Supports 3 workflow modes:\n" +
       "- `analyze`: read-only exploration → review → improve → final report (no code changes)\n" +
-      "- `improve`: review diff → fix → re-review loop until clean (needs existing sub-agent ID)\n" +
-      "- `execute`: walk todo items; each: execute → improve loop → next (needs todo items list)\n" +
-      "Without mode, works as simple fire-and-forget spawn (backward compatible).",
+      "- `improve`: analyze target → review → fix → re-review loop until clean (subagentId optional; without it, analyzes cwd first)\n" +
+      "- `execute`: walk todo items; each: execute → improve loop → next (needs todo items list)",
     promptSnippet: "Spawn a sub-agent (analyze/improve/execute).",
     promptGuidelines: [
-      "Use subagent_spawn when a task is self-contained and can be done in parallel with other work.",
       "Use mode='analyze' for research/exploration tasks — it self-improves the analysis quality.",
-      "Use subagent_spawn with mode='improve' to review and fix any work (from spawn, analyze, execute, or manual edits). Requires subagentId.",
+      "Use mode='improve' to review and fix code. Pass subagentId to improve an existing agent's work, or omit it to improve the current codebase directly.",
       "Use mode='execute' with a todo list to churn through tasks, each with its own improve loop.",
-      "Without mode: simple fire-and-forget spawn. Use subagent_review then merge/reject.",
       "Always review sub-agent output before merging — never merge blindly.",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
-      mode: Type.Optional(Type.String({ description: "Workflow: 'analyze', 'improve', or 'execute'. Omit for simple spawn." })),
+      mode: Type.String({ description: "Workflow: 'analyze', 'improve', or 'execute'" }),
       model: Type.Optional(Type.String({ description: "Model override" })),
       tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
       systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt" })),
       timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms (min: 20 min, default: 20 min)" })),
-      subagentId: Type.Optional(Type.String({ description: "Target sub-agent ID to review and improve (any source)" })),
+      subagentId: Type.Optional(Type.String({ description: "Target sub-agent ID to improve (any source). If omitted, improves current codebase." })),
       criteria: Type.Optional(Type.String({ description: "Review criteria (improve mode)" })),
       maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 5, max: 5)" })),
       todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
@@ -808,10 +805,19 @@ export default function (pi: ExtensionAPI) {
 
       // ── IMPROVE mode ────────────────────────────────────────────────
       if (params.mode === "improve") {
-        if (!params.subagentId) {
-          return { content: [{ type: "text", text: "improve mode requires subagentId — spawn a sub-agent first, then improve it." }], details: {}, isError: true };
+        // If no subagentId, first spawn a sub-agent to analyze the code, then improve that
+        let targetId = params.subagentId || null;
+        if (!targetId) {
+          // Phase 0: analyze the codebase first so we have a target to improve
+          const { id: preId, promise: prePromise } = spawnSubAgent(
+            `Analyze: ${params.task}. Read relevant files thoroughly. Make notes about issues found.`,
+            ctx.cwd,
+            { model: _cheapModel, tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"] }
+          );
+          await prePromise;
+          targetId = preId;
         }
-        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, maxIt);
+        const result = await handleImproveMode(targetId!, ctx.cwd, params.criteria, maxIt);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
       }
 
@@ -838,37 +844,8 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: summary }], details: { allClean: result.allClean } };
       }
 
-      // ── DEFAULT: simple fire-and-forget spawn ────────────────────────
-      const { id, promise } = spawnSubAgent(params.task, ctx.cwd, {
-        model: params.model,
-        tools: params.tools ? params.tools.split(",").map((t: string) => t.trim()) : undefined,
-        systemPrompt: params.systemPrompt,
-        timeoutMs: params.timeoutMs,
-      });
-
-      // Fire and forget — return immediately. Catch rejections to avoid unhandled promise warnings.
-      promise.catch((_err) => {
-        // Completion/error will be picked up by subagent_wait
-      });
-
-      return {
-        content: [{
-          type: "text",
-          text: [
-            `Sub-agent spawned. ID: ${id}`,
-            `Branch: ${branchName(id)}`,
-            `Worktree: .pi/subagent/${id}`,
-            `Task: ${params.task}`,
-            `Model: ${params.model || "default"}`,
-            "",
-            `Use subagent_wait("${id}") to collect the result.`,
-            `Use subagent_review("${id}") to inspect the diff.`,
-            `Use subagent_merge("${id}") to accept changes.`,
-            `Use subagent_reject("${id}") to discard.`,
-          ].join("\n"),
-        }],
-        details: { subagentId: id },
-      };
+      // ── Unknown mode ────────────────────────────────────────────────
+      return { content: [{ type: "text", text: `Unknown mode "${params.mode}". Use: analyze, improve, or execute.` }], details: {}, isError: true };
     },
   });
 
