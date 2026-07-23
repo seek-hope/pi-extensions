@@ -159,15 +159,23 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      const maxWidget = 8;
       const lines: string[] = [];
-      for (const item of todo.items) {
+      const statusOrder: TodoStatus[] = ["in_progress", "pending", "completed", "cancelled"];
+
+      // Sort: in_progress first, then pending, then completed/cancelled
+      const sorted = [...todo.items].sort((a, b) => {
+        return statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status);
+      });
+
+      for (const item of sorted) {
         const icon = STATUS_ICONS[item.status] || "○";
-        lines.push(`${icon} [${item.status}] ${item.content}`);
+        lines.push(`${icon} ${item.content}`);
       }
 
-      ctx.ui.setWidget("todo-detail", lines.map(l => `│ ${l}`).slice(0, 15));
-      if (lines.length > 15) {
-        ctx.ui.notify(`${lines.length - 15} more items not shown.`, "info");
+      ctx.ui.setWidget("todo-detail", lines.slice(0, maxWidget).map((l, i) => `│ ${i + 1}. ${l}`));
+      if (lines.length > maxWidget) {
+        ctx.ui.notify(`${lines.length - maxWidget} more items. Use /todo repeatedly or check the last todo_write response for full list.`, "info");
       }
     },
   });
