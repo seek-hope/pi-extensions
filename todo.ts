@@ -44,12 +44,13 @@ function renderWidget(ctx?: any): void {
 
   const total = todo.items.length;
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
+  const maxItems = total <= 8 ? total : 7; // header+footer=2, more-line=1 → 10 max
   const lines: string[] = [];
   lines.push(`┌─ Todo (${done}/${total}) ──────────────────────────`);
 
-  for (const item of todo.items) {
+  for (let i = 0; i < Math.min(total, maxItems); i++) {
+    const item = todo.items[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    // Strip control characters from item content to prevent terminal injection
     const safeContent = item.content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").replace(/\n/g, " ");
     if (item.status === "in_progress") {
       lines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
@@ -60,11 +61,10 @@ function renderWidget(ctx?: any): void {
     } else {
       lines.push(`│ ${icon} ${safeContent}`);
     }
-    if (lines.length >= 11) break; // 10 items max (header + 9 items + summary)
   }
 
-  if (todo.items.length > 10) {
-    lines.push(`│ ... (${todo.items.length - 10} more, /todo for full list)`);
+  if (total > maxItems) {
+    lines.push(`│ ... (${total - maxItems} more, /todo for full)`);
   }
   lines.push(`└──────────────────────────────────────────`);
 
