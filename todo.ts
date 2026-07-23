@@ -159,24 +159,28 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const maxWidget = 8;
-      const lines: string[] = [];
       const statusOrder: TodoStatus[] = ["in_progress", "pending", "completed", "cancelled"];
+      const maxWidget = 8;
+      const total = todo.items.length;
+      const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
 
-      // Sort: in_progress first, then pending, then completed/cancelled
       const sorted = [...todo.items].sort((a, b) => {
         return statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status);
       });
 
-      for (const item of sorted) {
-        const icon = STATUS_ICONS[item.status] || "○";
-        lines.push(`${icon} ${item.content}`);
-      }
+      // Widget: first 8 items
+      const widgetLines = sorted.slice(0, maxWidget).map((item, i) =>
+        `│ ${i + 1}. ${STATUS_ICONS[item.status]} ${item.content}`
+      );
+      if (sorted.length > maxWidget) widgetLines.push(`│ ... ${sorted.length - maxWidget} more`);
+      ctx.ui.setWidget("todo-detail", widgetLines);
 
-      ctx.ui.setWidget("todo-detail", lines.slice(0, maxWidget).map((l, i) => `│ ${i + 1}. ${l}`));
-      if (lines.length > maxWidget) {
-        ctx.ui.notify(`${lines.length - maxWidget} more items. Use /todo repeatedly or check the last todo_write response for full list.`, "info");
-      }
+      // Full list as text so user can scroll
+      const fullLines = sorted.map((item, i) =>
+        `${i + 1}. ${STATUS_ICONS[item.status]} [${item.status}] ${item.content}`
+      );
+      const text = `=== Todo (${done}/${total}) ===\n\n` + fullLines.join("\n");
+      ctx.ui.notify(text, "info");
     },
   });
 
