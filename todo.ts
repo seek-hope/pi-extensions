@@ -31,6 +31,7 @@ const STATUS_ICONS: Record<TodoStatus, string> = {
 
 let _pi: ExtensionAPI | null = null;
 let todo: TodoList = { items: [], updatedAt: 0 };
+let detailWidgetActive = false;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -46,9 +47,6 @@ function renderWidget(ctx?: any): void {
 
   const total = todo.items.length;
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
-  const maxItems = active.length <= 8 ? active.length : 7;
-  const lines: string[] = [];
-  lines.push(`┌─ Todo (${done}/${total} done) ────────────────`);
 
   // Show active items first: in_progress, then pending
   const sorted = [...active].sort((a, b) => {
@@ -57,10 +55,18 @@ function renderWidget(ctx?: any): void {
     return 0;
   });
 
-  for (let i = 0; i < Math.min(sorted.length, maxItems); i++) {
+  const limit = Math.min(sorted.length, 7);
+  const lines: string[] = [];
+  lines.push(`┌─ Todo (${done}/${total} done) ────────────────`);
+
+  for (let i = 0; i < limit; i++) {
     const item = sorted[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    const safeContent = item.content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").replace(/\n/g, " ");
+    // Strip control chars (including CR, excluding TAB/LF), then flatten whitespace
+    const safeContent = item.content
+      .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
+      .replace(/\t/g, " ")
+      .replace(/\n/g, " ");
     if (item.status === "in_progress") {
       lines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
     } else {
@@ -68,8 +74,9 @@ function renderWidget(ctx?: any): void {
     }
   }
 
-  if (sorted.length > maxItems) {
-    lines.push(`│ ... ${sorted.length - maxItems} more active, /todo for full`);
+  const remaining = sorted.length - limit;
+  if (remaining > 0) {
+    lines.push(`│ ... ${remaining} more active, /todo for full`);
   }
   lines.push(`└──────────────────────────────────────────`);
 
@@ -105,6 +112,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const validStatuses = new Set<TodoStatus>(["pending", "in_progress", "completed", "cancelled"]);
+      const warnings: string[] = [];
 
       // Validate and normalize
       const items: TodoItem[] = params.items.map((item: any, i: number) => {
@@ -116,10 +124,13 @@ export default function (pi: ExtensionAPI) {
           const s = item.status.trim().toLowerCase();
           if (validStatuses.has(s as TodoStatus)) {
             status = s as TodoStatus;
+          } else {
+            warnings.push(`Item ${i + 1}: invalid status "${item.status}" → defaulting to "pending"`);
           }
         }
 
-        return { content: content.substring(0, 200), status };
+        const truncated = content.length > 200;
+        return { content: content.substring(0, 200) + (truncated ? "…" : ""), status };
       });
 
       // Enforce: only one in_progress
@@ -146,9 +157,11 @@ export default function (pi: ExtensionAPI) {
           const icon = STATUS_ICONS[s as TodoStatus] || "○";
           return `  ${icon} ${n} ${s.replace("_", " ")}`;
         }),
+        ...(warnings.length > 0 ? ["", "⚠ warnings:", ...warnings.map(w => `  ${w}`)] : []),
       ];
 
       // Clear detail widget since todo was updated
+      detailWidgetActive = false;
       ctx.ui?.setWidget?.("todo-detail", undefined);
 
       return { content: [{ type: "text", text: summary.join("\n") }], details: { count: items.length, counts, items: items.map(i => ({ content: i.content, status: i.status })) } };
@@ -172,17 +185,82 @@ export default function (pi: ExtensionAPI) {
         return statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status);
       });
 
-      // Full list as text — widget is managed by renderWidget() from todo_write
-      const fullLines = sorted.map((item, i) =>
-        `${i + 1}. ${STATUS_ICONS[item.status]} ${item.content}`
-      );
-      const text = `=== Todo (${done}/${total}) ===\n\n` + fullLines.join("\n");
-      ctx.ui.notify(text, "info");
+      // Build detail widget lines
+      const detailLines: string[] = [];
+      detailLines.push(`┌─ Todo detail (${done}/${total} done) ─────────────`);
+      for (const item of sorted) {
+        const icon = STATUS_ICONS[item.status];
+        const safeContent = item.content
+          .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
+          .replace(/\t/g, " ")
+          .replace(/\n/g, " ");
+        if (item.status === "in_progress") {
+          detailLines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
+        } else {
+          detailLines.push(`│ ${icon} ${safeContent}`);
+        }
+      }
+      detailLines.push(`└──────────────────────────────────────────`);
+      detailLines.push(`(${total} items · /todo to toggle)`);
+
+      if (detailWidgetActive) {
+        // Toggle off
+        ctx.ui.setWidget("todo-detail", undefined);
+        detailWidgetActive = false;
+        ctx.ui.notify(`Todo detail hidden (${done}/${total} done)`, "info");
+      } else {
+        // Show detail
+        ctx.ui.setWidget("todo-detail", detailLines);
+        detailWidgetActive = true;
+        ctx.ui.notify(`Todo detail shown (${done}/${total} done). /todo to hide.`, "info");
+      }
     },
   });
 
-  // ── session_shutdown: clear widget ───────────────────────────────────
+  // ── session_start: restore widget on resume ─────────────────────────
+  pi.on("session_start", async (_event, ctx) => {
+    // Reconstruct state from last todo_write result in the current branch
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "message") continue;
+      const msg = entry.message;
+      if (msg.role === "toolResult" && msg.toolName === "todo_write") {
+        const details = msg.details as { items?: TodoItem[]; updatedAt?: number } | undefined;
+        if (details?.items) {
+          todo = { items: details.items, updatedAt: details.updatedAt || Date.now() };
+        }
+      }
+    }
+    detailWidgetActive = false;
+    renderWidget(ctx);
+  });
+
+  // ── session_tree: rebuild state after tree navigation ────────────────
+  pi.on("session_tree", async (_event, ctx) => {
+    // Reset and reconstruct for the new branch point
+    todo = { items: [], updatedAt: 0 };
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "message") continue;
+      const msg = entry.message;
+      if (msg.role === "toolResult" && msg.toolName === "todo_write") {
+        const details = msg.details as { items?: TodoItem[]; updatedAt?: number } | undefined;
+        if (details?.items) {
+          todo = { items: details.items, updatedAt: details.updatedAt || Date.now() };
+        }
+      }
+    }
+    detailWidgetActive = false;
+    ctx.ui?.setWidget?.("todo-detail", undefined);
+    renderWidget(ctx);
+  });
+
+  // ── session_shutdown: clear widgets and references ───────────────────
   pi.on("session_shutdown", () => {
-    if (_pi) _pi.ui.setWidget("todo", undefined);
+    if (_pi) {
+      _pi.ui.setWidget("todo", undefined);
+      _pi.ui.setWidget("todo-detail", undefined);
+    }
+    detailWidgetActive = false;
+    todo = { items: [], updatedAt: 0 };
+    _pi = null;
   });
 }
