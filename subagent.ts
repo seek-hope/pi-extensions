@@ -547,7 +547,7 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
   return new Promise((resolve) => {
     const args: string[] = ["-p", "--no-context-files", "--no-session"];
     if (model) args.push("--model", model);
-    args.push("--", task);
+    args.push(task);
     const proc = spawn("pi", args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -700,7 +700,7 @@ function spawnSubAgent(
       args.push("--tools", toolsArg);
     }
     if (options?.systemPrompt) args.push("--system-prompt", options.systemPrompt);
-    args.push("--", task);
+    args.push(task);
 
     const proc = spawn("pi", args, {
       cwd: worktreePath,
