@@ -63,6 +63,7 @@ const checks: Check[] = [
     exists: (cwd) => existsSync(join(cwd, ".codegraph")) || existsSync(join(cwd, ".codegraph.json")),
     init: (cwd) => sh("codegraph init", cwd),
     description: "Code intelligence index",
+    skipInHome: true,
   },
   {
     name: "DocRelay",
@@ -70,6 +71,7 @@ const checks: Check[] = [
     exists: (cwd) => existsSync(join(cwd, ".docrelay")) || existsSync(join(cwd, ".docrelay.db")),
     init: (cwd) => sh("doc-relay init --no-hooks --no-integrate", cwd),
     description: "Documentation sync",
+    skipInHome: true,
   },
   {
     name: "Serena",
@@ -77,6 +79,7 @@ const checks: Check[] = [
     exists: (cwd) => existsSync(join(cwd, ".serena")),
     init: (cwd) => sh("serena project create --index", cwd),
     description: "Semantic code tools",
+    skipInHome: true,
   },
 ];
 
