@@ -261,11 +261,7 @@ async function handleImproveMode(
       const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const { id: fixerId, promise } = spawnSubAgent(task, ctxCwd, { model: _cheapModel || _defaultModel });
       const output = await promise;
-      // Merge fixer's changes back into the target worktree
-      // If merge fails, report it — reviewLoop will detect the error and abort
-      let mergeSucceeded = false;
-      try {
-        // Commit any uncommitted changes in the target worktree before merging
+      // Commit any uncommitted changes in the target worktree before merging
       try { git(["add", "-A"], workCwd); git(["commit", "-m", `pre-merge checkpoint`, "--allow-empty"], workCwd); } catch { /* ok */ }
       // Merge fixer's changes back into the target worktree
       let mergeSucceeded = false;
