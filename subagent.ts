@@ -789,12 +789,6 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     let exitCode: number | null = null;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
-    // Early abort check — before attaching listeners to avoid resource leak
-    if (signal?.aborted) {
-      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-      return void resolve({ stdout: "", stderr: "[cancelled]", exitCode: -3 });
-    }
-
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
@@ -824,7 +818,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       done();
     });
 
-    // Wire up AbortSignal for mid-flight cancellation
+    // Wire up AbortSignal for mid-flight cancellation BEFORE early check to prevent race
     if (signal) {
       abortHandler = () => {
         try { proc.kill("SIGKILL"); } catch { /* already dead */ }
@@ -833,6 +827,11 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
         done();
       };
       signal.addEventListener("abort", abortHandler, { once: true });
+    }
+    // Early abort check — after attaching listener to prevent signal firing between check and listener
+    if (signal?.aborted) {
+      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+      return void resolve({ stdout: "", stderr: "[cancelled]", exitCode: -3 });
     }
 
     const timer = setTimeout(() => {
@@ -872,7 +871,8 @@ function resolveGitRoot(cwd: string): string {
       // --git-common-dir returns ".git" (relative) in a regular repo
       // or an absolute path like /path/to/main/.git/worktrees/sa-xxx in a worktree
       if (commonDir === ".git") {
-        return cwd;
+        // Fall through to walk-up logic below — don't return cwd which may be a subdirectory
+        throw new Error("relative .git — need to walk up");
       }
       // Strip /.git or /.git/worktrees/<name> suffix to get the repo root
       return commonDir.replace(/\/\.git(?:\/worktrees\/[^\/]+)?$/, "");
@@ -1285,6 +1285,20 @@ export default function (pi: ExtensionAPI) {
               if (!retainForManualReview) {
                 cleanupWorktree(projectRoot(ctx.cwd), params.subagentId, true);
                 subAgents.delete(params.subagentId);
+              }
+            } else if (!ag) {
+              // Agent was evicted from map — reconstruct branch and merge anyway
+              const safe = safeId(params.subagentId);
+              if (safe) {
+                const wtPath = join(projectRoot(ctx.cwd), ".pi", "subagent", safe);
+                if (existsSync(wtPath)) {
+                  const { retainForManualReview } = autoMergeBranch(
+                    ctx.cwd, params.subagentId, "delegated task"
+                  );
+                  if (!retainForManualReview) {
+                    cleanupWorktree(projectRoot(ctx.cwd), params.subagentId, true);
+                  }
+                }
               }
             }
           } catch { /* best effort cleanup */ }
