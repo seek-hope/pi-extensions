@@ -86,10 +86,10 @@ function shortId(): string {
 /** Validate/sanitize a potentially user-provided sub-agent id for use in git branch names.
  *  Returns a safe version or null if the id is completely invalid. */
 function safeId(raw: string): string | null {
-  const hash = createHash("sha1").update(raw).digest("hex").substring(0, 8);
   // Allow alphanumeric, dash, underscore. Replace anything else.
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "");
   if (cleaned.length === 0 || cleaned.length > 71) return null;
+  const hash = createHash("sha1").update(raw).digest("hex").substring(0, 8);
   return `${cleaned}-${hash}`;
 }
 
@@ -119,14 +119,20 @@ function refreshModels() {
 
 refreshModels();
 
-function branchName(id: string): string {
-  const safe = safeId(id);
-  if (!safe) {
+function branchName(id: string, safe?: string | null): string {
+  const s = safe ?? safeId(id);
+  if (!s) {
     // Fallback: hash the raw id to produce a stable, safe branch component
     const hash = createHash("sha1").update(id).digest("hex").substring(0, 12);
     return `pi/subagent/fallback-${hash}`;
   }
-  return `pi/subagent/${safe}`;
+  return `pi/subagent/${s}`;
+}
+
+// ── Todo bridge helper ───────────────────────────────────────────────────────
+
+function getTodoBridge(): any {
+  return (globalThis as any).__pi_todo;
 }
 
 // ── Unified Review Loop Engine ─────────────────────────────────────────────
@@ -159,7 +165,7 @@ async function reviewLoop(
       return { iterations: i - 1, clean: false, summary: `❌ Overall review loop deadline (${(MAX_LOOP_DURATION_MS / 1000).toFixed(0)}s) exceeded at round ${i}.` };
     }
     // Update todo progress if bridge available
-    const tb = (globalThis as any).__pi_todo;
+    const tb = getTodoBridge();
     if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
 
     evictTerminalAgents(); // periodic cleanup of stale agent records
@@ -252,13 +258,13 @@ async function reviewLoop(
         // caller retries the improve loop, a clean review round would start fresh.
         try { gitQuiet(["checkout", "--", "."], workCwd); } catch { /* best effort */ }
         try { gitQuiet(["clean", "-fd"], workCwd); } catch { /* best effort */ }
-        return { iterations: i, clean: false, summary: `❌ Fix committed but git commit failed at round ${i}. Aborting to avoid stale state.` };
+        return { iterations: i, clean: false, summary: `❌ Fix applied but git commit failed at round ${i}. Aborting to avoid stale state.` };
       }
     }
   }
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
-  const tb = (globalThis as any).__pi_todo;
+  const tb = getTodoBridge();
   if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
@@ -416,12 +422,16 @@ async function handleImproveMode(
       return parts.join("\n");
     },
     async (issuesCount, reviewerOutput, _i) => {
+      // Check for cancellation before running the fixer to avoid wasted work
+      if (signal?.aborted) {
+        return "[cancelled by user]";
+      }
       // Fixer runs directly in the target worktree (no merge needed)
       // reviewLoop handles committing (via commitWorktree) after each fixer round when
       // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
       // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
       const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-      const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash", undefined, signal);
+      const r = await runSubProcess(fixerTask, workCwd, _defaultModel, "read,edit,write,bash", undefined, signal);
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
       if (r.exitCode !== 0) {
@@ -682,7 +692,7 @@ function ensureGitRepo(projectRoot: string): string {
 function createWorktree(projectRoot: string, id: string): string {
   const safe = safeId(id);
   if (!safe) throw new Error(`Invalid sub-agent id for worktree: "${id.substring(0, 40)}"`);
-  const branch = branchName(id);
+  const branch = branchName(id, safe);
   const wtDir = join(projectRoot, ".pi", "subagent", safe);
 
   // Ensure .pi/subagent directory exists
@@ -868,10 +878,22 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
   } catch (mergeErr: any) {
     const unmerged = gitQuiet(["ls-files", "-u"], ctxCwd).trim();
     const isConflict = unmerged.length > 0;
-    gitQuiet(["merge", "--abort"], ctxCwd);
-    if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* best effort */ } }
+    // Parse unique filenames from ls-files -u output BEFORE abort (which clears conflict state)
+    let conflictFiles = "";
     if (isConflict) {
-      const conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctxCwd);
+      const seen = new Set<string>();
+      for (const line of unmerged.split('\n')) {
+        const tabIdx = line.indexOf('\t');
+        if (tabIdx >= 0) {
+          const path = line.substring(tabIdx + 1);
+          if (path) seen.add(path);
+        }
+      }
+      conflictFiles = [...seen].join('\n');
+    }
+    gitQuiet(["merge", "--abort"], ctxCwd);
+    if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after merge conflict \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
+    if (isConflict) {
       return { success: false, retainForManualReview: true, hasConflicts: true, conflictFiles, error: "Merge conflicts" };
     }
     return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: (mergeErr as any).stderr || (mergeErr as any).message || "Unknown merge error" };
@@ -883,18 +905,18 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
   } catch (commitErr: any) {
     if (options.onCommitFailure === "abort-merge") {
       gitQuiet(["merge", "--abort"], ctxCwd);
-      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* ok */ } }
+      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after abort-merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
       return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `Commit failed: ${(commitErr.message || "").substring(0, 200)}` };
     } else {
       // keep-merge: merge applied but commit failed — retain branch for manual review
       console.error(`  \u26a0 Merge of ${execId} applied but commit failed (${(commitErr.message || "").substring(0, 80)}). Branch retained for manual review.`);
-      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* ok */ } }
+      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after keep-merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
       return { success: false, retainForManualReview: true, hasConflicts: false, conflictFiles: "" };
     }
   }
 
   // Success
-  if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* best effort */ } }
+  if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after successful merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
   return { success: true, retainForManualReview: false, hasConflicts: false, conflictFiles: "" };
 }
 
@@ -929,6 +951,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
     let abortHandler: (() => void) | null = null;
+    let timer: NodeJS.Timeout | null = null;
     const done = () => {
       if (!resolved) {
         resolved = true;
@@ -974,7 +997,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       return;
     }
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       // Use a separate timedOut flag instead of setting exitCode = -1 as a sentinel.
       // This avoids a race where the process exits naturally with code 0 between the
       // assignment and the close handler firing, permanently masking the real exit code.
@@ -1424,7 +1447,7 @@ export default function (pi: ExtensionAPI) {
       // ── ANALYZE mode ────────────────────────────────────────────────
       if (params.mode === "analyze") {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
-        const tb = (globalThis as any).__pi_todo;
+        const tb = getTodoBridge();
         const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
@@ -1437,7 +1460,7 @@ export default function (pi: ExtensionAPI) {
       if (params.mode === "improve") {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
         // Add a todo item so progress is visible in the todo flow widget
-        const tb = (globalThis as any).__pi_todo;
+        const tb = getTodoBridge();
         // Use a unique match key incorporating the task text to avoid substring collisions
         const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
@@ -1445,7 +1468,8 @@ export default function (pi: ExtensionAPI) {
 
         // If no subagentId, improve the current codebase directly (no worktree)
         // This avoids cross-repo mismatch when extensions live in a different git repo
-        if (!params.subagentId) {
+        // Only treat undefined/null as "no subagentId" — empty string is an invalid ID
+        if (params.subagentId === undefined || params.subagentId === null) {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey);
           if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
@@ -1533,14 +1557,26 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Sub-agent ID" }),
       timeoutMs: Type.Optional(Type.Number({ description: "Max wait ms (default: 1200000 = 20 min)" })),
     }),
-    async execute(_id, params, _signal) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       const ag = subAgents.get(params.id);
       if (!ag) {
-        return {
-          content: [{ type: "text", text: `Sub-agent ${params.id} not found. It may have already completed or never existed.` }],
-          details: {},
-          isError: true,
-        };
+        // Recovery: the agent may have been evicted from the map but the git branch
+        // and worktree still exist. Check the branch to provide a helpful message.
+        try {
+          const branch = branchName(params.id);
+          const root = projectRoot(ctx?.cwd || process.cwd());
+          git(["rev-parse", "--verify", branch], root);
+          return {
+            content: [{ type: "text", text: `Sub-agent ${params.id} not in memory (evicted) but git branch ${branch} still exists. Use subagent_review to inspect and merge/reject.` }],
+            details: { status: "evicted", branch },
+          };
+        } catch {
+          return {
+            content: [{ type: "text", text: `Sub-agent ${params.id} not found and its git branch does not exist either. It may have already completed and been cleaned up.` }],
+            details: {},
+            isError: true,
+          };
+        }
       }
 
       const deadline = Date.now() + (params.timeoutMs || 1_200_000);
