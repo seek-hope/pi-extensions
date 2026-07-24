@@ -667,12 +667,11 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     // Capture the pre-commit HEAD hash so we can undo the commit on rev-parse failure.
     // This prevents duplicate commits if the caller retries after a false "failed" return.
     preCommitHash = git(["rev-parse", "HEAD"], worktreePath).trim();
-    // Use git add -u (tracked files only) to avoid accidentally committing build
-    // artifacts, large binaries, core dumps, logs, or secrets that the sub-agent
-    // may have created. In a git worktree, the sub-agent should only modify
-    // existing tracked files; new untracked files are intentionally excluded
-    // from auto-commit as a security precaution.
-    git(["add", "-u"], worktreePath);
+    // Use git add -A to stage all changes including new files the sub-agent may
+    // have created via the write tool. The .gitignore file still excludes build
+    // artifacts, binaries, logs, and secrets; -A is safe because the worktree
+    // is dedicated to this sub-agent's task and should reflect the full diff.
+    git(["add", "-A"], worktreePath);
     git(["commit", "-m", msg], worktreePath);
     const hash = git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
     return hash;
