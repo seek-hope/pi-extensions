@@ -243,6 +243,11 @@ async function reviewLoop(
         // were needed (e.g., false positive review). Continue the loop.
       } else if (!hash) {
         console.error(`reviewLoop: commitWorktree failed at iteration ${i} in ${workCwd}`);
+        // Reset the worktree to prevent residual uncommitted changes from leaking
+        // into the next iteration. The fixer's changes remain uncommitted; if the
+        // caller retries the improve loop, a clean review round would start fresh.
+        try { gitQuiet(["checkout", "--", "."], workCwd); } catch { /* best effort */ }
+        try { gitQuiet(["clean", "-fd"], workCwd); } catch { /* best effort */ }
         return { iterations: i, clean: false, summary: `❌ Fix committed but git commit failed at round ${i}. Aborting to avoid stale state.` };
       }
     }
@@ -356,6 +361,10 @@ async function handleImproveMode(
       try { git(["rev-parse", "--verify", branchName(targetAgentId)], ctxCwd); }
       catch {
         return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree exists but branch is missing.` };
+      }
+      // Verify it's a valid git worktree (contains .git file or .git directory)
+      if (!existsSync(join(reconstructed, ".git"))) {
+        return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree ${reconstructed} is not a valid git worktree (missing .git).` };
       }
       workCwd = reconstructed;
     } else {
@@ -687,6 +696,8 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
   } catch {
     truncated = [...task].slice(0, 80).join('');
   }
+  // Guard against empty truncated message (e.g., task consisting entirely of zero-width characters)
+  if (!truncated || !truncated.trim()) truncated = "(empty task)";
   const msg = id ? `pi: ${id} — ${truncated}` : `pi: ${truncated}`;
 
   if (!worktreePath || !existsSync(join(worktreePath, ".git"))) return "";
@@ -719,7 +730,9 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     // next call's `git add -A` re-stages everything (no-op for already-staged
     // files), and a successful commit would bundle changes from *both* iterations
     // under a single message, losing the per-iteration audit trail.
-    try { git(["reset", "HEAD"], worktreePath); } catch { /* best effort */ }
+    try { git(["reset", "HEAD"], worktreePath); } catch (resetErr: any) {
+      console.error(`commitWorktree: git reset HEAD also failed in ${worktreePath}: ${(resetErr.message || resetErr).substring(0, 200)}`);
+    }
     console.error(`commitWorktree failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
     return "";
   }
@@ -899,7 +912,10 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     // Early abort check — after attaching listener to prevent signal firing between check and listener
     if (signal?.aborted) {
       try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-      return void resolve({ stdout: "", stderr: "[cancelled]", exitCode: -3 });
+      stderr = "[cancelled]";
+      exitCode = -3;
+      done(); // Call done() to clean up timers and listeners, not raw resolve()
+      return;
     }
 
     const timer = setTimeout(() => {
@@ -2056,19 +2072,27 @@ export default function (pi: ExtensionAPI) {
             // If the sentinel persisted (unlinkSync failed in settle()), a subsequent session_start
             // would delete the branch and destroy committed work. Preserve unmerged commits by
             // moving the branch to the recovered/ namespace.
+            // First, check if the branch actually exists before attempting merge-base.
+            let branchExists = false;
             try {
-              const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
-              const branchTip = git(["rev-parse", branch], root).trim();
-              if (mergeBase !== branchTip) {
-                const recoveredBranch = `recovered/subagent/${entry}`;
-                git(["branch", "-m", branch, recoveredBranch], root);
-                console.warn(`[subagent] Stale sentinel for ${entry}: worktree removed; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
-              } else {
+              git(["rev-parse", "--verify", branch], root);
+              branchExists = true;
+            } catch { /* branch already deleted — nothing to preserve */ }
+            if (branchExists) {
+              try {
+                const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
+                const branchTip = git(["rev-parse", branch], root).trim();
+                if (mergeBase !== branchTip) {
+                  const recoveredBranch = `recovered/subagent/${entry}`;
+                  git(["branch", "-m", branch, recoveredBranch], root);
+                  console.warn(`[subagent] Stale sentinel for ${entry}: worktree removed; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
+                } else {
+                  git(["branch", "-D", branch], root);
+                }
+              } catch {
+                // merge-base or rev-parse failed — force delete
                 git(["branch", "-D", branch], root);
               }
-            } catch {
-              // merge-base or rev-parse failed (e.g., branch doesn't exist) — force delete
-              git(["branch", "-D", branch], root);
             }
             unlinkSync(sentinel);
           } catch {
