@@ -261,14 +261,12 @@ async function handleImproveMode(
       // Fixer runs directly in the target worktree (no merge needed)
       const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
-      // CRITICAL: commit fixer edits in all relevant repos
+      // Commit fixer edits in the actual project repo (extensions, not home dir)
       try {
-        const roots = [workCwd, join(homedir(), ".pi", "agent", "extensions")];
-        for (const r of roots) {
-          if (existsSync(join(r, ".git")) && gitQuiet(["status", "--porcelain"], r).trim()) {
-            gitQuiet(["add", "-A"], r);
-            gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], r);
-          }
+        const repo = join(homedir(), ".pi", "agent", "extensions");
+        if (existsSync(join(repo, ".git")) && gitQuiet(["status", "--porcelain"], repo).trim()) {
+          gitQuiet(["add", "-A"], repo);
+          gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], repo);
         }
       } catch (e) { /* best effort */ }
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
@@ -507,29 +505,21 @@ function getDiff(projectRoot: string, id: string): string {
   }
 }
 
-/** Commit changes in a worktree. Also handles nested repos (e.g. extensions dir). */
-function commitWorktree(worktreePath: string, id: string, task: string): string {
+/** Commit changes in the actual project repo(s), NOT the home directory. */
+function commitWorktree(_worktreePath: string, id: string, task: string): string {
   const msg = `pi: ${id} — ${task.substring(0, 80)}`;
   let lastHash = "";
-  // Commit in the primary repo
-  try {
-    if (gitQuiet(["status", "--porcelain"], worktreePath).trim()) {
-      gitQuiet(["add", "-A"], worktreePath);
-      gitQuiet(["commit", "-m", msg], worktreePath);
-      lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], worktreePath).trim();
-    }
-  } catch { /* ok */ }
-  // Also commit in nested repos that may contain edited files (e.g. ~/.pi/agent/extensions/)
-  const nestedRepos = [
+  // extensions repo is the real project repo; home dir only hosts worktrees
+  const repos = [
     join(homedir(), ".pi", "agent", "extensions"),
   ];
-  for (const nr of nestedRepos) {
-    if (existsSync(join(nr, ".git"))) {
+  for (const repo of repos) {
+    if (existsSync(join(repo, ".git"))) {
       try {
-        if (gitQuiet(["status", "--porcelain"], nr).trim()) {
-          gitQuiet(["add", "-A"], nr);
-          gitQuiet(["commit", "-m", msg], nr);
-          lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], nr).trim() || lastHash;
+        if (gitQuiet(["status", "--porcelain"], repo).trim()) {
+          gitQuiet(["add", "-A"], repo);
+          gitQuiet(["commit", "-m", msg], repo);
+          lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
         }
       } catch { /* ok */ }
     }
