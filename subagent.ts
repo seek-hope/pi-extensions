@@ -22,7 +22,7 @@ interface SubAgent {
   worktreePath: string;
   projectRoot: string;
   task: string;
-  status: "running" | "done" | "error" | "cancelled" | "merged" | "rejected";
+  status: "running" | "done" | "error" | "cancelled" | "merged" | "rejected" | "improving";
   startTime: number;
   endTime?: number;
   result?: string;
@@ -57,14 +57,14 @@ function evictTerminalAgents(): void {
           if (resolved && resolved !== ag.worktreePath) {
             cleanupWorktree(resolved, ag.id, ag.status !== "done" && ag.status !== "merged");
           } else {
-            try { rmSync(ag.worktreePath, { recursive: true, force: true }); } catch { /* ok */ }
-            // Attempt to delete the git branch to prevent orphan branches when the
-            // resolved root matches the worktree path (no parent git repo found).
+            // Delete the git branch FIRST to avoid orphan branches — the branch delete
+            // uses the worktree path as CWD, which won't exist after rmSync.
             try { gitQuiet(["branch", "-D", branchName(ag.id)], ag.worktreePath); } catch { /* ok */ }
+            try { rmSync(ag.worktreePath, { recursive: true, force: true }); } catch { /* ok */ }
           }
         } catch {
-          try { rmSync(ag.worktreePath, { recursive: true, force: true }); } catch { /* ok */ }
           try { gitQuiet(["branch", "-D", branchName(ag.id)], ag.worktreePath); } catch { /* ok */ }
+          try { rmSync(ag.worktreePath, { recursive: true, force: true }); } catch { /* ok */ }
         }
       }
       subAgents.delete(id);
@@ -243,7 +243,7 @@ async function reviewLoop(
     }
     // Require the full bracketed pattern (including closing `]`) to avoid false positives
     // from legitimate output that happens to start with "[Sub-agent error...".
-    if (/^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(fixerOutput)) {
+    if (/^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") {
@@ -402,10 +402,10 @@ async function handleImproveMode(
   // delete the worktree out from under the active review loop.
   const originalStatus = existing?.status;
   if (existing && originalStatus && ["done", "error", "merged", "rejected", "cancelled"].includes(originalStatus)) {
-    existing.status = "improving" as any;
+    existing.status = "improving";
   }
 
-  let _loopResult: LoopResult;
+  let _loopResult: LoopResult = { iterations: 0, clean: false, summary: "" };
   try {
     _loopResult = await reviewLoop(
       ctxCwd, workCwd,
@@ -503,7 +503,7 @@ async function handleExecuteMode(
       const execResult = await execPromise;
       const ag = subAgents.get(execId);
       if (ag) {
-        if (ag.status === "error" || ag.status === "cancelled" || /^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(execResult)) {
+        if (ag.status === "error" || ag.status === "cancelled" || /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(execResult)) {
           results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
           allClean = false;
           // Preserve worktree and branch for commit failures so the user can inspect
@@ -791,7 +791,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     } catch {
       const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
       if (fullHash) return fullHash.substring(0, 7);
-      return "";
+      return "committed-but-no-hash";
     }
   } catch (e: any) {
     // git add or git commit failed. Reset the index to prevent dirty staging area
@@ -965,22 +965,26 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
         if (abortHandler && signal) {
           signal.removeEventListener("abort", abortHandler);
         }
+        proc.removeListener("close", closeHandler);
+        proc.removeListener("error", errorHandler);
         resolve({ stdout, stderr, exitCode });
       }
     };
-    proc.on("close", (code) => {
+    const closeHandler = (code: number | null) => {
       // When timeout fired AND the process was killed by signal (null), keep the -1 sentinel.
       // If the process exited naturally (non-null) concurrent with the timer, trust the real exit code.
       if (!timedOut || code === null) {
         exitCode = code;
       }
       done();
-    });
-    proc.on("error", (err: Error) => {
+    };
+    const errorHandler = (err: Error) => {
       stderr = `[spawn error] ${err.message}`;
       exitCode = -2;
       done();
-    });
+    };
+    proc.on("close", closeHandler);
+    proc.on("error", errorHandler);
 
     // Wire up AbortSignal for mid-flight cancellation BEFORE early check to prevent race
     if (signal) {
