@@ -353,6 +353,18 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         reject(new Error(`SSH stdin error: ${err.message}`));
       });
     };
+
+    // Also handle process exit — covers the race where proc dies between the check above
+    // and the listener registration (TOCTOU window)
+    const onProcExit = (code: number | null) => {
+      done(() => {
+        clearTimeout(timer);
+        conn.pending.delete(reqId);
+        reject(new Error(`SSH shell exited (code ${code}) before command could be written`));
+      });
+    };
+    conn.proc.once("exit", onProcExit);
+
     conn.proc.stdin!.once("error", onStdinError);
 
     conn.pending.set(reqId, { resolve, reject, rand, timer });
@@ -366,10 +378,12 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         conn.proc.stdin!.once("drain", () => {
           // Data flushed successfully — response will arrive via extractResponses
           conn.proc.stdin!.removeListener("error", onStdinError);
+          conn.proc!.removeListener("exit", onProcExit);
         });
         // If the process dies during drain, the exit handler on the proc will reject
       } else {
         conn.proc.stdin!.removeListener("error", onStdinError);
+        conn.proc.removeListener("exit", onProcExit);
       }
     } catch (writeErr: any) {
       done(() => {
@@ -377,6 +391,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         conn.pending.delete(reqId);
         reject(new Error(`SSH write failed: ${writeErr.message}`));
       });
+      conn.proc?.removeListener("exit", onProcExit);
     }
   });
 }
@@ -467,7 +482,7 @@ function syncFromDisk(): void {
       try {
         // Quick check with short timeout
         const result = spawnSync("ssh", ["-O", "check", "-o", `ControlPath=${sock}`, "x"], {
-          encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 2_000
+          encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000
         });
         const combined = (result.stdout || "") + (result.stderr || "");
         if (result.status !== 0 && !/master running/i.test(combined)) {

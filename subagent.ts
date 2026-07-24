@@ -120,6 +120,10 @@ async function reviewLoop(
     if (r.exitCode !== 0 && (!reviewerOutput || reviewerOutput.trim().length === 0)) {
       return { iterations: i, clean: false, summary: `❌ Reviewer crashed at round ${i} (exit ${r.exitCode})` };
     }
+    // Abort if reviewer was killed by signal — output may be partial/garbled
+    if (r.exitCode === null) {
+      return { iterations: i, clean: false, summary: `❌ Reviewer killed (signal) at round ${i}` };
+    }
     if (!reviewerOutput || reviewerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Reviewer produced no output at round ${i}` };
     }
@@ -267,10 +271,10 @@ async function handleImproveMode(
       // Fixer runs directly in the target worktree (no merge needed)
       const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
-      // Commit fixer edits in the actual project repo (extensions, not home dir)
+      // Commit fixer edits in the actual project repo
       try {
-        const repo = join(homedir(), ".pi", "agent", "extensions");
-        if (existsSync(join(repo, ".git")) && gitQuiet(["status", "--porcelain"], repo).trim()) {
+        const repo = projectRoot(workCwd);
+        if (repo && existsSync(join(repo, ".git")) && gitQuiet(["status", "--porcelain"], repo).trim()) {
           gitQuiet(["add", "-A"], repo);
           gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], repo);
         }
@@ -511,24 +515,19 @@ function getDiff(projectRoot: string, id: string): string {
   }
 }
 
-/** Commit changes in the actual project repo(s), NOT the home directory. */
+/** Commit changes in the actual project repo derived from the worktree path. */
 function commitWorktree(_worktreePath: string, id: string, task: string): string {
   const msg = `pi: ${id} — ${task.substring(0, 80)}`;
   let lastHash = "";
-  // extensions repo is the real project repo; home dir only hosts worktrees
-  const repos = [
-    join(homedir(), ".pi", "agent", "extensions"),
-  ];
-  for (const repo of repos) {
-    if (existsSync(join(repo, ".git"))) {
-      try {
-        if (gitQuiet(["status", "--porcelain"], repo).trim()) {
-          gitQuiet(["add", "-A"], repo);
-          gitQuiet(["commit", "-m", msg], repo);
-          lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
-        }
-      } catch { /* ok */ }
-    }
+  const repo = projectRoot(_worktreePath);
+  if (repo && existsSync(join(repo, ".git"))) {
+    try {
+      if (gitQuiet(["status", "--porcelain"], repo).trim()) {
+        gitQuiet(["add", "-A"], repo);
+        gitQuiet(["commit", "-m", msg], repo);
+        lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
+      }
+    } catch { /* ok */ }
   }
   return lastHash;
 }
@@ -551,8 +550,8 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 // ── sub-process runner ───────────────────────────────────────────────────────
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
-function runSubProcess(task: string, cwd: string, model?: string, tools?: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const killTimeout = Math.max(1_200_000, 1_200_000);
+function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+  const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000);
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
@@ -1219,6 +1218,9 @@ export default function (pi: ExtensionAPI) {
       tasks: Type.String({ description: "JSON array of task strings" }),
       model: Type.Optional(Type.String({ description: "Model override" })),
       maxConcurrency: Type.Optional(Type.Number({ description: "Max concurrent (default: 5)" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms per sub-agent (min: 20 min, default: 20 min)" })),
+      tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist for each sub-agent" })),
+      systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt for each sub-agent" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       let tasks: string[];
@@ -1241,7 +1243,12 @@ export default function (pi: ExtensionAPI) {
       for (let i = 0; i < tasks.length; i += maxCon) {
         const batch = tasks.slice(i, i + maxCon);
         const batchPromises = batch.map((task) => {
-          const { id, promise } = spawnSubAgent(task, ctx.cwd, { model: params.model });
+          const { id, promise } = spawnSubAgent(task, ctx.cwd, {
+            model: params.model,
+            timeoutMs: params.timeoutMs,
+            tools: params.tools ? params.tools.split(",") : undefined,
+            systemPrompt: params.systemPrompt,
+          });
           return promise.then((result) => {
             const ag = subAgents.get(id);
             return {
