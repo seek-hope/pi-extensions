@@ -252,18 +252,14 @@ async function handleImproveMode(
   return reviewLoop(
     ctxCwd, workCwd,
     (_i) => {
-      const diffContent = targetAgentId
-        ? getDiff(ctxCwd, targetAgentId)
-        : gitQuiet(["diff", "HEAD"], ctxCwd) || gitQuiet(["diff", "--cached"], ctxCwd);
       const parts = [`Review criteria: ${reviewCriteria}`];
-      if (diffContent) {
-        parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
-      } else if (task) {
-        // No diff + no worktree → tell reviewer exactly what to review
-        parts.push(`No git diff available. Read the code directly based on the task description.`);
+      if (task) {
         parts.push(`TASK: ${task}`);
+        parts.push(`Read the code files directly — use read, bash, serena tools to inspect the codebase.`);
+      } else if (targetAgentId) {
+        const diffContent = getDiff(ctxCwd, targetAgentId);
+        if (diffContent) parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
       }
-      if (task && !targetAgentId) parts.push(`TASK: ${task}`);
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
       return parts.join("\n");
     },
