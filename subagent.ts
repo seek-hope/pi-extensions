@@ -58,9 +58,13 @@ function evictTerminalAgents(): void {
             cleanupWorktree(resolved, ag.id, ag.status !== "done" && ag.status !== "merged");
           } else {
             try { rmSync(ag.worktreePath, { recursive: true, force: true }); } catch { /* ok */ }
+            // Attempt to delete the git branch to prevent orphan branches when the
+            // resolved root matches the worktree path (no parent git repo found).
+            try { gitQuiet(["branch", "-D", branchName(ag.id)], ag.worktreePath); } catch { /* ok */ }
           }
         } catch {
           try { rmSync(ag.worktreePath, { recursive: true, force: true }); } catch { /* ok */ }
+          try { gitQuiet(["branch", "-D", branchName(ag.id)], ag.worktreePath); } catch { /* ok */ }
         }
       }
       subAgents.delete(id);
@@ -298,6 +302,10 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       `If CLEAN: true, just write "CLEAN: true".`,
     ].join("\n"),
     async (_c, reviewerOutput, _i) => {
+      // Check for cancellation before running the fixer to avoid wasted work
+      if (signal?.aborted) {
+        return "[cancelled by user]";
+      }
       const r = await runSubProcess(
         `Improve this analysis based on feedback. Produce a complete final analysis. DO NOT modify files.\n\n` +
         `Feedback: ${reviewerOutput.substring(0, 4000)}`,
@@ -307,6 +315,10 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
         undefined,
         signal
       );
+      // Check if the fixer was cancelled/aborted mid-execution before trusting its output
+      if (signal?.aborted || r.exitCode === -3) {
+        return "[cancelled by user]";
+      }
       const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
       if (improved.trim().length > 0) analysis = improved; // update for next review round
       // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
@@ -480,8 +492,10 @@ async function handleExecuteMode(
         if (ag.status === "error" || ag.status === "cancelled" || /^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(execResult)) {
           results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
           allClean = false;
-          // Reject: delete branch + worktree for failed items
-          cleanupWorktree(root, execId, true);
+          // Preserve worktree and branch for commit failures so the user can inspect
+          // and manually commit the changes (the error message tells them to check the worktree).
+          const isCommitFailure = ag.error?.includes("git commit failed") || execResult.startsWith("[Sub-agent commit failed]");
+          cleanupWorktree(root, execId, !isCommitFailure);
           subAgents.delete(execId);
         } else {
           // Use a unique todoMatchKey for this execute item so progress is visible
@@ -506,19 +520,26 @@ async function handleExecuteMode(
         // from "evicted-but-done" — a completed agent may have been evicted during
         // a long-running execute pipeline.
         const branch = branchName(execId);
+        let branchExists = true;
         let hasUnmergedCommits = false;
         try {
           const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
           const branchTip = git(["rev-parse", branch], root).trim();
           hasUnmergedCommits = mergeBase !== branchTip;
-        } catch { /* branch doesn't exist */ }
-        if (hasUnmergedCommits) {
+        } catch {
+          // git merge-base or rev-parse threw — branch was already deleted (merged and cleaned up)
+          branchExists = false;
+        }
+        if (branchExists && hasUnmergedCommits) {
           results.push(`${i + 1}. ${item.description}: ⚠ evicted but had committed work (branch preserved)`);
-        } else {
+        } else if (branchExists) {
           results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
           allClean = false;
+        } else {
+          // Branch doesn't exist at all → already merged and cleaned up, report as completed
+          results.push(`${i + 1}. ${item.description}: ✅ already merged (evicted)`);
         }
-        cleanupWorktree(root, execId, !hasUnmergedCommits);
+        cleanupWorktree(root, execId, branchExists && !hasUnmergedCommits);
         subAgents.delete(execId);
       }
     } catch (e: any) {
@@ -1112,15 +1133,30 @@ function spawnSubAgent(
     // Prefix with "\n" to prevent task text from being parsed as a CLI option
     args.push("\n" + task);
 
-    const proc = spawn(resolvePiBin(), args, {
-      cwd: worktreePath,
-      env: {
-        ...process.env,
-        PI_SUBAGENT_DEPTH: String(depth + 1),
-        PI_SUBAGENT_ROOT: root,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let proc: ChildProcess;
+    try {
+      proc = spawn(resolvePiBin(), args, {
+        cwd: worktreePath,
+        env: {
+          ...process.env,
+          PI_SUBAGENT_DEPTH: String(depth + 1),
+          PI_SUBAGENT_ROOT: root,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err: any) {
+      // Clean up sentinel if spawn threw synchronously before event handlers were attached.
+      // Without this, the sentinel would persist until the next session_start, potentially
+      // confusing startup cleanup logic.
+      try { if (sentinel) unlinkSync(sentinel); } catch { /* best effort */ }
+      // Clean up the worktree since the sub-agent process never started
+      cleanupWorktree(root, id, true);
+      agent.error = `spawn failed: ${(err.message || err).substring(0, 200)}`;
+      agent.status = "error";
+      agent.endTime = Date.now();
+      resolve(`[Sub-agent spawn error] ${agent.error}`);
+      return;
+    }
     agent.proc = proc;
 
     let stdout = "";
