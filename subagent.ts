@@ -420,25 +420,29 @@ async function handleImproveMode(
       }
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
       return parts.join("\n");
-    },
-    async (issuesCount, reviewerOutput, _i) => {
-      // Check for cancellation before running the fixer to avoid wasted work
-      if (signal?.aborted) {
-        return "[cancelled by user]";
-      }
-      // Fixer runs directly in the target worktree (no merge needed)
-      // reviewLoop handles committing (via commitWorktree) after each fixer round when
-      // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
-      // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
-      const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-      const r = await runSubProcess(fixerTask, workCwd, _defaultModel, "read,edit,write,bash", undefined, signal);
-      const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
-      // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
-      if (r.exitCode !== 0) {
-        return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${output.substring(0, 200)}`;
-      }
-      return output;
-    },
+      },
+      async (issuesCount, reviewerOutput, _i) => {
+        // Check for cancellation before running the fixer to avoid wasted work
+        if (signal?.aborted) {
+          return "[cancelled by user]";
+        }
+        // Fixer runs directly in the target worktree (no merge needed)
+        // reviewLoop handles committing (via commitWorktree) after each fixer round when
+        // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
+        // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
+        const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
+        const r = await runSubProcess(fixerTask, workCwd, _defaultModel, "read,edit,write,bash", undefined, signal);
+        const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
+        // Check if the fixer was cancelled/aborted mid-execution before trusting its output
+        if (signal?.aborted || r.exitCode === -3) {
+          return "[cancelled by user]";
+        }
+        // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
+        if (r.exitCode !== 0) {
+          return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${output.substring(0, 200)}`;
+        }
+        return output;
+      },
       targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
       signal,
       todoMatchKey
@@ -451,7 +455,7 @@ async function handleImproveMode(
     }
   }
   return _loopResult;
-  }
+}
 
 /**
  * Auto-merge a sub-agent branch into main. Returns whether the branch should be retained for manual review.
@@ -465,7 +469,7 @@ function autoMergeBranch(
     onCommitFailure: "keep-merge",
     description,
   });
-  if (!result.success && result.error && result.error !== "Branch not found") {
+  if (!result.success && result.error && result.error !== "Branch not found" && !result.error.includes("Already up to date")) {
     if (result.hasConflicts) {
       console.error(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
     } else {
@@ -981,6 +985,9 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     // Wire up AbortSignal for mid-flight cancellation BEFORE early check to prevent race
     if (signal) {
       abortHandler = () => {
+        // If the process already exited (proc.exitCode set) before close event,
+        // let the closeHandler report the real exit code instead of overwriting it.
+        if (proc.exitCode !== null) return;
         try { proc.kill("SIGKILL"); } catch { /* already dead */ }
         exitCode = -3;
         stderr = "[cancelled by user]";
@@ -990,6 +997,8 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     }
     // Early abort check — after attaching listener to prevent signal firing between check and listener
     if (signal?.aborted) {
+      // If the process already exited, let closeHandler handle it
+      if (proc.exitCode !== null) { done(); return; }
       try { proc.kill("SIGKILL"); } catch { /* already dead */ }
       stderr = "[cancelled]";
       exitCode = -3;
@@ -1288,7 +1297,10 @@ function spawnSubAgent(
     // Wire up external AbortSignal for mid-flight cancellation
     if (extSignal) {
       abortHandler = () => {
-        if (!settled && agent.status === "running") {
+        // Only cancel if the process is still running (exitCode === null).
+        // If proc.exitCode is already set (e.g., 0 for successful exit) but closeHandler
+        // hasn't fired yet, don't overwrite — let closeHandler report the real result.
+        if (!settled && agent.status === "running" && proc.exitCode === null) {
           agent.status = "cancelled";
           try { proc.kill("SIGKILL"); } catch { /* already dead */ }
           // closeHandler checks agent.status === "cancelled" and calls settle()
