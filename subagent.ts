@@ -251,7 +251,9 @@ async function handleImproveMode(
   return reviewLoop(
     ctxCwd, workCwd,
     (_i) => {
-      const diffContent = targetAgentId ? getDiff(ctxCwd, targetAgentId) : null;
+      const diffContent = targetAgentId
+        ? getDiff(ctxCwd, targetAgentId)
+        : gitQuiet(["diff", "HEAD"], ctxCwd) || gitQuiet(["diff", "--cached"], ctxCwd);
       const parts = [`Review criteria: ${reviewCriteria}`];
       if (diffContent) parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
