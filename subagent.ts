@@ -1256,10 +1256,14 @@ function spawnSubAgent(
       // This prevents a TOCTOU race where the cancelled status is overwritten by a
       // simultaneous success exit.
       if (agent.status === "cancelled") {
-        // Preserve the branch if the sub-agent exited successfully (code === 0). The
-        // session_shutdown handler may have set status to "cancelled" before this close
-        // event fired — without this guard, a successful commit would be nuked by the
-        // branch deletion, losing the sub-agent's work.
+        // If the process actually exited successfully (code 0), commit the work before
+        // cleaning up, even though the agent was cancelled. The session_shutdown handler
+        // may have set status to "cancelled" between process exit and this close event,
+        // and without this commit the sub-agent's completed work would be silently lost.
+        if (code === 0) {
+          const ch = commitWorktree(worktreePath, id, task);
+          if (ch && ch !== "no-changes") agent.commitHash = ch;
+        }
         cleanupWorktree(root, id, code !== 0);
         settle("[Sub-agent cancelled]", "cancelled");
         return;
