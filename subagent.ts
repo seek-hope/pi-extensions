@@ -8,7 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
@@ -76,6 +76,13 @@ function evictTerminalAgents(): void {
       subAgents.delete(id);
     }
   }
+}
+
+/** Sentinel file path used to distinguish stale (interrupted) from completed-but-unmerged worktrees */
+function sentinelPath(root: string, id: string): string {
+  const safe = safeId(id);
+  if (!safe) return "";
+  return join(root, ".pi", "subagent", `.${safe}.sentinel`);
 }
 
 function shortId(): string {
@@ -223,8 +230,19 @@ async function reviewLoop(
     if (/^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
+    // Check for cancellation — runSubProcess returns exitCode -3 and "[cancelled by user]"
+    // when the signal fires, but the output doesn't match the error pattern above.
+    // We must detect cancellation here to prevent an extra (partial) commit before
+    // the loop's signal?.aborted check fires on the next iteration.
+    if (signal?.aborted || /\[cancelled by user\]/.test(fixerOutput)) {
+      return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
+    }
     if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
   }
+
+  // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
+  const tb = (globalThis as any).__pi_todo;
+  if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "completed", `⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
@@ -455,14 +473,18 @@ async function handleExecuteMode(
           cleanupWorktree(root, execId, true);
           subAgents.delete(execId);
         } else {
-          const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal);
+          // Use a unique todoMatchKey for this execute item so progress is visible
+          const todoMatchKey = `execute:${item.description.substring(0, 50)}`;
+          const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey);
           results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
           if (!ir.clean) allClean = false;
-          // Auto-merge the improved branch into main
-          const mergeResult = autoMergeBranch(root, ctxCwd, execId, item.description);
-          if (!mergeResult.retainForManualReview) {
-            cleanupWorktree(root, execId, true);
-            subAgents.delete(execId);
+          // Only auto-merge clean improvements — failed loops leave the branch for manual review
+          if (ir.clean) {
+            const mergeResult = autoMergeBranch(root, ctxCwd, execId, item.description);
+            if (!mergeResult.retainForManualReview) {
+              cleanupWorktree(root, execId, true);
+              subAgents.delete(execId);
+            }
           }
         }
       } else {
@@ -651,30 +673,21 @@ function getDiff(projectRoot: string, id: string): string {
  *  Callers should check for empty hash to detect failure. */
 function commitWorktree(worktreePath: string, id: string, task: string): string {
   const msg = id ? `pi: ${id} — ${task.substring(0, 80)}` : `pi: ${task.substring(0, 80)}`;
-  let lastHash = "";
 
-  // CRITICAL: The extensions dir is a NESTED git repo separate from the home dir.
-  // Changes are always in the extensions repo. The home repo only hosts worktrees.
-  // DO NOT REMOVE this — the worktreePath (home dir) .git is a different repo!
-  const exts = join(homedir(), ".pi", "agent", "extensions");
-  const repos = [exts];
-  if (worktreePath && existsSync(join(worktreePath, ".git"))) {
-    repos.push(worktreePath);
-  }
+  if (!worktreePath || !existsSync(join(worktreePath, ".git"))) return "";
 
-  for (const repo of [...new Set(repos)]) {
-    if (!existsSync(join(repo, ".git"))) continue;
-    try {
-      if (gitQuiet(["status", "--porcelain"], repo).trim()) {
-        gitQuiet(["add", "-A"], repo);
-        gitQuiet(["commit", "-m", msg], repo);
-        lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
-      }
-    } catch (e: any) {
-      console.error(`commitWorktree failed in ${repo}: ${(e.message || e).substring(0, 200)}`);
-    }
+  // Only commit changes in the sub-agent's worktree repo.
+  // The extensions dir is a different git repo — do NOT commit unrelated changes there.
+  if (!gitQuiet(["status", "--porcelain"], worktreePath).trim()) return "";
+
+  try {
+    git(["add", "-A"], worktreePath);
+    git(["commit", "-m", msg], worktreePath);
+    return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
+  } catch (e: any) {
+    console.error(`commitWorktree failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
+    return "";
   }
-  return lastHash;
 }
 
 /** Clean up worktree and optionally the branch */
@@ -898,6 +911,14 @@ function spawnSubAgent(
   };
   subAgents.set(id, agent);
 
+  // Create sentinel file so session_start can distinguish stale (interrupted)
+  // agents from completed-but-unmerged ones. The sentinel is removed when the
+  // agent reaches a terminal state.
+  const sentinel = sentinelPath(root, id);
+  if (sentinel) {
+    try { writeFileSync(sentinel, String(process.pid), "utf-8"); } catch { /* best effort */ }
+  }
+
   const promise = new Promise<string>((resolve) => {
     const args: string[] = ["-p"];
     
@@ -947,6 +968,8 @@ function spawnSubAgent(
         extSignal.removeEventListener("abort", abortHandler);
         abortHandler = null;
       }
+      // Remove sentinel file — agent has reached terminal state
+      try { if (sentinel) unlinkSync(sentinel); } catch { /* best effort */ }
       agent.status = status;
       agent.endTime = Date.now();
       resolve(result);
@@ -968,6 +991,14 @@ function spawnSubAgent(
       }
 
       if (code === 0) {
+        // TOCTOU guard: also check the external signal in case it fired moments before
+        // this closeHandler ran but after agent.status was last checked.
+        if (extSignal?.aborted) {
+          agent.status = "cancelled";
+          cleanupWorktree(root, id, true);
+          settle("[Sub-agent cancelled]", "cancelled");
+          return;
+        }
         agent.result = stdout.trim();
         // Auto-commit changes made by the sub-agent
         agent.commitHash = commitWorktree(worktreePath, id, task);
@@ -1717,16 +1748,26 @@ export default function (pi: ExtensionAPI) {
   // ── cleanup on shutdown ────────────────────────────────────────────────
   // ── session_start: recover from interrupted sessions ───────────────
   pi.on("session_start", async () => {
-    // Clean up stale worktrees from previous interrupted sessions
+    // Clean up stale worktrees from previous interrupted sessions.
+    // Only remove worktrees that still have a sentinel file — these are agents that
+    // were interrupted (crashed/killed) before reaching a terminal state.
+    // Completed-but-unmerged agents do NOT have sentinel files and are preserved.
     const root = process.env.PI_SUBAGENT_ROOT || resolveGitRoot(process.cwd());
     const subDir = join(root, ".pi", "subagent");
     if (existsSync(subDir)) {
       try {
         const entries = readdirSync(subDir);
         for (const entry of entries) {
+          // Skip non-directories and hidden files (like sentinel files)
+          if (entry.startsWith(".")) continue;
           const wtDir = join(subDir, entry);
+          const sentinel = join(subDir, `.${entry}.sentinel`);
+          // Only clean up if sentinel file still exists (agent was interrupted)
+          if (!existsSync(sentinel)) continue;
           const branch = `pi/subagent/${entry}`;
           try {
+            // Remove sentinel first to prevent re-processing
+            unlinkSync(sentinel);
             git(["worktree", "remove", "--force", wtDir], root);
             git(["branch", "-D", branch], root);
           } catch { /* best effort — may have been partially cleaned */ }
