@@ -486,7 +486,17 @@ async function handleExecuteMode(
       } else {
         results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
         allClean = false;
-        cleanupWorktree(root, execId, true);
+        // Agent was evicted from map (terminal state + age > EVICTION_AGE_MS).
+        // Check if the branch exists and has unmerged commits before force-deleting,
+        // to preserve work from agents that completed successfully (status "done").
+        const branch = branchName(execId);
+        let hasUnmergedCommits = false;
+        try {
+          const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
+          const branchTip = git(["rev-parse", branch], root).trim();
+          hasUnmergedCommits = mergeBase !== branchTip;
+        } catch { /* branch doesn't exist */ }
+        cleanupWorktree(root, execId, !hasUnmergedCommits);
         subAgents.delete(execId);
       }
     } catch (e: any) {
@@ -1122,6 +1132,11 @@ function spawnSubAgent(
       resolve(result);
     }
 
+    // Kill process after timeout (min 20 min, configurable via options).
+    // Declared before closeHandler so the function can reference it without
+    // a temporal-dead-zone dependency.
+    const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
+
     const closeHandler = (code: number | null) => {
       if (settled) return;
       // Note: agent may have been removed from subAgents map externally (TOCTOU race).
@@ -1183,6 +1198,7 @@ function spawnSubAgent(
     };
 
     const errorHandler = (err: Error) => {
+      if (settled) return;
       agent.error = err.message;
       agent.status = "error";
       agent.endTime = Date.now();
@@ -1205,8 +1221,6 @@ function spawnSubAgent(
       extSignal.addEventListener("abort", abortHandler, { once: true });
     }
 
-    // Kill process after timeout (min 20 min, configurable via options)
-    const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
     killTimer = setTimeout(() => {
       if (agent.status === "running" && !settled) {
         // Use a boolean flag to indicate timeout, not a string sentinel in agent.error.
@@ -1400,11 +1414,19 @@ export default function (pi: ExtensionAPI) {
                 subAgents.delete(params.subagentId);
               }
             } else if (!ag) {
-              // Agent was evicted from map — reconstruct branch and merge anyway
+              // Agent was evicted from map — reconstruct branch and merge anyway.
+              // evictTerminalAgents removes the worktree directory for "done" agents
+              // but preserves the git branch. Check branch existence instead of the
+              // worktree directory so we don't skip the merge.
               const safe = safeId(params.subagentId);
               if (safe) {
-                const wtPath = join(projectRoot(ctx.cwd), ".pi", "subagent", safe);
-                if (existsSync(wtPath)) {
+                const branch = branchName(params.subagentId);
+                let branchExists = false;
+                try {
+                  git(["rev-parse", "--verify", branch], projectRoot(ctx.cwd));
+                  branchExists = true;
+                } catch { /* branch doesn't exist — nothing to merge */ }
+                if (branchExists) {
                   const { retainForManualReview } = autoMergeBranch(
                     ctx.cwd, params.subagentId, "delegated task"
                   );
@@ -1778,11 +1800,20 @@ export default function (pi: ExtensionAPI) {
             };
           });
         });
-        // spawnSubAgent promises always resolve (never reject), so Promise.all
-        // cannot throw here. The .then() callback only reads properties and
-        // never throws. No try/catch needed — dead code would silently mask
-        // invariant violations.
-        const batchResults = await Promise.all(batchPromises);
+        // spawnSubAgent promises should always resolve (never reject), but if
+        // spawn() throws synchronously inside the Promise executor (e.g., missing
+        // pi binary), the promise can reject. Wrap in try/catch to prevent
+        // crashing the entire parallel tool on a single spawn failure.
+        let batchResults: { task: string; id: string; result: string; status: string; elapsed: number; commitHash?: string }[];
+        try {
+          batchResults = await Promise.all(batchPromises);
+        } catch (e: any) {
+          batchResults = batchPromises.map((_, i) => {
+            const task = batch[i];
+            const id = batchIds[i];
+            return { task, id, result: `[Sub-agent spawn error] ${e.message || String(e)}`, status: "error", elapsed: 0 };
+          });
+        }
         results.push(...batchResults);
         // If cancelled mid-batch, clean up any sub-agents that are still tracked as running
         if (_signal?.aborted) {
@@ -2116,8 +2147,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     for (const [id, ag] of subAgents) {
-      ag.status = "cancelled";
-      try { ag.proc?.kill("SIGKILL"); } catch { /* process may have already exited */ }
+      // Only cancel running agents — don't overwrite "done" or other terminal states.
+      // Concurrent code reading agent status between the assignment and the clear()
+      // below would see misleading state if we unconditionally set "cancelled".
+      if (ag.status === "running") {
+        ag.status = "cancelled";
+        try { ag.proc?.kill("SIGKILL"); } catch { /* process may have already exited */ }
+      }
     }
     // Don't auto-cleanup worktrees — they contain committed work that may be valuable
     subAgents.clear();
