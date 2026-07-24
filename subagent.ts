@@ -758,8 +758,8 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
         git(["stash", "push", "-m", `pi: auto-stash before merge ${execId}`], ctxCwd);
         stashed = true;
       } catch (e: any) {
-        stashed = false;
         console.warn(`  \u26a0 git stash push failed before merge ${execId}: ${(e.message || "").substring(0, 80)}`);
+        return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `git stash push failed: ${(e.message || "").substring(0, 80)}` };
       }
     }
   }
@@ -1881,17 +1881,16 @@ export default function (pi: ExtensionAPI) {
                 process.kill(pid, 0);
                 // PID is alive — verify it's actually a pi agent process, not a recycled PID
                 // that happened to be reused by an unrelated process (PID-reuse TOCTOU).
+                let isPiProcess = true;
                 try {
                   const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
-                  if (!cmdline.includes("pi")) {
-                    // Not a pi process — sentinel is stale, proceed with cleanup
-                    throw new Error("not pi");
-                  }
+                  isPiProcess = cmdline.includes("pi");
                 } catch {
                   // Can't read /proc/<pid>/cmdline (e.g., not on Linux, permissions error).
                   // Fall through and trust the kill check — the race window is small.
                 }
-                continue;
+                if (isPiProcess) continue;
+                // Not a pi process — sentinel is stale, proceed with cleanup
               } catch { /* dead, proceed with cleanup */ }
             }
           } catch { /* can't read sentinel, treat as stale and clean up */ }
