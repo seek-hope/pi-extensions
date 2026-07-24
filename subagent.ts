@@ -113,7 +113,7 @@ async function reviewLoop(
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
-    const r = await runSubProcess(reviewTask, ctxCwd, _defaultModel);
+    const r = await runSubProcess(reviewTask, ctxCwd, _defaultModel, "read,bash");
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
 
     // Abort if reviewer crashed or produced no output
@@ -258,24 +258,10 @@ async function handleImproveMode(
       return parts.join("\n");
     },
     async (issuesCount, reviewerOutput, _i) => {
-      const task = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-      const { id: fixerId, promise } = spawnSubAgent(task, ctxCwd, { model: _cheapModel || _defaultModel });
-      const output = await promise;
-      // Commit any uncommitted changes in the target worktree before merging
-      try { git(["add", "-A"], workCwd); git(["commit", "-m", `pre-merge checkpoint`, "--allow-empty"], workCwd); } catch { /* ok */ }
-      // Merge fixer's changes back into the target worktree
-      let mergeSucceeded = false;
-      try {
-        git(["merge", "--no-edit", branchName(fixerId)], workCwd);
-        mergeSucceeded = true;
-      } catch {
-        gitQuiet(["merge", "--abort"], workCwd);
-      }
-      subAgents.delete(fixerId);
-      cleanupWorktree(projectRoot(ctxCwd), fixerId, true);
-      if (!mergeSucceeded) {
-        return `[Sub-agent error] Merge of fixer ${fixerId} failed — fixer changes cannot be applied.`;
-      }
+      // Fixer runs directly in the target worktree (no merge needed)
+      const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
+      const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
+      const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },
     maxIt,
@@ -542,14 +528,14 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 // ── sub-process runner ───────────────────────────────────────────────────────
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
-function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000);
+function runSubProcess(task: string, cwd: string, model?: string, tools?: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+  const killTimeout = Math.max(1_200_000, 1_200_000);
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
     if (model) args.push("--model", model);
+    if (tools) args.push("--tools", tools);
     args.push("\n" + task);
-    try { require("fs").appendFileSync("/tmp/pi-spawn-args.log", JSON.stringify(args) + "\n"); } catch {}
     const proc = spawn("pi", args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],

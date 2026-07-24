@@ -10,7 +10,8 @@ import { Type } from "typebox";
 
 // ── types ───────────────────────────────────────────────────────────────────
 
-type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"] as const;
+type TodoStatus = (typeof TODO_STATUSES)[number];
 
 interface TodoItem {
   content: string;
@@ -35,7 +36,8 @@ let detailWidgetActive = false;
 
 /** Narrow a string to a valid TodoStatus after user input or session restore. */
 function isValidTodoStatus(s: string): s is TodoStatus {
-  return s === "pending" || s === "in_progress" || s === "completed" || s === "cancelled";
+  // Derive from TODO_STATUSES to avoid drift — single source of truth
+  return (TODO_STATUSES as readonly string[]).includes(s);
 }
 
 /** Coerce an unknown status string to a valid TodoStatus, defaulting to pending. */
@@ -76,7 +78,7 @@ function clearDetailWidget(ctx?: any): void {
 function restoreFromBranch(ctx?: any): void {
   todo = { items: [], updatedAt: 0 };
   try {
-    const branch = (ctx as any)?.sessionManager?.getBranch?.();
+    const branch = ctx?.sessionManager?.getBranch?.();
     if (Array.isArray(branch)) {
       // Iterate in reverse so the most recent todo_write wins
       for (let i = branch.length - 1; i >= 0; i--) {
@@ -179,7 +181,7 @@ export default function (pi: ExtensionAPI) {
       const warnings: string[] = [];
 
       // Validate and normalize
-      const items: TodoItem[] = params.items.map((item: any, i: number) => {
+      const items: TodoItem[] = params.items.map((item: { content: string; status?: string }, i: number) => {
         const content = (item.content || "").trim();
         if (!content) throw new Error(`Todo item ${i + 1} has empty content.`);
 
@@ -217,6 +219,16 @@ export default function (pi: ExtensionAPI) {
       if (items.length > 100) {
         warnings.push(`List capped at 100 items (${items.length} provided). The first 100 items were kept.`);
         items.length = 100;
+      }
+
+      // Detect duplicate content and warn
+      const seen = new Set<string>();
+      for (const item of items) {
+        if (seen.has(item.content)) {
+          const preview = item.content.length > 40 ? item.content.substring(0, 40) + "…" : item.content;
+          warnings.push(`Duplicate item: "${preview}" appears multiple times.`);
+        }
+        seen.add(item.content);
       }
 
       todo = { items, updatedAt: Date.now() };
