@@ -686,7 +686,6 @@ function spawnSubAgent(
     if (options?.systemPrompt) args.push("--system-prompt", options.systemPrompt);
     // Prefix with "\n" to prevent task text from being parsed as a CLI option
     args.push("\n" + task);
-    try { require("fs").appendFileSync("/tmp/pi-spawn-args.log", JSON.stringify(args) + "\n"); } catch {}
 
     const proc = spawn("pi", args, {
       cwd: worktreePath,

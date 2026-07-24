@@ -61,7 +61,8 @@ function sanitizeContent(raw: string): string {
     .replace(/\x1b[PX^_].*?\x1b\\/g, "")        // DCS, SOS, PM, APC
     .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "") // remaining C0 controls (bare ESC, CR, etc.)
     .replace(/\t/g, " ")
-    .replace(/\n/g, " ");
+    .replace(/\n/g, " ")
+    .replace(/[\p{Cf}\p{Cs}]/gu, "");        // Unicode format chars + surrogates
 }
 
 /** Clear the full-detail widget and sync the toggle flag. */
@@ -99,8 +100,8 @@ function restoreFromBranch(ctx?: any): void {
         }
       }
     }
-  } catch {
-    // ignore — state stays as empty todo list
+  } catch (e) {
+    console.debug("restoreFromBranch: failed to restore todo from branch", e);
   }
 }
 
@@ -181,6 +182,10 @@ export default function (pi: ExtensionAPI) {
       const warnings: string[] = [];
 
       // Validate and normalize
+      if (!Array.isArray(params.items)) {
+        throw new Error(`Expected items to be an array, got ${typeof params.items}`);
+      }
+
       const items: TodoItem[] = params.items.map((item: { content: string; status?: string }, i: number) => {
         const content = (item.content || "").trim();
         if (!content) throw new Error(`Todo item ${i + 1} has empty content.`);
@@ -221,12 +226,14 @@ export default function (pi: ExtensionAPI) {
         items.length = 100;
       }
 
-      // Detect duplicate content and warn
+      // Detect duplicate content and warn (once per unique content)
       const seen = new Set<string>();
+      const warned = new Set<string>();
       for (const item of items) {
-        if (seen.has(item.content)) {
+        if (seen.has(item.content) && !warned.has(item.content)) {
           const preview = item.content.length > 40 ? item.content.substring(0, 40) + "…" : item.content;
           warnings.push(`Duplicate item: "${preview}" appears multiple times.`);
+          warned.add(item.content);
         }
         seen.add(item.content);
       }
@@ -292,7 +299,7 @@ export default function (pi: ExtensionAPI) {
       const detailLines: string[] = [];
       detailLines.push(`┌─ Todo detail (${done}/${total} done) ─────────────`);
       for (const item of sorted) {
-        const icon = STATUS_ICONS[item.status];
+        const icon = STATUS_ICONS[item.status] || "○";
         const safeContent = sanitizeContent(item.content);
         if (item.status === "in_progress") {
           detailLines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
