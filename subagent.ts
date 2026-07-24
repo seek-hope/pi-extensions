@@ -329,12 +329,21 @@ async function handleExecuteMode(
                 git(["commit", "-m", `pi: auto-merge ${execId}: ${item.description.substring(0, 60)}`, "--no-edit"], ctxCwd);
                 // Pop stash on successful merge
                 if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
-              } catch {
-                // Conflict or merge error — abort and leave branch for manual review
-                gitQuiet(["merge", "--abort"], ctxCwd);
-                mergeHadConflicts = true;
-                retainForManualReview = true;
-                results.push(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
+              } catch (mergeErr: any) {
+                // Check if this is actually a conflict (unmerged files) vs. a transient error
+                const unmerged = gitQuiet(["ls-files", "-u"], ctxCwd).trim();
+                if (unmerged.length > 0) {
+                  // Genuine merge conflict — abort and leave branch for manual review
+                  gitQuiet(["merge", "--abort"], ctxCwd);
+                  mergeHadConflicts = true;
+                  retainForManualReview = true;
+                  results.push(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
+                } else {
+                  // Transient error (disk full, permissions, etc.) — abort and fail cleanly
+                  gitQuiet(["merge", "--abort"], ctxCwd);
+                  mergeHadConflicts = false;
+                  results.push(`  ⚠ Auto-merge of ${execId} failed: ${(mergeErr.message || "").substring(0, 80)}`);
+                }
                 // Pop stash back (merge was aborted, so working tree is clean)
                 if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
               }
@@ -699,6 +708,7 @@ function spawnSubAgent(
       args.push("--tools", toolsArg);
     }
     if (options?.systemPrompt) args.push("--system-prompt", options.systemPrompt);
+    if (options?.model) args.push("--model", options.model);
     // Prefix with "\n" to prevent task text from being parsed as a CLI option
     args.push("\n" + task);
 

@@ -162,7 +162,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       }
       return;
     }
-    shellExec(c, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
+    shellExec(conn3, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
       if (_sshPi) {
         _sshPi.sendUserMessage([
           { type: "text", text: `[SSH background task completed on ${host}]` },
@@ -209,7 +209,7 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
     const p = parts[i];
     if (p === "-p") {
       if (i + 1 < parts.length) { const v = parseInt(parts[i + 1]); if (!isNaN(v)) port = v; i += 2; }
-      else { i++; } // -p at end: skip it
+      else { return null; } // -p without port value: invalid
     }
     else if (p.startsWith("-")) {
       // Consume option and its value (if next token doesn't look like another flag)
@@ -406,6 +406,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         reject(new Error(`SSH write failed: ${writeErr.message}`));
       });
       conn.proc?.removeListener("exit", onProcExit);
+      conn.proc?.stdin?.removeListener("error", onStdinError);
     }
   });
 }
@@ -509,8 +510,10 @@ function syncFromDisk(): void {
           const [uh, pt] = key.split(":");
           addConn(key, uh, sock, pt && pt !== "22" ? `-p ${pt} ${uh}` : uh);
         }
-      } catch {
-        // ssh -O check timed out — socket likely stale, clean up
+      } catch (syncErr: any) {
+        // Don't delete socket on transient spawn errors (ssh not found, permission denied)
+        if (syncErr.code === 'ENOENT' || syncErr.code === 'EACCES') continue;
+        // For other errors (e.g., SSH connection issues), remove stale socket
         try { rmSync(sock); } catch { /* ok */ }
       }
     }
