@@ -234,7 +234,10 @@ async function reviewLoop(
     }
     if (commitPrefix !== "") {
       const hash = commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
-      if (!hash) {
+      if (hash === "no-changes") {
+        // No changes to commit — the fixer correctly determined no modifications
+        // were needed (e.g., false positive review). Continue the loop.
+      } else if (!hash) {
         console.error(`reviewLoop: commitWorktree failed at iteration ${i} in ${workCwd}`);
         return { iterations: i, clean: false, summary: `❌ Fix committed but git commit failed at round ${i}. Aborting to avoid stale state.` };
       }
@@ -297,8 +300,8 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       );
       const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
       if (improved.trim().length > 0) analysis = improved; // update for next review round
-      // If the sub-process failed to spawn, prefix output so reviewLoop's error regex catches it
-      if (r.exitCode !== 0 && (!r.stdout || r.stdout.trim().length === 0)) {
+      // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
+      if (r.exitCode !== 0) {
         return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${improved.substring(0, 200)}`;
       }
       return improved;
@@ -381,8 +384,8 @@ async function handleImproveMode(
       const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash", undefined, signal);
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
-      // If the sub-process failed to spawn, prefix output so reviewLoop's error regex catches it
-      if (r.exitCode !== 0 && (!r.stdout || r.stdout.trim().length === 0)) {
+      // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
+      if (r.exitCode !== 0) {
         return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${output.substring(0, 200)}`;
       }
       return output;
@@ -666,7 +669,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
 
   // Only commit changes in the sub-agent's worktree repo.
   // The extensions dir is a different git repo — do NOT commit unrelated changes there.
-  if (!gitQuiet(["status", "--porcelain"], worktreePath).trim()) return "";
+  if (!gitQuiet(["status", "--porcelain"], worktreePath).trim()) return "no-changes";
 
   try {
     // Use git add -A to stage all changes including new files the sub-agent may
@@ -1945,10 +1948,21 @@ export default function (pi: ExtensionAPI) {
           try {
             git(["worktree", "remove", "--force", wtDir], root);
             git(["branch", "-D", branch], root);
-            // Only remove sentinel after both git operations succeed — if either fails,
-            // the sentinel remains so the next session_start retries cleanup.
             unlinkSync(sentinel);
-          } catch { /* best effort — may have been partially cleaned */ }
+          } catch {
+            // If the worktree directory no longer exists on disk (successfully removed or
+            // manually deleted), remove the sentinel to break the retry cycle even if
+            // branch deletion failed. Otherwise the sentinel blocks future session_start
+            // cleanup attempts indefinitely.
+            if (!existsSync(wtDir)) {
+              try { unlinkSync(sentinel); } catch { /* best effort */ }
+              try { git(["branch", "-D", branch], root); } catch {
+                console.warn(`[subagent] Could not delete stale branch ${branch} after worktree cleanup — manual cleanup may be needed.`);
+              }
+            }
+            // If the worktree directory still exists, leave the sentinel so the next
+            // session_start attempt retries the full cleanup.
+          }
         }
       } catch { /* ok */ }
     }
