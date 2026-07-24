@@ -30,7 +30,7 @@ function sh(cmd: string, timeout = 5_000): string {
 }
 
 function sudoSh(cmd: string, timeout = 5_000): string {
-  return sh(`YDOTOOL_SOCKET=${YDOTOOL_SOCKET} ${cmd}`, timeout);
+  return sh(`sudo YDOTOOL_SOCKET=${YDOTOOL_SOCKET} ${cmd}`, timeout);
 }
 
 /** Non-blocking promise-based sleep for use inside async execute() */
@@ -102,21 +102,34 @@ async function ydotoolRetry(action: string, attempts = 3, delayMs = 200): Promis
 /** Move mouse and verify position (retry if not at target) */
 async function moveToVerified(x: number, y: number, bound: { width: number; height: number; minX: number; minY: number }): Promise<void> {
   const { x: cx, y: cy } = clamp(x, y, bound);
+  let lastPos: { x: number; y: number } | null = null;
+  let readSucceeded = false;
   for (let attempt = 0; attempt < 3; attempt++) {
     sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
     await sleep(50);
     try {
       const pos = getCursorPos();
+      readSucceeded = true;
+      lastPos = pos;
       // Accept if within 5px tolerance
       if (Math.abs(pos.x - cx) <= 5 && Math.abs(pos.y - cy) <= 5) return;
     } catch {
       // getCursorPos failed — may be transient; retry
     }
   }
-  throw new Error(
-    `Failed to move mouse to (${cx}, ${cy}) after 3 attempts. ` +
-    `Last known position: unable to verify. The mouse may not have moved correctly.`
-  );
+  if (readSucceeded && lastPos) {
+    throw new Error(
+      `Failed to move mouse to (${cx}, ${cy}) after 3 attempts. ` +
+      `Last known position: (${lastPos.x}, ${lastPos.y}) — still off-target. ` +
+      `The mouse may not have moved correctly.`
+    );
+  } else {
+    throw new Error(
+      `Failed to move mouse to (${cx}, ${cy}) after 3 attempts. ` +
+      `Could not read cursor position (getCursorPos failed each time). ` +
+      `The mouse may not have moved correctly.`
+    );
+  }
 }
 
 // ── extension ───────────────────────────────────────────────────────────────

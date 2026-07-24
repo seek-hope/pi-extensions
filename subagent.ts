@@ -269,16 +269,9 @@ async function handleImproveMode(
     },
     async (issuesCount, reviewerOutput, _i) => {
       // Fixer runs directly in the target worktree (no merge needed)
+      // reviewLoop handles committing after each fixer round — no inline commit needed.
       const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
-      // Commit fixer edits in the actual project repo
-      try {
-        const repo = projectRoot(workCwd);
-        if (repo && existsSync(join(repo, ".git")) && gitQuiet(["status", "--porcelain"], repo).trim()) {
-          gitQuiet(["add", "-A"], repo);
-          gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], repo);
-        }
-      } catch (e) { /* best effort */ }
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },

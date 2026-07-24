@@ -176,10 +176,14 @@ function updateTaskWidget(): void {
   } catch { /* best effort */ }
 }
 
+const MAX_POLL_ERRORS = 5;
+
 function pollCompletion(id: string): void {
   // Prevent duplicate polling chains for the same task
   if (pollingTasks.has(id)) return;
   pollingTasks.add(id);
+
+  let consecutiveErrors = 0;
 
   const check = () => {
     const task = tasks.get(id);
@@ -193,11 +197,24 @@ function pollCompletion(id: string): void {
     try {
       execSync(`tmux has-session -t "${id}"`, { stdio: "pipe", timeout: 5_000 });
       sessionExists = true;
+      consecutiveErrors = 0; // reset on success
     } catch (e: any) {
       // exit code 1 = session does not exist (normal completion)
       // any other exit code = tmux error (don't assume task completed)
       if (e.status !== 1) {
         // tmux error — retry later rather than falsely marking task complete
+        consecutiveErrors++;
+        if (consecutiveErrors >= MAX_POLL_ERRORS) {
+          // Too many consecutive errors — abort polling, mark task as error
+          task.status = "error";
+          task.exitCode = -1;
+          task.endTime = Date.now();
+          pollingTasks.delete(id);
+          saveTasks(tasks);
+          updateTaskWidget();
+          notifyUser(`❌ Background task ${id} failed: too many tmux errors (${consecutiveErrors})`, "error");
+          return;
+        }
         updateTaskWidget();
         setTimeout(check, 5000);
         return;

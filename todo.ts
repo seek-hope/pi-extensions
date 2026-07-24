@@ -295,10 +295,13 @@ export default function (pi: ExtensionAPI) {
         })
         .map(({ item }) => item);
 
-      // Build detail widget lines
+      // Build detail widget lines (capped to prevent TUI overflow)
+      const MAX_DETAIL_LINES = 25;
       const detailLines: string[] = [];
       detailLines.push(`┌─ Todo detail (${done}/${total} done) ─────────────`);
-      for (const item of sorted) {
+      const limit = Math.min(sorted.length, MAX_DETAIL_LINES);
+      for (let i = 0; i < limit; i++) {
+        const item = sorted[i];
         const icon = STATUS_ICONS[item.status] || "○";
         const safeContent = sanitizeContent(item.content);
         if (item.status === "in_progress") {
@@ -306,6 +309,10 @@ export default function (pi: ExtensionAPI) {
         } else {
           detailLines.push(`│ ${icon} ${safeContent}`);
         }
+      }
+      const remaining = sorted.length - limit;
+      if (remaining > 0) {
+        detailLines.push(`│ ... and ${remaining} more item(s)`);
       }
       detailLines.push(`└──────────────────────────────────────────`);
       detailLines.push(`(${total} items · /todo to toggle)`);

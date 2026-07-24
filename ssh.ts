@@ -636,7 +636,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       host: Type.String({ description: "SSH host alias" }),
       command: Type.String({ description: "Command to execute on the remote server" }),
-      timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 120000 = 2 min). Accepts numeric ms or suffixed strings like '60s', '10m'" })),
+      timeout: Type.Optional(Type.Union([Type.Number(), Type.String()], { description: "Timeout in ms (default: 120000 = 2 min). Accepts numeric ms or suffixed strings like '60s', '10m'" })),
       background: Type.Optional(Type.Boolean({ description: "Run in background via nohup on remote. Returns log path immediately (default: false)" })),
     }),
     async execute(_id, params, _signal) {
