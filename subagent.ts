@@ -184,7 +184,7 @@ async function reviewLoop(
     evictTerminalAgents();
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
-    let r;
+    let r: { stdout: string; stderr: string; exitCode: number | null };
     // runSubProcess always resolves (never rejects on its own). The try/catch
     // only handles the edge case where resolvePiBin() throws synchronously
     // inside the Promise constructor (e.g., missing binary).
@@ -295,13 +295,14 @@ async function reviewLoop(
  * ANALYZE: read-only exploration → review → improve → loop → final report.
  */
 async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSignal, todoMatchKey?: string, model?: string): Promise<LoopResult> {
+  refreshModels();
   // Phase 1: initial exploration with cheap model (use sub-process, not worktree)
   const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
   // If _cheapModel is undefined (refreshModels failed or no cheap model configured),
   // derive a fallback from _defaultModel or log a warning.
   const cheapModel = _cheapModel ?? (_defaultModel ? _defaultModel.replace(/pro/i, "flash") : undefined);
-  if (!cheapModel) console.warn("handleAnalyzeMode: _cheapModel is undefined and no fallback could be derived; using system default.");
-  let initR;
+  if (!cheapModel) console.warn("handleAnalyzeMode: _cheapModel is undefined and no fallback could be derived; using pi's built-in default model.");
+  let initR: { stdout: string; stderr: string; exitCode: number | null };
   try {
     initR = await runSubProcess(initTask, ctxCwd, cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
   } catch (e: any) {
@@ -371,6 +372,7 @@ async function handleImproveMode(
   todoMatchKey?: string, // unique key for todo bridge updates
   model?: string // model override for the fixer sub-process
 ): Promise<LoopResult> {
+  refreshModels();
   // Early cancellation check before any filesystem or validation work
   if (signal?.aborted) {
     return { iterations: 0, clean: false, summary: "❌ Cancelled by user before starting improvement." };
@@ -518,7 +520,7 @@ async function handleExecuteMode(
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const item = items[i];
     const { id: execId, promise: execPromise } = spawnSubAgent(
-      `Execute: ${item.description}. Make changes as needed.`,
+      `Execute: ${item.description || "(unnamed task)"}. Make changes as needed.`,
       ctxCwd,
       signal ? { signal } : undefined
     );
@@ -986,7 +988,7 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
     git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
   } catch (mergeErr: any) {
     const unmerged = gitQuiet(["ls-files", "-u"], ctxCwd).trim();
-    const isConflict = unmerged.length > 0;
+    const isConflict = unmerged.length > 0 && !unmerged.startsWith("fatal:");
     // Parse unique filenames from ls-files -u output BEFORE abort (which clears conflict state)
     let conflictFiles = "";
     if (isConflict) {
@@ -1136,7 +1138,11 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
         forceKillTimer = null;
         try { proc.kill("SIGKILL"); } catch { /* ok */ }
         // Safety net: if close event still hasn't fired after SIGKILL, force-resolve
-        safetyTimer = setTimeout(() => { if (!resolved) done(); }, 10_000);
+        // Guard: only create safetyTimer if done() hasn't already resolved (race)
+        // to avoid an orphaned timer that would fire 10s later as a no-op.
+        if (!resolved) {
+          safetyTimer = setTimeout(() => { if (!resolved) done(); }, 10_000);
+        }
       }, 10_000);
     }, killTimeout);
   });
@@ -1453,10 +1459,14 @@ function spawnSubAgent(
           forceKillTimer = null;
           try { proc.kill("SIGKILL"); } catch { /* already dead */ }
           // Safety net: if close event still hasn't fired after SIGKILL, force-settle
-          safetyTimer = setTimeout(() => {
-            safetyTimer = null;
-            if (!settled) settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
-          }, 10_000);
+          // Guard: only create safetyTimer if settle() hasn't already resolved (race)
+          // to avoid an orphaned timer that would fire 10s later as a no-op.
+          if (!settled) {
+            safetyTimer = setTimeout(() => {
+              safetyTimer = null;
+              if (!settled) settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
+            }, 10_000);
+          }
         }, 10_000);
       }
     }, killTimeout);
@@ -2160,6 +2170,7 @@ export default function (pi: ExtensionAPI) {
         for (const entry of entries) {
           // Skip non-directories and hidden files (like sentinel files)
           if (entry.startsWith(".")) continue;
+          const recoverySuffix = Date.now().toString(36).slice(-4) + Math.random().toString(36).slice(2, 4);
           const wtDir = join(subDir, entry);
           // Verify the entry is a directory — regular files in .pi/subagent/ are not worktrees
           if (!lstatSync(wtDir).isDirectory()) continue;
@@ -2309,7 +2320,7 @@ export default function (pi: ExtensionAPI) {
                 const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
                 const branchTip = git(["rev-parse", branch], root).trim();
                 if (mergeBase !== branchTip) {
-                  const recoveredBranch = `recovered/subagent/${entry}`;
+                  const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
                   git(["branch", "-m", branch, recoveredBranch], root);
                   console.warn(`[subagent] Stale sentinel for ${entry}: worktree removed; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
                 } else {
@@ -2319,7 +2330,7 @@ export default function (pi: ExtensionAPI) {
                 // merge-base or rev-parse failed — rename to recovered/ to preserve
                 // unmerged commits rather than force-delete (which could lose data).
                 try {
-                  const recoveredBranch = `recovered/subagent/${entry}`;
+                  const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
                   git(["branch", "-m", branch, recoveredBranch], root);
                   console.warn(`[subagent] Stale sentinel for ${entry}: merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
                 } catch {
@@ -2346,7 +2357,7 @@ export default function (pi: ExtensionAPI) {
                   const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
                   const branchTip = git(["rev-parse", branch], root).trim();
                   if (mergeBase !== branchTip) {
-                    const recoveredBranch = `recovered/subagent/${entry}`;
+                    const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
                     git(["branch", "-m", branch, recoveredBranch], root);
                     console.warn(`[subagent] Stale sentinel for ${entry}: worktree missing; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
                   } else {
@@ -2356,7 +2367,7 @@ export default function (pi: ExtensionAPI) {
                   // merge-base or rev-parse failed — rename to recovered/ to preserve
                   // unmerged commits rather than force-delete (which could lose data).
                   try {
-                    const recoveredBranch = `recovered/subagent/${entry}`;
+                    const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
                     git(["branch", "-m", branch, recoveredBranch], root);
                     console.warn(`[subagent] Stale sentinel for ${entry}: worktree missing, merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
                   } catch {
