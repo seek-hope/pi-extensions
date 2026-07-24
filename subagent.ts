@@ -434,7 +434,7 @@ async function handleImproveMode(
     existing.status = "improving";
   }
 
-  let _loopResult: LoopResult;
+  let _loopResult: LoopResult = { iterations: 0, clean: false, summary: "Unreachable" };
   try {
     _loopResult = await reviewLoop(
       workCwd,
@@ -905,13 +905,16 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
   return { branchDeleted, worktreeRemoved };
 }
 
-/** Pop a stash safely — drops the entry if pop fails to avoid orphaned stash entries. */
+/** Pop a stash safely — warns if pop fails but leaves the stash intact (orphaned stashes are recoverable). */
 function safeStashPop(ctxCwd: string, execId: string, context: string): void {
   try {
     git(["stash", "pop"], ctxCwd);
   } catch {
-    try { git(["stash", "drop"], ctxCwd); } catch { /* best effort */ }
-    console.warn(`  \u26a0 git stash pop failed ${context} \u2014 stashed entry dropped for ${execId}.`);
+    console.warn(
+      `  \u26a0\u26a0\u26a0 git stash pop failed ${context} for ${execId}. ` +
+      `The stash entry has been LEFT IN PLACE to avoid data loss. ` +
+      `You can recover it manually: git stash list`
+    );
   }
 }
 
@@ -1904,7 +1907,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // Commit failure (abort-merge already handled inside mergeBranch)
-        if (result.error?.startsWith("Commit failed:")) {
+        if (result.error?.startsWith(COMMIT_FAILED_PREFIX.trimEnd())) {
           return {
             content: [{
               type: "text",
@@ -2029,14 +2032,15 @@ export default function (pi: ExtensionAPI) {
         tasks = parsed;
       } catch (e: any) {
         // If JSON.parse fails, only fall back to newline splitting if the input
-        // clearly isn't JSON (no leading '[' or contains literal newlines).
+        // clearly isn't JSON (no leading '['). Pretty-printed JSON arrays with
+        // newlines are surfaced as parse errors, not silently split.
         // Malformed JSON like ["a", "b" (missing ']') is surfaced to the caller.
         if (!(e instanceof SyntaxError)) {
           console.error("subagent_parallel: JSON.parse threw non-SyntaxError", e);
           return { content: [{ type: "text", text: `Unexpected parse error: ${e.message}` }], details: {}, isError: true };
         }
         const trimmed = params.tasks.trim();
-        if (trimmed.startsWith("[") && !trimmed.includes("\n")) {
+        if (trimmed.startsWith("[")) {
           return { content: [{ type: "text", text: `Failed to parse tasks as JSON array: ${e.message}` }], details: {}, isError: true };
         }
         tasks = params.tasks.split("\n").filter((t: string) => t.trim());
