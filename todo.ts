@@ -126,45 +126,42 @@ function renderWidget(ctx?: any): void {
   const ui = ctx?.ui ?? _pi?.ui;
   if (!ui) return;
 
-  const active = todo.items.filter(i => i.status === "pending" || i.status === "in_progress");
-  if (active.length === 0) {
+  if (todo.items.length === 0) {
     ui.setWidget("todo", undefined);
     return;
   }
 
-  const total = todo.items.length;
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
+  const total = todo.items.length;
 
-  // Show active items first: in_progress, then pending (stable sort preserves order)
-  const sorted = [...active].sort((a, b) => {
-    if (a.status === "in_progress" && b.status !== "in_progress") return -1;
-    if (b.status === "in_progress" && a.status !== "in_progress") return 1;
-    return 0;
-  });
+  // Flow view: all items in order, connected by lines
+  const MAX_VISIBLE = 8;
+  const showAll = todo.items.length <= MAX_VISIBLE;
+  const visible = showAll ? todo.items : todo.items.slice(0, MAX_VISIBLE);
 
-  const MAX_VISIBLE_ITEMS = 7;
-  const limit = Math.min(sorted.length, MAX_VISIBLE_ITEMS);
   const lines: string[] = [];
-  lines.push(`┌─ Todo (${done}/${total} done) ────────────────`);
+  lines.push(`┌─ Todo Flow (${done}/${total}) ──────────`);
+  lines.push("│");
 
-  for (let i = 0; i < limit; i++) {
-    const item = sorted[i];
+  for (let i = 0; i < visible.length; i++) {
+    const item = visible[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    const safeContent = sanitizeContent(item.content);
-    if (item.status === "in_progress") {
-      lines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
-    } else {
-      lines.push(`│ ${icon} ${safeContent}`);
-    }
+    const safe = sanitizeContent(item.content).substring(0, 50);
+    const isLast = i === visible.length - 1;
+    const connector = isLast ? "  " : "│ ";
+    const bold = item.status === "in_progress" ? "\x1b[1m" : "";
+    const reset = item.status === "in_progress" ? "\x1b[0m" : "";
+    lines.push(`│  ${bold}${icon}  ${safe}${reset}`);
+    if (!isLast) lines.push(`│  ${connector}`);
   }
 
-  const remaining = sorted.length - limit;
-  if (remaining > 0) {
-    lines.push(`│ ... ${remaining} more active, /todo for full`);
+  lines.push("│");
+  if (!showAll) {
+    lines.push(`│  ... ${total - MAX_VISIBLE} more, /todo for full`);
   }
-  lines.push(`└──────────────────────────────────────────`);
+  lines.push(`└─ /todo for details`);
 
-  ui.setWidget("todo", lines);
+  ui.setWidget("todo", lines.join("\n"));
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
