@@ -115,6 +115,8 @@ async function reviewLoop(
     // Reviewer runs directly (no worktree) — it only reads and reports
     const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash");
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
+    // DEBUG
+    try { appendFileSync("/tmp/improve-debug.log", `[round ${i}] review exit=${r.exitCode} clean=${cleanMatch?.[1]} found=${foundMatch?.[1]}\n`); } catch {}
 
     // Abort if reviewer crashed or produced no output
     if (r.exitCode !== 0 && (!reviewerOutput || reviewerOutput.trim().length === 0)) {
@@ -261,13 +263,18 @@ async function handleImproveMode(
       // Fixer runs directly in the target worktree (no merge needed)
       const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
+      // DEBUG
+      try { appendFileSync("/tmp/improve-debug.log", `[round ${_i}] fixer exit=${r.exitCode} stdout=${r.stdout.substring(0, 200)}\n`); } catch {}
       // CRITICAL: commit fixer edits — otherwise merge loses them
       try {
-        if (gitQuiet(["status", "--porcelain"], workCwd).trim()) {
+        const st = gitQuiet(["status", "--porcelain"], workCwd);
+        appendFileSync("/tmp/improve-debug.log", `[round ${_i}] status="{st}"\n`);
+        if (st.trim()) {
+          appendFileSync("/tmp/improve-debug.log", `[round ${_i}] committing...\n`);
           gitQuiet(["add", "-A"], workCwd);
           gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], workCwd);
         }
-      } catch (e) { /* best effort */ }
+      } catch (e) { appendFileSync("/tmp/improve-debug.log", `[round ${_i}] commit error: ${e}\n`); }
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },
