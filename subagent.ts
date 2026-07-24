@@ -595,8 +595,7 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  // Default 20 min timeout for sub-processes (reviewer/fixer), 30s floor, 30min ceiling
-  const killTimeout = Math.min(Math.max(timeoutMs ?? 1_200_000, 30_000), 1_800_000);
+  const killTimeout = timeoutMs || 1_200_000; // default 20 min
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
