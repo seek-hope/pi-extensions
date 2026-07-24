@@ -102,7 +102,7 @@ function safeId(raw: string): string | null {
   // Allow alphanumeric, dash, underscore. Replace anything else.
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "");
   if (cleaned.length === 0 || cleaned.length > 71) return null;
-  const hash = createHash("sha1").update(raw).digest("hex").substring(0, 8);
+  const hash = createHash("sha256").update(raw).digest("hex").substring(0, 8);
   return `${cleaned}-${hash}`;
 }
 
@@ -136,7 +136,7 @@ function branchName(id: string, safe?: string | null): string {
   const s = safe ?? safeId(id);
   if (!s) {
     // Fallback: hash the raw id to produce a stable, safe branch component
-    const hash = createHash("sha1").update(id).digest("hex").substring(0, 12);
+    const hash = createHash("sha256").update(id).digest("hex").substring(0, 12);
     return `pi/subagent/fallback-${hash}`;
   }
   return `pi/subagent/${s}`;
@@ -298,10 +298,11 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
   refreshModels();
   // Phase 1: initial exploration with cheap model (use sub-process, not worktree)
   const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
-  // If _cheapModel is undefined (refreshModels failed or no cheap model configured),
-  // derive a fallback from _defaultModel or log a warning.
-  const cheapModel = _cheapModel ?? (_defaultModel ? _defaultModel.replace(/pro/i, "flash") : undefined);
-  if (!cheapModel) console.warn("handleAnalyzeMode: _cheapModel is undefined and no fallback could be derived; using pi's built-in default model.");
+  // refreshModels() above already derived _cheapModel with the pro→flash fallback.
+  // If _cheapModel is still undefined (no cheap model configured and no fallback),
+  // log a warning — pi will use its built-in default model.
+  const cheapModel = _cheapModel;
+  if (!cheapModel) console.warn("handleAnalyzeMode: _cheapModel is undefined; using pi's built-in default model.");
   let initR: { stdout: string; stderr: string; exitCode: number | null };
   try {
     initR = await runSubProcess(initTask, ctxCwd, cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
@@ -345,6 +346,11 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       // Check if the fixer was cancelled/aborted mid-execution before trusting its output
       if (signal?.aborted || r.exitCode === -3) {
         return "[cancelled by user]";
+      }
+      // Check for timeout before generic non-zero handling — gives clearer diagnostics
+      if (r.exitCode === -1) {
+        const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
+        return `[Sub-agent timeout] Fixer timed out (exit -1): ${improved.substring(0, 200)}`;
       }
       const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
       if (improved.trim().length > 0) analysis = improved; // update for next review round
@@ -460,6 +466,10 @@ async function handleImproveMode(
         if (signal?.aborted || r.exitCode === -3) {
           return "[cancelled by user]";
         }
+        // Check for timeout before generic non-zero handling — gives clearer diagnostics
+        if (r.exitCode === -1) {
+          return `[Sub-agent timeout] Fixer timed out (exit -1): ${output.substring(0, 200)}`;
+        }
         // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
         if (r.exitCode !== 0) {
           return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${output.substring(0, 200)}`;
@@ -538,9 +548,12 @@ async function handleExecuteMode(
           subAgents.delete(execId);
         } else {
           // Use a unique todoMatchKey for this execute item so progress is visible
-          // Include a hash prefix to avoid collisions between items sharing the same first 50 chars
-          const executeHash = createHash("sha1").update(item.description).digest("hex").substring(0, 8);
-          const todoMatchKey = `execute:${executeHash}:${item.description.substring(0, 50)}`;
+          // Include a hash prefix to avoid collisions between items sharing the same first 50 chars.
+          // Guard: item.description is validated as a string in the EXECUTE handler, but
+          // handleExecuteMode may also be called from other paths — use a safe fallback.
+          const desc = typeof item.description === "string" ? item.description : String(item.description ?? "");
+          const executeHash = createHash("sha256").update(desc).digest("hex").substring(0, 8);
+          const todoMatchKey = `execute:${executeHash}:${desc.substring(0, 50)}`;
           const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey);
           results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
           if (!ir.clean) allClean = false;
@@ -602,21 +615,26 @@ async function handleExecuteMode(
         // Setting status FIRST closes the TOCTOU window where closeHandler could
         // commitWorktree (code===0) between our running-check and the kill.
         const prevStatus = ag.status;
-        ag.status = "cancelled";
+        // Use "error" for actual crashes vs "cancelled" for user-initiated abort.
+        // This distinction matters for branch preservation: cancelled work is
+        // discarded, but a crashed agent may have committed partial work.
+        ag.status = isAbort ? "cancelled" : "error";
 
         if (prevStatus === "running") {
           try { ag.proc?.kill("SIGKILL"); } catch { /* ok */ }
-          // closeHandler will fire (or already fired). If it saw "cancelled" (because
+          // closeHandler will fire (or already fired). If it saw "cancelled"/"error" (because
           // we set it before kill), it will call cleanupWorktree with (code !== 0)
           // and settle. If it fired in the narrow window before our status write, it
           // would have committed the work. cleanupWorktree is idempotent, so calling
           // it here is safe regardless — double-cleanup is a no-op.
-          cleanupWorktree(root, execId, true);
+          // Preserve branch on crash (may contain partial committed work); discard on cancel.
+          cleanupWorktree(root, execId, isAbort);
           subAgents.delete(execId);
         } else {
           // Agent was already in a terminal state ("done", "error", "merged", etc.).
           // Preserve the git branch if the work was already committed.
-          const deleteBranch = prevStatus !== "done" && prevStatus !== "merged";
+          // For crashes, preserve branch regardless of prior state.
+          const deleteBranch = isAbort && prevStatus !== "done" && prevStatus !== "merged";
           cleanupWorktree(root, execId, deleteBranch);
           subAgents.delete(execId);
         }
@@ -731,6 +749,14 @@ function ensureGitRepo(projectRoot: string): string {
         "*.swo",
         ".pi/subagent/",
       ].join("\n") + "\n");
+    } catch { /* best effort */ }
+  } else {
+    // .gitignore already exists — check whether .pi/subagent/ is already ignored
+    try {
+      const content = readFileSync(gitignorePath, "utf-8");
+      if (!content.includes(".pi/subagent/")) {
+        console.warn(`\u26a0 ${gitignorePath} exists but does not exclude .pi/subagent/. Sub-agent worktree contents could be staged by git add -A. Consider adding \".pi/subagent/\" to your .gitignore.`);
+      }
     } catch { /* best effort */ }
   }
   // Create initial commit so worktree add works
@@ -1579,7 +1605,7 @@ export default function (pi: ExtensionAPI) {
       if (params.mode === "analyze") {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
         const tb = getTodoBridge();
-        const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
+        const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
@@ -1593,7 +1619,7 @@ export default function (pi: ExtensionAPI) {
         // Add a todo item so progress is visible in the todo flow widget
         const tb = getTodoBridge();
         // Use a unique match key incorporating the task text to avoid substring collisions
-        const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
+        const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
 
@@ -1664,6 +1690,10 @@ export default function (pi: ExtensionAPI) {
         if (items.length === 0) {
           return { content: [{ type: "text", text: "No todo items provided." }], details: {}, isError: true };
         }
+        // Validate each todo item has a string description before passing to handler
+        if (!items.every((x: any) => typeof x?.description === "string")) {
+          return { content: [{ type: "text", text: "Each todo item must have a string description." }], details: {}, isError: true };
+        }
         const result = await handleExecuteMode(items, ctx.cwd, _signal);
         const summary = [
           `┌─ Execute Complete ──────────────────────`,
@@ -1689,6 +1719,10 @@ export default function (pi: ExtensionAPI) {
       timeoutMs: Type.Optional(Type.Number({ description: "Max wait ms (default: 1200000 = 20 min)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      // Validate ID format early to avoid confusing git error messages
+      if (!params.id || typeof params.id !== "string" || !safeId(params.id)) {
+        return { content: [{ type: "text", text: `Invalid sub-agent ID: "${String(params.id).substring(0, 40)}". IDs must be alphanumeric with optional dashes/underscores.` }], details: {}, isError: true };
+      }
       const ag = subAgents.get(params.id);
       if (!ag) {
         // Recovery: the agent may have been evicted from the map but the git branch
@@ -1782,6 +1816,10 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Sub-agent ID" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      // Validate ID format early to avoid confusing git error messages
+      if (!params.id || typeof params.id !== "string" || !safeId(params.id)) {
+        return { content: [{ type: "text", text: `Invalid sub-agent ID: "${String(params.id).substring(0, 40)}". IDs must be alphanumeric with optional dashes/underscores.` }], details: {}, isError: true };
+      }
       const ag = subAgents.get(params.id);
       if (ag && ag.status === "running") {
         return {
@@ -1823,6 +1861,10 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Sub-agent ID" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      // Validate ID format early to avoid confusing git error messages
+      if (!params.id || typeof params.id !== "string" || !safeId(params.id)) {
+        return { content: [{ type: "text", text: `Invalid sub-agent ID: "${String(params.id).substring(0, 40)}". IDs must be alphanumeric with optional dashes/underscores.` }], details: {}, isError: true };
+      }
       const branch = branchName(params.id);
       const ag = subAgents.get(params.id);
       if (ag && ag.status === "running") return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
@@ -1915,6 +1957,10 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Sub-agent ID" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      // Validate ID format early to avoid confusing git error messages
+      if (!params.id || typeof params.id !== "string" || !safeId(params.id)) {
+        return { content: [{ type: "text", text: `Invalid sub-agent ID: "${String(params.id).substring(0, 40)}". IDs must be alphanumeric with optional dashes/underscores.` }], details: {}, isError: true };
+      }
       const ag = subAgents.get(params.id);
       // Attempt cleanup even if agent is not in the map (e.g., after subagent_parallel)
       // by checking if the worktree/branch exists
@@ -2113,6 +2159,10 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Sub-agent ID" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      // Validate ID format early to avoid confusing git error messages
+      if (!params.id || typeof params.id !== "string" || !safeId(params.id)) {
+        return { content: [{ type: "text", text: `Invalid sub-agent ID: "${String(params.id).substring(0, 40)}". IDs must be alphanumeric with optional dashes/underscores.` }], details: {}, isError: true };
+      }
       if (!subAgents.has(params.id)) {
         return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
       }
