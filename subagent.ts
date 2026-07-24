@@ -542,15 +542,24 @@ function getDiff(projectRoot: string, id: string): string {
 function commitWorktree(worktreePath: string, id: string, task: string): string {
   const msg = `pi: ${id} — ${task.substring(0, 80)}`;
   let lastHash = "";
-  const repo = worktreePath;
-  if (repo && existsSync(join(repo, ".git"))) {
-    try {
-      if (gitQuiet(["status", "--porcelain"], repo).trim()) {
-        gitQuiet(["add", "-A"], repo);
-        gitQuiet(["commit", "-m", msg], repo);
-        lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
-      }
-    } catch { /* ok */ }
+  // Always commit to the extensions repo — that's where the real code lives.
+  // The home directory git repo is only for sub-agent worktree management.
+  const exts = join(homedir(), ".pi", "agent", "extensions");
+  const repos = [exts];
+  // Also try the worktree path itself if it's a different git repo
+  if (worktreePath !== exts && existsSync(join(worktreePath, ".git"))) {
+    repos.push(worktreePath);
+  }
+  for (const repo of repos) {
+    if (existsSync(join(repo, ".git"))) {
+      try {
+        if (gitQuiet(["status", "--porcelain"], repo).trim()) {
+          gitQuiet(["add", "-A"], repo);
+          gitQuiet(["commit", "-m", msg], repo);
+          lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
+        }
+      } catch { /* ok */ }
+    }
   }
   return lastHash;
 }
