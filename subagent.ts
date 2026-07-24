@@ -321,7 +321,7 @@ async function handleImproveMode(
     const safe = safeId(targetAgentId);
     // Use hash-based fallback if safeId fails — ensures deterministic paths
     // Use the same fallback logic as branchName() to reconstruct the worktree path
-    const dirComponent = safe || `fallback-${createHash("sha1").update(targetAgentId).digest("hex").substring(0, 8)}`;
+        const dirComponent = safe || `fallback-${createHash("sha1").update(targetAgentId).digest("hex").substring(0, 12)}`;
     const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", dirComponent);
     if (existsSync(reconstructed)) {
       // Verify the branch still exists — worktree without branch is useless
@@ -384,53 +384,19 @@ async function handleImproveMode(
 function autoMergeBranch(
   ctxCwd: string, execId: string, description: string
 ): { retainForManualReview: boolean } {
-  const branch = branchName(execId);
-  try { git(["rev-parse", "--verify", branch], ctxCwd); }
-  catch { /* branch missing, skip merge */ return { retainForManualReview: false }; }
-  // Stash any dirty state before merging (safer than checkpoint commits)
-  let stashed = false;
-  if (gitQuiet(["status", "--porcelain"], ctxCwd).trim()) {
-    try {
-      git(["stash", "push", "-m", `pi: auto-stash before merge ${execId}`], ctxCwd);
-      stashed = true;
-    } catch {
-      stashed = false;
-      console.warn(`  ⚠ git stash push failed before merge ${execId}`);
-    }
-  }
-  try {
-    git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
-    // Separate commit from merge to handle commit failures gracefully.
-    // Use --allow-empty so a no-diff merge doesn't cause data loss.
-    try {
-      git(["commit", "-m", `pi: auto-merge ${execId}: ${description.substring(0, 60)}`, "--no-edit", "--allow-empty"], ctxCwd);
-    } catch (commitErr: any) {
-      // Merge applied but commit failed (e.g. pre-commit hook).
-      // Do NOT abort the merge — that would discard all changes.
-      // Retain the branch for manual review instead.
-      console.error(`  ⚠ Auto-merge of ${execId} applied but commit failed (${(commitErr.message || "").substring(0, 80)}). Branch retained for manual review.`);
-      if (stashed) try { git(["stash", "pop"], ctxCwd); } catch (e: any) { console.warn(`  ⚠ stash pop failed: ${(e.message || "").substring(0, 80)}`); }
-      return { retainForManualReview: true };
-    }
-    // Pop stash on successful merge + commit
-    if (stashed) try { git(["stash", "pop"], ctxCwd); } catch (e: any) { console.warn(`  ⚠ stash pop failed: ${(e.message || "").substring(0, 80)}`); }
-    return { retainForManualReview: false };
-  } catch (mergeErr: any) {
-    // Check if this is actually a conflict (unmerged files) vs. a transient error
-    const unmerged = gitQuiet(["ls-files", "-u"], ctxCwd).trim();
-    if (unmerged.length > 0) {
-      // Genuine merge conflict — abort and leave branch for manual review
-      gitQuiet(["merge", "--abort"], ctxCwd);
+  const result = mergeBranch(ctxCwd, execId, {
+    stashPolicy: "auto",
+    onCommitFailure: "keep-merge",
+    description,
+  });
+  if (!result.success && result.error && result.error !== "Branch not found") {
+    if (result.hasConflicts) {
       console.error(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
     } else {
-      // Transient error (disk full, permissions, etc.) — abort and fail cleanly
-      gitQuiet(["merge", "--abort"], ctxCwd);
-      console.error(`  ⚠ Auto-merge of ${execId} failed: ${(mergeErr.message || "").substring(0, 80)}`);
+      console.error(`  ⚠ Auto-merge of ${execId} failed: ${result.error.substring(0, 80)}`);
     }
-    // Pop stash back (merge was aborted, so working tree is clean)
-    if (stashed) try { git(["stash", "pop"], ctxCwd); } catch (e: any) { console.warn(`  ⚠ stash pop failed: ${(e.message || "").substring(0, 80)}`); }
-    return { retainForManualReview: unmerged.length > 0 };
   }
+  return { retainForManualReview: result.retainForManualReview };
 }
 
 /**
@@ -527,10 +493,16 @@ function git(args: string[], cwd: string): string {
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const err: any = new Error(result.stderr?.trim() || `git ${args[0]} exited with code ${result.status}`);
+    // When the process is killed by a signal, result.status is null and result.signal
+    // contains the signal name (e.g., "SIGTERM", "SIGKILL"). Produce a descriptive message.
+    const msg = result.signal
+      ? `git ${args[0]} killed by ${result.signal}`
+      : (result.stderr?.trim() || `git ${args[0]} exited with code ${result.status}`);
+    const err: any = new Error(msg);
     err.stderr = result.stderr || "";
     err.stdout = result.stdout || "";
     err.status = result.status;
+    err.signal = result.signal;
     throw err;
   }
   return result.stdout || "";
@@ -676,6 +648,12 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     git(["commit", "-m", msg], worktreePath);
     return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
   } catch (e: any) {
+    // Reset the index to HEAD to prevent dirty staging area from leaking into the next
+    // iteration. If `git add -A` succeeded but `git commit` failed, the index holds staged
+    // changes. Without a reset, the next call's `git add -A` re-stages everything (no-op
+    // for already-staged files), and a successful commit would bundle changes from *both*
+    // iterations under a single message, losing the per-iteration audit trail.
+    try { git(["reset", "HEAD"], worktreePath); } catch { /* best effort */ }
     console.error(`commitWorktree failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
     return "";
   }
@@ -697,6 +675,92 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
     try { git(["branch", "-D", branch], projectRoot); branchDeleted = true; } catch { /* ok */ }
   }
   return { branchDeleted, worktreeRemoved };
+}
+
+// ── shared merge helper ─────────────────────────────────────────────────────
+
+interface MergeBranchOptions {
+  /** Policy for handling dirty working tree before merge */
+  stashPolicy: "reject" | "auto";
+  /** What to do when merge succeeds but commit fails */
+  onCommitFailure: "abort-merge" | "keep-merge";
+  /** Description for the auto-merge commit message */
+  description: string;
+}
+
+interface MergeBranchResult {
+  success: boolean;
+  retainForManualReview: boolean;
+  hasConflicts: boolean;
+  conflictFiles: string;
+  error?: string;
+}
+
+/**
+ * Shared merge logic used by both autoMergeBranch (execute/improve) and
+ * subagent_merge (manual tool). The two callers differ only in policy:
+ * - autoMergeBranch: stashPolicy=auto, onCommitFailure=keep-merge
+ * - subagent_merge:  stashPolicy=reject, onCommitFailure=abort-merge
+ */
+function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions): MergeBranchResult {
+  const branch = branchName(execId);
+
+  // Verify branch exists
+  try { git(["rev-parse", "--verify", branch], ctxCwd); }
+  catch { return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: "Branch not found" }; }
+
+  // Handle dirty working tree
+  let stashed = false;
+  const dirty = gitQuiet(["status", "--porcelain"], ctxCwd).trim();
+  if (dirty) {
+    if (options.stashPolicy === "reject") {
+      return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: "Dirty working tree" };
+    }
+    if (options.stashPolicy === "auto") {
+      try {
+        git(["stash", "push", "-m", `pi: auto-stash before merge ${execId}`], ctxCwd);
+        stashed = true;
+      } catch (e: any) {
+        stashed = false;
+        console.warn(`  \u26a0 git stash push failed before merge ${execId}: ${(e.message || "").substring(0, 80)}`);
+      }
+    }
+  }
+
+  // Attempt merge
+  try {
+    git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
+  } catch (mergeErr: any) {
+    const unmerged = gitQuiet(["ls-files", "-u"], ctxCwd).trim();
+    const isConflict = unmerged.length > 0;
+    gitQuiet(["merge", "--abort"], ctxCwd);
+    if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* best effort */ } }
+    if (isConflict) {
+      const conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctxCwd);
+      return { success: false, retainForManualReview: true, hasConflicts: true, conflictFiles, error: "Merge conflicts" };
+    }
+    return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: (mergeErr as any).stderr || (mergeErr as any).message || "Unknown merge error" };
+  }
+
+  // Merge applied — commit
+  try {
+    git(["commit", "-m", `pi: merge ${execId}: ${options.description.substring(0, 60)}`, "--no-edit", "--allow-empty"], ctxCwd);
+  } catch (commitErr: any) {
+    if (options.onCommitFailure === "abort-merge") {
+      gitQuiet(["merge", "--abort"], ctxCwd);
+      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* ok */ } }
+      return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `Commit failed: ${(commitErr.message || "").substring(0, 200)}` };
+    } else {
+      // keep-merge: merge applied but commit failed — retain branch for manual review
+      console.error(`  \u26a0 Merge of ${execId} applied but commit failed (${(commitErr.message || "").substring(0, 80)}). Branch retained for manual review.`);
+      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* ok */ } }
+      return { success: false, retainForManualReview: true, hasConflicts: false, conflictFiles: "" };
+    }
+  }
+
+  // Success
+  if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { /* best effort */ } }
+  return { success: true, retainForManualReview: false, hasConflicts: false, conflictFiles: "" };
 }
 
 // ── sub-process runner ───────────────────────────────────────────────────────
@@ -1390,79 +1454,52 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const branch = branchName(params.id);
-      if (gitQuiet(["status", "--porcelain"], ctx.cwd).trim()) { return { content: [{ type: "text", text: "Working tree has uncommitted changes. Commit or stash before merging." }], details: {}, isError: true }; }
       const ag = subAgents.get(params.id);
       if (ag && ag.status === "running") return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
 
-      // Verify branch exists before attempting merge
-      try { git(["rev-parse", "--verify", branch], ctx.cwd); }
-      catch { return { content: [{ type: "text", text: `Branch ${branch} for sub-agent ${params.id} not found. It may have been cleaned up already.` }], details: {}, isError: true }; }
+      // Use shared merge helper with policy: reject dirty tree, abort on commit failure
+      const result = mergeBranch(ctx.cwd, params.id, {
+        stashPolicy: "reject",
+        onCommitFailure: "abort-merge",
+        description: ag?.task || "delegated task",
+      });
 
-      // Try merge
-      try {
-        // Attempt merge — catch both conflicts and other errors
-        let mergeSucceeded = false;
-        let mergeError = "";
-        try {
-          git(["merge", "--no-commit", "--no-ff", branch], ctx.cwd);
-          mergeSucceeded = true;
-        } catch (e: any) {
-          mergeError = e.stderr || e.message || "";
+      if (!result.success) {
+        if (result.error === "Dirty working tree") {
+          return { content: [{ type: "text", text: "Working tree has uncommitted changes. Commit or stash before merging." }], details: {}, isError: true };
         }
-
-        if (!mergeSucceeded) {
-          const isConflict = mergeError.includes("CONFLICT");
-
-          // Capture conflicting files BEFORE aborting the merge
-          let conflictFiles = "";
-          if (isConflict) {
-            conflictFiles = gitQuiet(["diff", "--name-only", "--diff-filter=U"], ctx.cwd);
-          }
-          // Abort to leave working tree clean
-          gitQuiet(["merge", "--abort"], ctx.cwd);
-
-          if (isConflict) {
-            return {
-              content: [{
-                type: "text",
-                text: [
-                  `⚠ Merge conflicts detected for sub-agent ${params.id}`,
-                  `Branch: ${branch}`,
-                  "",
-                  "Conflicting files:",
-                  conflictFiles || "(check manually)",
-                  "",
-                  "The merge was aborted. You need to resolve conflicts manually:",
-                  `  git merge ${branch}`,
-                  "  # resolve conflicts",
-                  "  git add -A && git commit",
-                ].join("\n"),
-              }],
-              details: { hasConflicts: true, branch },
-            };
-          }
-
+        if (result.error === "Branch not found") {
+          return { content: [{ type: "text", text: `Branch ${branch} for sub-agent ${params.id} not found. It may have been cleaned up already.` }], details: {}, isError: true };
+        }
+        if (result.hasConflicts) {
           return {
-            content: [{ type: "text", text: `Merge failed for ${params.id}: ${mergeError.substring(0, 500)}` }],
-            details: {},
-            isError: true,
+            content: [{
+              type: "text",
+              text: [
+                `⚠ Merge conflicts detected for sub-agent ${params.id}`,
+                `Branch: ${branch}`,
+                "",
+                "Conflicting files:",
+                result.conflictFiles || "(check manually)",
+                "",
+                "The merge was aborted. You need to resolve conflicts manually:",
+                `  git merge ${branch}`,
+                "  # resolve conflicts",
+                "  git add -A && git commit",
+              ].join("\n"),
+            }],
+            details: { hasConflicts: true, branch },
           };
         }
-
-        // Clean merge — commit it (with --allow-empty for no-diff merges)
-        try {
-          git(["commit", "-m", `pi: merge subagent ${params.id}: ${ag?.task?.substring(0, 60) || "delegated task"}`, "--no-edit", "--allow-empty"], ctx.cwd);
-        } catch (commitErr: any) {
-          // Commit failed — abort the merge to leave the working tree clean
-          // rather than leaving it in a half-merged state with no recovery path.
-          gitQuiet(["merge", "--abort"], ctx.cwd);
+        // Commit failure (abort-merge already handled inside mergeBranch)
+        if (result.error?.startsWith("Commit failed:")) {
           return {
             content: [{
               type: "text",
               text: [
                 `Merge of sub-agent ${params.id} failed during commit.`,
                 `The merge has been aborted and working tree is clean.`,
-                `Commit error: ${(commitErr.message || "").substring(0, 200)}`,
+                `Commit error: ${result.error.substring("Commit failed: ".length)}`,
                 ``,
                 `To retry: subagent_merge id="${params.id}"`,
               ].join("\n"),
@@ -1471,40 +1508,31 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-
-        // Update agent status
-        if (ag) ag.status = "merged";
-
-        // Clean up worktree (keep branch for history)
-        cleanupWorktree(projectRoot(ctx.cwd), params.id, false);
-        subAgents.delete(params.id);
-
         return {
-          content: [{
-            type: "text",
-            text: [
-              `✅ Sub-agent ${params.id} merged successfully.`,
-              `Branch: ${branch}`,
-              ag?.commitHash ? `Commits: ${ag.commitHash}` : "",
-              "",
-              "Worktree cleaned up. Branch retained for history.",
-            ].join("\n"),
-          }],
-          details: { merged: true, branch },
-        };
-      } catch (e: any) {
-        // Abort any partial merge
-        try { git(["merge", "--abort"], ctx.cwd); } catch { /* ok */ }
-
-        return {
-          content: [{
-            type: "text",
-            text: `Merge failed for ${params.id}: ${e.stderr || e.message}`,
-          }],
+          content: [{ type: "text", text: `Merge failed for ${params.id}: ${result.error}` }],
           details: {},
           isError: true,
         };
       }
+
+      // Success
+      if (ag) ag.status = "merged";
+      cleanupWorktree(projectRoot(ctx.cwd), params.id, false);
+      subAgents.delete(params.id);
+
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `✅ Sub-agent ${params.id} merged successfully.`,
+            `Branch: ${branch}`,
+            ag?.commitHash ? `Commits: ${ag.commitHash}` : "",
+            "",
+            "Worktree cleaned up. Branch retained for history.",
+          ].join("\n"),
+        }],
+        details: { merged: true, branch },
+      };
     },
   });
 
@@ -1781,10 +1809,11 @@ export default function (pi: ExtensionAPI) {
           } catch { /* can't read sentinel, treat as stale and clean up */ }
           const branch = `pi/subagent/${entry}`;
           try {
-            // Remove sentinel first to prevent re-processing
-            unlinkSync(sentinel);
             git(["worktree", "remove", "--force", wtDir], root);
             git(["branch", "-D", branch], root);
+            // Only remove sentinel after both git operations succeed — if either fails,
+            // the sentinel remains so the next session_start retries cleanup.
+            unlinkSync(sentinel);
           } catch { /* best effort — may have been partially cleaned */ }
         }
       } catch { /* ok */ }
