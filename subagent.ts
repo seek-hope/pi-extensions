@@ -157,7 +157,8 @@ async function reviewLoop(
   runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
   commitPrefix = "loop",
   signal?: AbortSignal,
-  todoMatchKey?: string // unique key for todo bridge updates (avoids substring collisions)
+  todoMatchKey?: string, // unique key for todo bridge updates (avoids substring collisions)
+  model?: string // model override for reviewer
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
@@ -179,8 +180,11 @@ async function reviewLoop(
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
     let r;
+    // runSubProcess always resolves (never rejects on its own). The try/catch
+    // only handles the edge case where resolvePiBin() throws synchronously
+    // inside the Promise constructor (e.g., missing binary).
     try {
-      r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+      r = await runSubProcess(reviewTask, workCwd, model ?? _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
     } catch (e: any) {
       return { iterations: i, clean: false, summary: `❌ Reviewer failed to start at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
@@ -285,12 +289,16 @@ async function reviewLoop(
 /**
  * ANALYZE: read-only exploration → review → improve → loop → final report.
  */
-async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSignal, todoMatchKey?: string): Promise<LoopResult> {
+async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSignal, todoMatchKey?: string, model?: string): Promise<LoopResult> {
   // Phase 1: initial exploration with cheap model (use sub-process, not worktree)
   const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
+  // If _cheapModel is undefined (refreshModels failed or no cheap model configured),
+  // derive a fallback from _defaultModel or log a warning.
+  const cheapModel = _cheapModel ?? (_defaultModel ? _defaultModel.replace(/pro/i, "flash") : undefined);
+  if (!cheapModel) console.warn("handleAnalyzeMode: _cheapModel is undefined and no fallback could be derived; using system default.");
   let initR;
   try {
-    initR = await runSubProcess(initTask, ctxCwd, _cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+    initR = await runSubProcess(initTask, ctxCwd, cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
   } catch (e: any) {
     return { iterations: 0, clean: false, summary: `❌ Initial exploration failed to start: ${(e.message || e).substring(0, 200)}` };
   }
@@ -323,7 +331,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
         `Improve this analysis based on feedback. Produce a complete final analysis. DO NOT modify files.\n\n` +
         `Feedback: ${reviewerOutput.substring(0, 4000)}`,
         ctxCwd,
-        _defaultModel,
+        model ?? _defaultModel,
         "read,bash,serena_search_pattern,serena_overview",
         undefined,
         signal
@@ -355,7 +363,8 @@ async function handleImproveMode(
   criteria: string | undefined,
   task?: string,
   signal?: AbortSignal,
-  todoMatchKey?: string // unique key for todo bridge updates
+  todoMatchKey?: string, // unique key for todo bridge updates
+  model?: string // model override for the fixer sub-process
 ): Promise<LoopResult> {
   // Early cancellation check before any filesystem or validation work
   if (signal?.aborted) {
@@ -438,7 +447,7 @@ async function handleImproveMode(
         // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
         // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
         const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-        const r = await runSubProcess(fixerTask, workCwd, _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, signal);
+        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, signal);
         const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
         // Check if the fixer was cancelled/aborted mid-execution before trusting its output
         if (signal?.aborted || r.exitCode === -3) {
@@ -800,7 +809,8 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     } catch {
       const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
       if (fullHash) return fullHash.substring(0, 7);
-      return "committed-but-no-hash";
+      console.warn(`commitWorktree: commit succeeded but rev-parse HEAD failed in ${worktreePath}; hash unknown.`);
+      return "no-changes";
     }
   } catch (e: any) {
     // git add or git commit failed. Reset the index to prevent dirty staging area
@@ -876,11 +886,14 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
     }
     if (options.stashPolicy === "auto") {
       try {
-        git(["stash", "push", "-m", `pi: auto-stash before merge ${execId}`], ctxCwd);
+        git(["stash", "push", "--include-untracked", "-m", `pi: auto-stash before merge ${execId}`], ctxCwd);
         stashed = true;
       } catch (e: any) {
         console.warn(`  \u26a0 git stash push failed before merge ${execId}: ${(e.message || "").substring(0, 80)}`);
-        return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `git stash push failed: ${(e.message || "").substring(0, 80)}` };
+        // Stash-push failure means the working tree could not be stashed, so
+        // the merge cannot proceed. Return retainForManualReview: true so the
+        // sub-agent's branch is preserved for manual merge instead of being deleted.
+        return { success: false, retainForManualReview: true, hasConflicts: false, conflictFiles: "", error: `git stash push failed: ${(e.message || "").substring(0, 80)}` };
       }
     }
   }
@@ -1398,11 +1411,11 @@ export default function (pi: ExtensionAPI) {
           const ag = subAgents.get(rest);
           if (!ag) { ctx.ui.notify(`No sub-agent: ${rest}`, "error"); return; }
           ag.status = "cancelled";
-          try { ag.proc?.kill("SIGKILL"); } catch { /* already dead */ }
           // Wait for process to fully exit before cleaning up worktree to avoid
           // file handle races (e.g., rmSync on locked files after SIGKILL).
-          // Attach the close listener BEFORE checking if the pid is alive to avoid
-          // a TOCTOU race where the process exits between the check and the listener.
+          // Attach the close listener BEFORE killing and checking if the pid is
+          // alive to avoid a TOCTOU race where the process exits between the
+          // check and the listener.
           if (ag.proc) {
             const { pid } = ag.proc;
             if (pid !== undefined) {
@@ -1410,6 +1423,7 @@ export default function (pi: ExtensionAPI) {
                 const timeout = setTimeout(() => resolveWait(), 3000);
                 ag.proc!.on("close", () => { clearTimeout(timeout); resolveWait(); });
               });
+              try { ag.proc!.kill("SIGKILL"); } catch { /* already dead */ }
               try { process.kill(pid, 0); /* check if alive — wait for close */
                 await closePromise;
               } catch { /* already dead */ }
@@ -1491,7 +1505,7 @@ export default function (pi: ExtensionAPI) {
         const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
-        const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey);
+        const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
         if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
       }
@@ -1510,13 +1524,13 @@ export default function (pi: ExtensionAPI) {
         // This avoids cross-repo mismatch when extensions live in a different git repo
         // Treat undefined, null, empty, or whitespace-only as "no subagentId"
         if (params.subagentId === undefined || params.subagentId === null || params.subagentId.trim() === "") {
-          const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey);
+          const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey, params.model);
           if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
         // If subagentId provided, improve the target sub-agent's worktree
-        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, undefined, _signal, todoMatchKey);
+        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, undefined, _signal, todoMatchKey, params.model);
         if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         // Only auto-merge when the improve loop completed cleanly; failed loops leave the branch for review
         if (result.clean) {
@@ -2028,11 +2042,11 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
       }
       ag.status = "cancelled";
-      if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
       // Wait for process to fully exit before cleaning up worktree to avoid
       // file handle races (e.g., rmSync on locked files after SIGKILL).
-      // Attach the close listener BEFORE checking if the pid is alive to avoid
-      // a TOCTOU race where the process exits between the check and the listener.
+      // Attach the close listener BEFORE killing and checking if the pid is
+      // alive to avoid a TOCTOU race where the process exits between the
+      // check and the listener.
       const { proc } = ag;
       if (proc) {
         const { pid } = proc;
@@ -2041,6 +2055,7 @@ export default function (pi: ExtensionAPI) {
             const timeout = setTimeout(() => resolveWait(), 3000);
             proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
           });
+          try { proc.kill("SIGKILL"); } catch { /* ok */ }
           try { process.kill(pid, 0); /* check if alive — wait for close */
             await closePromise;
           } catch { /* already dead */ }
