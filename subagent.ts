@@ -261,6 +261,13 @@ async function handleImproveMode(
       // Fixer runs directly in the target worktree (no merge needed)
       const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
+      // CRITICAL: commit fixer edits — otherwise merge loses them
+      try {
+        if (gitQuiet(["status", "--porcelain"], workCwd).trim()) {
+          gitQuiet(["add", "-A"], workCwd);
+          gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], workCwd);
+        }
+      } catch (e) { /* best effort */ }
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },
