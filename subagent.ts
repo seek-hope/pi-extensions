@@ -492,7 +492,7 @@ function autoMergeBranch(
     onCommitFailure: "keep-merge",
     description,
   });
-  if (!result.success && result.error && result.error !== "Branch not found" && !result.error.includes("Already up to date")) {
+  if (!result.success && result.error && result.error !== "Branch not found") {
     if (result.hasConflicts) {
       console.error(`  ⚠ Auto-merge of ${execId} had conflicts — branch retained for manual merge.`);
     } else {
@@ -712,6 +712,25 @@ function ensureGitRepo(projectRoot: string): string {
   } catch (e: any) {
     throw new Error(`git init failed: ${e.stderr || e.message}`);
   }
+  // Create .gitignore with common exclusions before initial commit
+  const gitignorePath = join(projectRoot, ".gitignore");
+  if (!existsSync(gitignorePath)) {
+    try {
+      writeFileSync(gitignorePath, [
+        "# Auto-generated for sub-agent tracking",
+        "node_modules/",
+        ".env",
+        ".env.*",
+        "*.log",
+        "dist/",
+        "build/",
+        ".DS_Store",
+        "*.swp",
+        "*.swo",
+        ".pi/subagent/",
+      ].join("\n") + "\n");
+    } catch { /* best effort */ }
+  }
   // Create initial commit so worktree add works
   try {
     git(["add", "-A", "--ignore-errors"], projectRoot);
@@ -858,6 +877,49 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
   return { branchDeleted, worktreeRemoved };
 }
 
+/** Pop a stash safely — drops the entry if pop fails to avoid orphaned stash entries. */
+function safeStashPop(ctxCwd: string, execId: string, context: string): void {
+  try {
+    git(["stash", "pop"], ctxCwd);
+  } catch {
+    try { git(["stash", "drop"], ctxCwd); } catch { /* best effort */ }
+    console.warn(`  \u26a0 git stash pop failed ${context} \u2014 stashed entry dropped for ${execId}.`);
+  }
+}
+
+/**
+ * Cancel a sub-agent: set status, kill process, clean up worktree.
+ * Shared between /subagent cancel command and subagent_cancel tool.
+ */
+async function cancelSubAgent(id: string, projectRootArg: string): Promise<void> {
+  const ag = subAgents.get(id);
+  if (!ag) return;
+  ag.status = "cancelled";
+  // Wait for process to fully exit before cleaning up worktree to avoid
+  // file handle races (e.g., rmSync on locked files after SIGKILL).
+  // Attach the close listener BEFORE killing and checking if the pid is
+  // alive to avoid a TOCTOU race where the process exits between the
+  // check and the listener.
+  const proc = ag.proc;
+  if (proc) {
+    const { pid } = proc;
+    if (pid !== undefined && proc.exitCode === null) {
+      // Process is still alive — attach close listener before killing to avoid TOCTOU race
+      const closePromise = new Promise<void>((resolveWait) => {
+        const timeout = setTimeout(() => resolveWait(), 3000);
+        proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
+      });
+      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+      try { process.kill(pid, 0); /* check if alive — wait for close */
+        await closePromise;
+      } catch { /* already dead */ }
+    }
+    // If proc.exitCode !== null, process already existed — skip wait entirely
+  }
+  cleanupWorktree(projectRootArg, id, true);
+  subAgents.delete(id);
+}
+
 // ── shared merge helper ─────────────────────────────────────────────────────
 
 interface MergeBranchOptions {
@@ -911,6 +973,14 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
     }
   }
 
+  // Check if branch is already an ancestor of HEAD (avoids locale-dependent error parsing)
+  try {
+    git(["merge-base", "--is-ancestor", branch, "HEAD"], ctxCwd);
+    // Already up to date — no merge needed
+    if (stashed) safeStashPop(ctxCwd, execId, "after up-to-date merge");
+    return { success: true, retainForManualReview: false, hasConflicts: false, conflictFiles: "" };
+  } catch { /* not up to date — proceed with merge */ }
+
   // Attempt merge
   try {
     git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
@@ -931,7 +1001,7 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
       conflictFiles = [...seen].join('\n');
     }
     gitQuiet(["merge", "--abort"], ctxCwd);
-    if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after merge conflict \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
+    if (stashed) safeStashPop(ctxCwd, execId, "after merge conflict");
     if (isConflict) {
       return { success: false, retainForManualReview: true, hasConflicts: true, conflictFiles, error: "Merge conflicts" };
     }
@@ -944,18 +1014,18 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
   } catch (commitErr: any) {
     if (options.onCommitFailure === "abort-merge") {
       gitQuiet(["merge", "--abort"], ctxCwd);
-      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after abort-merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
+      if (stashed) safeStashPop(ctxCwd, execId, "after abort-merge");
       return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `${COMMIT_FAILED_PREFIX}${(commitErr.message || "").substring(0, 200)}` };
     } else {
       // keep-merge: merge applied but commit failed — retain branch for manual review
       console.error(`  \u26a0 Merge of ${execId} applied but commit failed (${(commitErr.message || "").substring(0, 80)}). Branch retained for manual review.`);
-      if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after keep-merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
+      if (stashed) safeStashPop(ctxCwd, execId, "after keep-merge");
       return { success: false, retainForManualReview: true, hasConflicts: false, conflictFiles: "" };
     }
   }
 
   // Success
-  if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after successful merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
+  if (stashed) safeStashPop(ctxCwd, execId, "after successful merge");
   return { success: true, retainForManualReview: false, hasConflicts: false, conflictFiles: "" };
 }
 
@@ -963,7 +1033,7 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number, signal?: AbortSignal): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000); // default 20 min, floor 20 min
+  const killTimeout = timeoutMs ?? 1_200_000; // default 20 min
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
@@ -1097,7 +1167,7 @@ function resolveGitRoot(cwd: string): string {
       return git(["rev-parse", "--show-toplevel"], cwd).trim();
     }
     // Worktree: strip /.git/worktrees/<name> suffix to get the main repo root
-    return commonDir.replace(/\/\.git(?:\/worktrees\/.+)?$/, "");
+    return commonDir.replace(/\/\.git(?:\/(?:worktrees|modules)\/.+)?$/, "");
   } catch {
     // Fallback: walk up looking for .git
     let dir = cwd;
@@ -1274,7 +1344,7 @@ function spawnSubAgent(
     // Kill process after timeout (min 20 min, configurable via options).
     // Declared before closeHandler so the function can reference it without
     // a temporal-dead-zone dependency.
-    const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
+    const killTimeout = options?.timeoutMs ?? 1_200_000;
 
     const closeHandler = (code: number | null) => {
       if (settled) return;
@@ -1426,31 +1496,8 @@ export default function (pi: ExtensionAPI) {
         }
         case "cancel": {
           if (!rest) { ctx.ui.notify("Usage: /subagent cancel <id>", "warning"); return; }
-          const ag = subAgents.get(rest);
-          if (!ag) { ctx.ui.notify(`No sub-agent: ${rest}`, "error"); return; }
-          ag.status = "cancelled";
-          // Wait for process to fully exit before cleaning up worktree to avoid
-          // file handle races (e.g., rmSync on locked files after SIGKILL).
-          // Attach the close listener BEFORE killing and checking if the pid is
-          // alive to avoid a TOCTOU race where the process exits between the
-          // check and the listener.
-          if (ag.proc) {
-            const { pid } = ag.proc;
-            if (pid !== undefined && ag.proc.exitCode === null) {
-              // Process is still alive — attach close listener before killing to avoid TOCTOU race
-              const closePromise = new Promise<void>((resolveWait) => {
-                const timeout = setTimeout(() => resolveWait(), 3000);
-                ag.proc!.on("close", () => { clearTimeout(timeout); resolveWait(); });
-              });
-              try { ag.proc!.kill("SIGKILL"); } catch { /* already dead */ }
-              try { process.kill(pid, 0); /* check if alive — wait for close */
-                await closePromise;
-              } catch { /* already dead */ }
-            }
-            // If proc.exitCode !== null, process already existed — skip wait entirely
-          }
-          cleanupWorktree(projectRoot(ctx.cwd), rest, true);
-          subAgents.delete(rest);
+          if (!subAgents.has(rest)) { ctx.ui.notify(`No sub-agent: ${rest}`, "error"); return; }
+          await cancelSubAgent(rest, projectRoot(ctx.cwd));
           ctx.ui.notify(`Sub-agent ${rest} cancelled and cleaned up.`, "info");
           return;
         }
@@ -2056,34 +2103,10 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Sub-agent ID" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const ag = subAgents.get(params.id);
-      if (!ag) {
+      if (!subAgents.has(params.id)) {
         return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
       }
-      ag.status = "cancelled";
-      // Wait for process to fully exit before cleaning up worktree to avoid
-      // file handle races (e.g., rmSync on locked files after SIGKILL).
-      // Attach the close listener BEFORE killing and checking if the pid is
-      // alive to avoid a TOCTOU race where the process exits between the
-      // check and the listener.
-      const { proc } = ag;
-      if (proc) {
-        const { pid } = proc;
-        if (pid !== undefined && proc.exitCode === null) {
-          // Process is still alive — attach close listener before killing to avoid TOCTOU race
-          const closePromise = new Promise<void>((resolveWait) => {
-            const timeout = setTimeout(() => resolveWait(), 3000);
-            proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
-          });
-          try { proc.kill("SIGKILL"); } catch { /* ok */ }
-          try { process.kill(pid, 0);
-            await closePromise;
-          } catch { /* already dead */ }
-        }
-        // If proc.exitCode !== null, process already existed — skip wait entirely
-      }
-      cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
-      subAgents.delete(params.id);
+      await cancelSubAgent(params.id, projectRoot(ctx.cwd));
       return { content: [{ type: "text", text: `Sub-agent ${params.id} cancelled. Worktree and branch removed.` }], details: {} };
     },
   });
