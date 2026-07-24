@@ -663,8 +663,10 @@ function getDiff(projectRoot: string, id: string): string {
 }
 
 /** Commit changes in the worktree directly (run git from the worktree path, not the main repo).
- *  Returns the short commit hash on success, or empty string on failure.
- *  Callers should check for empty hash to detect failure. */
+ *  Returns the short commit hash on success.
+ *  Returns "no-changes" if the worktree has no uncommitted changes (caller should treat as skip).
+ *  Returns "" on failure (git add/commit error, or hash retrieval failure).
+ *  Callers: check for empty string to detect failure, check for "no-changes" to skip. */
 function commitWorktree(worktreePath: string, id: string, task: string): string {
   const truncated = [...task].slice(0, 80).join('');
   const msg = id ? `pi: ${id} — ${truncated}` : `pi: ${truncated}`;
@@ -690,7 +692,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     } catch {
       const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
       if (fullHash) return fullHash.substring(0, 7);
-      return "committed";
+      return "";
     }
   } catch (e: any) {
     // git add or git commit failed. Reset the index to prevent dirty staging area
@@ -1115,7 +1117,8 @@ function spawnSubAgent(
         }
         agent.result = stdout.trim();
         // Auto-commit changes made by the sub-agent
-        agent.commitHash = commitWorktree(worktreePath, id, task);
+        const ch = commitWorktree(worktreePath, id, task);
+        agent.commitHash = ch === "no-changes" ? "" : ch;
         settle(stdout.trim(), "done");
         return;
       }
@@ -1977,7 +1980,24 @@ export default function (pi: ExtensionAPI) {
           const branch = `pi/subagent/${entry}`;
           try {
             git(["worktree", "remove", "--force", wtDir], root);
-            git(["branch", "-D", branch], root);
+            // Before deleting the branch, check if it has unmerged commits to prevent data loss.
+            // If the sentinel persisted (unlinkSync failed in settle()), a subsequent session_start
+            // would delete the branch and destroy committed work. Preserve unmerged commits by
+            // moving the branch to the recovered/ namespace.
+            try {
+              const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
+              const branchTip = git(["rev-parse", branch], root).trim();
+              if (mergeBase !== branchTip) {
+                const recoveredBranch = `recovered/subagent/${entry}`;
+                git(["branch", "-m", branch, recoveredBranch], root);
+                console.warn(`[subagent] Stale sentinel for ${entry}: worktree removed; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
+              } else {
+                git(["branch", "-D", branch], root);
+              }
+            } catch {
+              // merge-base or rev-parse failed (e.g., branch doesn't exist) — force delete
+              git(["branch", "-D", branch], root);
+            }
             unlinkSync(sentinel);
           } catch {
             // If the worktree directory no longer exists on disk (successfully removed or
