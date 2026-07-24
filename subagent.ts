@@ -8,7 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
@@ -211,16 +211,16 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
     if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+    // Check for cancellation BEFORE empty-output check — a cancelled fixer that is killed
+    // before any output is buffered could produce truly empty output rather than the
+    // "[cancelled by user]" sentinel. We must detect cancellation first to avoid
+    // misreporting it as a fixer failure.
+    if (signal?.aborted || /\[cancelled by user\]/.test(fixerOutput)) {
+      return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
+    }
     // Detect fixer failure — empty output or spawn errors
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
-    }
-    // Check for cancellation BEFORE error-pattern check — a cancelled fixer's output
-    // may contain "[cancelled by user]" (from runSubProcess) or be wrapped as
-    // "[Sub-agent error]" (from runAction). We must detect cancellation first to
-    // avoid misreporting it as a fixer failure.
-    if (signal?.aborted || /\[cancelled by user\]/.test(fixerOutput)) {
-      return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
     }
     // Require the full bracketed pattern (including closing `]`) to avoid false positives
     // from legitimate output that happens to start with "[Sub-agent error...".
@@ -431,7 +431,9 @@ async function handleExecuteMode(
           subAgents.delete(execId);
         } else {
           // Use a unique todoMatchKey for this execute item so progress is visible
-          const todoMatchKey = `execute:${item.description.substring(0, 50)}`;
+          // Include a hash prefix to avoid collisions between items sharing the same first 50 chars
+          const executeHash = createHash("sha1").update(item.description).digest("hex").substring(0, 8);
+          const todoMatchKey = `execute:${executeHash}:${item.description.substring(0, 50)}`;
           const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey);
           results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
           if (!ir.clean) allClean = false;
@@ -644,11 +646,25 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
   // The extensions dir is a different git repo — do NOT commit unrelated changes there.
   if (!gitQuiet(["status", "--porcelain"], worktreePath).trim()) return "";
 
+  let preCommitHash = "";
   try {
+    // Capture the pre-commit HEAD hash so we can undo the commit on rev-parse failure.
+    // This prevents duplicate commits if the caller retries after a false "failed" return.
+    preCommitHash = git(["rev-parse", "HEAD"], worktreePath).trim();
     git(["add", "-A"], worktreePath);
     git(["commit", "-m", msg], worktreePath);
-    return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
+    const hash = git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
+    return hash;
   } catch (e: any) {
+    // If commit succeeded but rev-parse failed, undo the commit to prevent duplicate commits
+    // on caller retry. Only attempt undo if we have a valid pre-commit hash and commit likely
+    // went through (add succeeded).
+    try {
+      const head = git(["rev-parse", "HEAD"], worktreePath).trim();
+      if (head !== preCommitHash) {
+        git(["reset", "--soft", "HEAD~1"], worktreePath);
+      }
+    } catch { /* best effort undo */ }
     // Reset the index to HEAD to prevent dirty staging area from leaking into the next
     // iteration. If `git add -A` succeeded but `git commit` failed, the index holds staged
     // changes. Without a reset, the next call's `git add -A` re-stages everything (no-op
@@ -836,9 +852,12 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     }
 
     const timer = setTimeout(() => {
-      try { proc.kill("SIGTERM"); } catch { /* already dead */ }
+      // Set exitCode sentinel BEFORE kill to prevent a race where the close event
+      // fires between kill and the assignment, capturing the real exit code and
+      // resolving the promise before exitCode = -1 takes effect.
       exitCode = -1;
       stderr = `[sub-process timeout after ${Math.round(killTimeout / 60_000)} min]`;
+      try { proc.kill("SIGTERM"); } catch { /* already dead */ }
       // Schedule SIGKILL escalation after grace period
       // Don't call done() here — let the close event resolve the promise naturally
       forceKillTimer = setTimeout(() => {
@@ -972,7 +991,11 @@ function spawnSubAgent(
   // agent reaches a terminal state.
   const sentinel = sentinelPath(root, id);
   if (sentinel) {
-    try { writeFileSync(sentinel, String(process.pid), "utf-8"); } catch { /* best effort */ }
+    try { writeFileSync(sentinel, String(process.pid), "utf-8"); } catch (e) {
+      // Sentinel creation failure means orphaned worktrees won't be auto-cleaned on
+      // next session_start. Log a warning so operators can detect and handle this.
+      console.warn(`[subagent] failed to create sentinel ${sentinel}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   const promise = new Promise<string>((resolve) => {
@@ -1812,6 +1835,8 @@ export default function (pi: ExtensionAPI) {
           // Skip non-directories and hidden files (like sentinel files)
           if (entry.startsWith(".")) continue;
           const wtDir = join(subDir, entry);
+          // Verify the entry is a directory — regular files in .pi/subagent/ are not worktrees
+          if (!lstatSync(wtDir).isDirectory()) continue;
           const sentinel = join(subDir, `.${entry}.sentinel`);
           // Only clean up if sentinel file still exists (agent was interrupted)
           if (!existsSync(sentinel)) continue;
