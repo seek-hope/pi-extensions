@@ -380,9 +380,18 @@ async function handleImproveMode(
 
   const reviewCriteria = criteria || "Check correctness, security, performance, style, edge cases, and completeness.";
 
-  return reviewLoop(
-    ctxCwd, workCwd,
-    (_i) => {
+  // Preserve agent status during improve loop so evictTerminalAgents doesn't
+  // delete the worktree out from under the active review loop.
+  const originalStatus = existing?.status;
+  if (existing && originalStatus && ["done", "error", "merged", "rejected", "cancelled"].includes(originalStatus)) {
+    existing.status = "improving" as any;
+  }
+
+  let _loopResult: LoopResult;
+  try {
+    _loopResult = await reviewLoop(
+      ctxCwd, workCwd,
+      (_i) => {
       const parts = [`Review criteria: ${reviewCriteria}`];
       if (task) {
         parts.push(`TASK: ${task}`);
@@ -408,11 +417,19 @@ async function handleImproveMode(
       }
       return output;
     },
-    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
-    signal,
-    todoMatchKey
-  );
-}
+      targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
+      signal,
+      todoMatchKey
+    );
+  } finally {
+    // Restore original status after loop completes so evictTerminalAgents
+    // can resume normal eviction for this agent.
+    if (existing && originalStatus) {
+      existing.status = originalStatus;
+    }
+  }
+  return _loopResult;
+  }
 
 /**
  * Auto-merge a sub-agent branch into main. Returns whether the branch should be retained for manual review.
@@ -484,11 +501,10 @@ async function handleExecuteMode(
           }
         }
       } else {
-        results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
-        allClean = false;
         // Agent was evicted from map (terminal state + age > EVICTION_AGE_MS).
-        // Check if the branch exists and has unmerged commits before force-deleting,
-        // to preserve work from agents that completed successfully (status "done").
+        // Check if the branch has unmerged commits to distinguish "actually failed"
+        // from "evicted-but-done" — a completed agent may have been evicted during
+        // a long-running execute pipeline.
         const branch = branchName(execId);
         let hasUnmergedCommits = false;
         try {
@@ -496,6 +512,12 @@ async function handleExecuteMode(
           const branchTip = git(["rev-parse", branch], root).trim();
           hasUnmergedCommits = mergeBase !== branchTip;
         } catch { /* branch doesn't exist */ }
+        if (hasUnmergedCommits) {
+          results.push(`${i + 1}. ${item.description}: ⚠ evicted but had committed work (branch preserved)`);
+        } else {
+          results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
+          allClean = false;
+        }
         cleanupWorktree(root, execId, !hasUnmergedCommits);
         subAgents.delete(execId);
       }
@@ -589,12 +611,15 @@ function ensureGitRepo(projectRoot: string): string {
       }
       // HEAD exists but rev-parse failed — try to repair before falling through
       if (existsSync(gitDir)) {
-        // Attempt recovery: if basic git commands work, the failure was transient
+        // Attempt recovery: if basic git commands work, the failure was transient.
+        // Use `git status --porcelain` instead of `git symbolic-ref HEAD` because
+        // a detached HEAD is a perfectly valid repo state — symbolic-ref would fail
+        // and trigger an unnecessary destructive re-init.
         try {
-          git(["symbolic-ref", "HEAD"], projectRoot);
+          git(["status", "--porcelain"], projectRoot);
           return projectRoot;
         } catch {
-          // Recovery failed — force-remove as last resort
+          // Both rev-parse and status failed — repo is unusable. Force-remove.
           try {
             rmSync(gitDir, { recursive: true, force: true });
           } catch {
@@ -1108,7 +1133,7 @@ function spawnSubAgent(
     let timedOut = false;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
-    let killTimer: NodeJS.Timeout;
+    let killTimer: NodeJS.Timeout | null = null;
 
     const extSignal = options?.signal;
     let abortHandler: (() => void) | null = null;
@@ -1116,7 +1141,7 @@ function spawnSubAgent(
     function settle(result: string, status: "done" | "error" | "cancelled") {
       if (settled) return;
       settled = true;
-      clearTimeout(killTimer);
+      if (killTimer) clearTimeout(killTimer);
       if (forceKillTimer) { clearTimeout(forceKillTimer); forceKillTimer = null; }
       if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
       proc.removeListener("close", closeHandler);
@@ -1157,14 +1182,6 @@ function spawnSubAgent(
       }
 
       if (code === 0) {
-        // TOCTOU guard: also check the external signal in case it fired moments before
-        // this closeHandler ran but after agent.status was last checked.
-        if (extSignal?.aborted) {
-          agent.status = "cancelled";
-          cleanupWorktree(root, id, true);
-          settle("[Sub-agent cancelled]", "cancelled");
-          return;
-        }
         agent.result = stdout.trim();
         // Auto-commit changes made by the sub-agent
         const ch = commitWorktree(worktreePath, id, task);
@@ -1263,6 +1280,7 @@ export default function (pi: ExtensionAPI) {
       switch (subcmd) {
         case "spawn": {
           if (!rest) { ctx.ui.notify("Usage: /subagent spawn <task>", "warning"); return; }
+          refreshModels(); // pick up any model changes made mid-session
           const { id } = spawnSubAgent(rest, ctx.cwd);
           ctx.ui.notify(`Sub-agent ${id} spawned (worktree: .pi/subagent/${id})`, "info");
           return;
@@ -1761,10 +1779,16 @@ export default function (pi: ExtensionAPI) {
         }
         tasks = parsed;
       } catch (e: any) {
-        // If JSON.parse fails, fall back to newline-delimited tasks
+        // If JSON.parse fails, only fall back to newline splitting if the input
+        // clearly isn't JSON (no leading '[' or contains literal newlines).
+        // Malformed JSON like ["a", "b" (missing ']') is surfaced to the caller.
         if (!(e instanceof SyntaxError)) {
           console.error("subagent_parallel: JSON.parse threw non-SyntaxError", e);
           return { content: [{ type: "text", text: `Unexpected parse error: ${e.message}` }], details: {}, isError: true };
+        }
+        const trimmed = params.tasks.trim();
+        if (trimmed.startsWith("[") && !trimmed.includes("\n")) {
+          return { content: [{ type: "text", text: `Failed to parse tasks as JSON array: ${e.message}` }], details: {}, isError: true };
         }
         tasks = params.tasks.split("\n").filter((t: string) => t.trim());
       }
