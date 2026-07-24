@@ -161,7 +161,7 @@ function renderWidget(ctx?: any): void {
   }
   lines.push(`└─ /todo for details`);
 
-  ui.setWidget("todo", lines.join("\n"));
+  ui.setWidget("todo", lines);
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
