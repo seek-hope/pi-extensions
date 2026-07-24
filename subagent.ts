@@ -115,8 +115,6 @@ async function reviewLoop(
     // Reviewer runs directly (no worktree) — it only reads and reports
     const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash");
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
-    // DEBUG
-    try { appendFileSync("/tmp/improve-debug.log", `[round ${i}] review exit=${r.exitCode} clean=${cleanMatch?.[1]} found=${foundMatch?.[1]}\n`); } catch {}
 
     // Abort if reviewer crashed or produced no output
     if (r.exitCode !== 0 && (!reviewerOutput || reviewerOutput.trim().length === 0)) {
@@ -263,18 +261,14 @@ async function handleImproveMode(
       // Fixer runs directly in the target worktree (no merge needed)
       const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash");
-      // DEBUG
-      try { appendFileSync("/tmp/improve-debug.log", `[round ${_i}] fixer exit=${r.exitCode} stdout=${r.stdout.substring(0, 200)}\n`); } catch {}
       // CRITICAL: commit fixer edits — otherwise merge loses them
       try {
         const st = gitQuiet(["status", "--porcelain"], workCwd);
-        appendFileSync("/tmp/improve-debug.log", `[round ${_i}] status="{st}"\n`);
         if (st.trim()) {
-          appendFileSync("/tmp/improve-debug.log", `[round ${_i}] committing...\n`);
           gitQuiet(["add", "-A"], workCwd);
           gitQuiet(["commit", "-m", `pi: fix round ${_i + 1} (${issuesCount} issue(s))`], workCwd);
         }
-      } catch (e) { appendFileSync("/tmp/improve-debug.log", `[round ${_i}] commit error: ${e}\n`); }
+      } catch (e) { /* best effort */ }
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },
@@ -893,40 +887,21 @@ export default function (pi: ExtensionAPI) {
 
       // ── IMPROVE mode ────────────────────────────────────────────────
       if (params.mode === "improve") {
-        // If no subagentId, spawn a temporary sub-agent to analyze first, then improve it
-        let targetId = params.subagentId || null;
-        let ownSpawn = false; // track whether we created the target ourselves
-        if (!targetId) {
-          const { id: preId, promise: prePromise } = spawnSubAgent(
-            `Analyze: ${params.task}. Read relevant files thoroughly. Note any issues found.`,
-            ctx.cwd,
-            { model: _cheapModel || _defaultModel, tools: ["read", "bash", "serena_search_pattern", "serena_find_symbol"] }
-          );
-          const preResult = await prePromise;
-          // Validate analyze step — abort if the agent failed
-          if (preResult.startsWith("[Sub-agent error") || preResult.startsWith("[Sub-agent spawn error") || preResult.startsWith("[Sub-agent timeout")) {
-            cleanupWorktree(projectRoot(ctx.cwd), preId, true);
-            subAgents.delete(preId);
-            return {
-              content: [{ type: "text", text: `❌ Analysis failed: ${preResult.substring(0, 300)}. Cannot proceed with improve mode.` }],
-              details: { mode: "improve_failed", reason: preResult.substring(0, 200) },
-              isError: true,
-            };
-          }
-          targetId = preId;
-          ownSpawn = true;
+        // If no subagentId, improve the current codebase directly (no worktree)
+        // This avoids cross-repo mismatch when extensions live in a different git repo
+        if (!params.subagentId) {
+          const result = await handleImproveMode(null, ctx.cwd, params.criteria, maxIt);
+          return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
-        const result = await handleImproveMode(targetId!, ctx.cwd, params.criteria, maxIt);
-        // Clean up: no subagentId should persist after completion
+
+        // If subagentId provided, improve the target sub-agent's worktree
+        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, maxIt);
         try {
-          const ag = subAgents.get(targetId!);
+          const ag = subAgents.get(params.subagentId);
           if (ag && ag.status !== "running") {
-            // Auto-merge if we own the target (else just clean up the review loop artifacts)
-            if (ownSpawn) {
-              try { git(["merge", "--no-edit", branchName(targetId!)], ctx.cwd); } catch { /* merge can fail, branch still cleaned below */ }
-            }
-            cleanupWorktree(projectRoot(ctx.cwd), targetId!, true);
-            subAgents.delete(targetId!);
+            try { git(["merge", "--no-edit", branchName(params.subagentId)], ctx.cwd); } catch { /* merge can fail */ }
+            cleanupWorktree(projectRoot(ctx.cwd), params.subagentId, true);
+            subAgents.delete(params.subagentId);
           }
         } catch { /* best effort cleanup */ }
         return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
