@@ -621,7 +621,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       host: Type.String({ description: "SSH host alias" }),
       command: Type.String({ description: "Command to execute on the remote server" }),
-      timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 120000 = 2 min)" })),
+      timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default: 120000 = 2 min). Accepts numeric ms or suffixed strings like '60s', '10m'" })),
       background: Type.Optional(Type.Boolean({ description: "Run in background via nohup on remote. Returns log path immediately (default: false)" })),
     }),
     async execute(_id, params, _signal) {
@@ -715,7 +715,7 @@ export default function (pi: ExtensionAPI) {
             details: { pid: result.trim(), logPath },
           };
         }
-        const result = await shellExec(conn, params.command, Math.min(params.timeout || 120_000, 600_000));
+        const result = await shellExec(conn, params.command, Math.min(effectiveTimeout, 600_000));
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (e: any) {
