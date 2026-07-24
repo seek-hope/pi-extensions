@@ -647,12 +647,23 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         // Block timeouts >300s — model must explicitly use background mode for long tasks
-        const effectiveTimeout = params.timeout || 120_000;
+        let effectiveTimeout: number | undefined = typeof params.timeout === "number" ? params.timeout : undefined;
+        // Handle string timeouts like "10000s" or "10m" that models sometimes pass
+        if (effectiveTimeout === undefined && typeof params.timeout === "string") {
+          const m = (params.timeout as string).match(/^(\d+(?:\.\d+)?)\s*(s|m|h|ms)?$/i);
+          if (m) {
+            const val = parseFloat(m[1]);
+            const unit = (m[2] || "ms").toLowerCase();
+            const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+            effectiveTimeout = Math.round(val * (multipliers[unit] || 1000));
+          }
+        }
+        if (effectiveTimeout === undefined) effectiveTimeout = 120_000;
         if (effectiveTimeout > 300_000 && !params.background) {
           return {
             content: [{
               type: "text",
-              text: `Timeout ${effectiveTimeout / 1000}s exceeds max synchronous limit (300s). Use one of:\n` +
+              text: `Timeout ${Math.round(effectiveTimeout / 1000)}s exceeds max synchronous limit (300s). Use one of:\n` +
                 `- Set background: true to run as nohup on remote\n` +
                 `- Or use a timeout <= 300000 (5 min) for synchronous execution`,
             }],
