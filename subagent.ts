@@ -195,7 +195,7 @@ async function reviewLoop(
     if (isClean) {
       if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `✅ improve: clean after ${i} rounds`);
       const summary = iterations.map(it =>
-        `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
+        `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
       return { iterations: i, clean: true, summary: `✅ CLEAN after ${i} rounds\n` + summary };
     }
@@ -210,24 +210,24 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} issue(s)`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
     // Detect fixer failure — empty output or spawn errors
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
+    }
+    // Check for cancellation BEFORE error-pattern check — a cancelled fixer's output
+    // may contain "[cancelled by user]" (from runSubProcess) or be wrapped as
+    // "[Sub-agent error]" (from runAction). We must detect cancellation first to
+    // avoid misreporting it as a fixer failure.
+    if (signal?.aborted || /\[cancelled by user\]/.test(fixerOutput)) {
+      return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
     }
     // Require the full bracketed pattern (including closing `]`) to avoid false positives
     // from legitimate output that happens to start with "[Sub-agent error...".
     if (/^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
-    // Check for cancellation — runSubProcess returns exitCode -3 and "[cancelled by user]"
-    // when the signal fires, but the output doesn't match the error pattern above.
-    // We must detect cancellation here to prevent an extra (partial) commit before
-    // the loop's signal?.aborted check fires on the next iteration.
-    if (signal?.aborted || /\[cancelled by user\]/.test(fixerOutput)) {
-      return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
-    }
-    if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
+    if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
   }
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
@@ -235,7 +235,7 @@ async function reviewLoop(
   if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
-    `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
+    `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
   ).join("\n");
   return { iterations: MAX_ROUNDS, clean: false, summary: `⚠ MAX ROUNDS (${MAX_ROUNDS})\n` + summary };
 }
@@ -319,10 +319,10 @@ async function handleImproveMode(
     }
   } else if (targetAgentId) {
     const safe = safeId(targetAgentId);
-    // Use hash-based fallback if safeId fails — ensures deterministic paths
-    // Use the same fallback logic as branchName() to reconstruct the worktree path
-        const dirComponent = safe || `fallback-${createHash("sha1").update(targetAgentId).digest("hex").substring(0, 12)}`;
-    const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", dirComponent);
+    if (!safe) {
+      return { iterations: 0, clean: false, summary: `Invalid sub-agent ID: "${targetAgentId.substring(0, 40)}"` };
+    }
+    const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", safe);
     if (existsSync(reconstructed)) {
       // Verify the branch still exists — worktree without branch is useless
       try { git(["rev-parse", "--verify", branchName(targetAgentId)], ctxCwd); }
@@ -362,7 +362,7 @@ async function handleImproveMode(
       // reviewLoop handles committing (via commitWorktree) after each fixer round when
       // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
       // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
-      const fixerTask = `Fix ${issuesCount} issue(s):\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
+      const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
       const r = await runSubProcess(fixerTask, workCwd, _cheapModel || _defaultModel, "read,edit,write,bash", undefined, signal);
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       // If the sub-process failed to spawn, prefix output so reviewLoop's error regex catches it
@@ -635,7 +635,8 @@ function getDiff(projectRoot: string, id: string): string {
  *  Returns the short commit hash on success, or empty string on failure.
  *  Callers should check for empty hash to detect failure. */
 function commitWorktree(worktreePath: string, id: string, task: string): string {
-  const msg = id ? `pi: ${id} — ${task.substring(0, 80)}` : `pi: ${task.substring(0, 80)}`;
+  const truncated = [...task].slice(0, 80).join('');
+  const msg = id ? `pi: ${id} — ${truncated}` : `pi: ${truncated}`;
 
   if (!worktreePath || !existsSync(join(worktreePath, ".git"))) return "";
 
@@ -1246,7 +1247,8 @@ export default function (pi: ExtensionAPI) {
       if (params.mode === "analyze") {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
         const tb = (globalThis as any).__pi_todo;
-        const todoMatchKey = `analyze:${params.task.substring(0, 50)}`;
+        const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
+        const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey);
         if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
@@ -1259,7 +1261,8 @@ export default function (pi: ExtensionAPI) {
         // Add a todo item so progress is visible in the todo flow widget
         const tb = (globalThis as any).__pi_todo;
         // Use a unique match key incorporating the task text to avoid substring collisions
-        const todoMatchKey = `improve:${params.task.substring(0, 50)}`;
+        const taskHash = createHash("sha1").update(params.task).digest("hex").substring(0, 8);
+        const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
 
         // If no subagentId, improve the current codebase directly (no worktree)
