@@ -38,16 +38,6 @@ const subAgents = new Map<string, SubAgent>();
 /** Eviction age: terminal-state agents older than this are auto-removed from the map */
 const EVICTION_AGE_MS = 10 * 60 * 1000; // 10 minutes
 
-/** Cross-version AbortError factory (DOMException is global only in Node ≥ 17) */
-function createAbortError(): Error {
-  if (typeof DOMException !== "undefined") {
-    return new DOMException("Aborted", "AbortError");
-  }
-  const err = new Error("Aborted");
-  err.name = "AbortError";
-  return err;
-}
-
 /** Remove stale terminal-state agents from the map to prevent unbounded growth */
 function evictTerminalAgents(): void {
   const now = Date.now();
@@ -162,7 +152,7 @@ async function reviewLoop(
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
     // Update todo progress if bridge available
     const tb = (globalThis as any).__pi_todo;
-    if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
 
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
@@ -203,7 +193,7 @@ async function reviewLoop(
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
 
     if (isClean) {
-      if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "completed", `✅ improve: clean after ${i} rounds`);
+      if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `✅ improve: clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -220,7 +210,7 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} issue(s)`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} issue(s)`);
     // Detect fixer failure — empty output or spawn errors
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
@@ -242,7 +232,7 @@ async function reviewLoop(
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
   const tb = (globalThis as any).__pi_todo;
-  if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "completed", `⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
+  if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
@@ -255,7 +245,7 @@ async function reviewLoop(
 /**
  * ANALYZE: read-only exploration → review → improve → loop → final report.
  */
-async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSignal): Promise<LoopResult> {
+async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSignal, todoMatchKey?: string): Promise<LoopResult> {
   // Phase 1: initial exploration with cheap model (use sub-process, not worktree)
   const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
   const initR = await runSubProcess(initTask, ctxCwd, _cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
@@ -298,7 +288,8 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       return improved;
     },
     "",
-    signal
+    signal,
+    todoMatchKey
   );
   return result;
 }
@@ -330,7 +321,7 @@ async function handleImproveMode(
     const safe = safeId(targetAgentId);
     // Use hash-based fallback if safeId fails — ensures deterministic paths
     // Use the same fallback logic as branchName() to reconstruct the worktree path
-    const dirComponent = safe || `fallback-${createHash("sha1").update(targetAgentId).digest("hex").substring(0, 12)}`;
+    const dirComponent = safe || `fallback-${createHash("sha1").update(targetAgentId).digest("hex").substring(0, 8)}`;
     const reconstructed = join(projectRoot(ctxCwd), ".pi", "subagent", dirComponent);
     if (existsSync(reconstructed)) {
       // Verify the branch still exists — worktree without branch is useless
@@ -380,7 +371,7 @@ async function handleImproveMode(
       }
       return output;
     },
-    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "improve",
+    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
     signal,
     todoMatchKey
   );
@@ -391,7 +382,7 @@ async function handleImproveMode(
  * This is extracted as a separate function to avoid fragile labeled continues across try/catch boundaries.
  */
 function autoMergeBranch(
-  root: string, ctxCwd: string, execId: string, description: string
+  ctxCwd: string, execId: string, description: string
 ): { retainForManualReview: boolean } {
   const branch = branchName(execId);
   try { git(["rev-parse", "--verify", branch], ctxCwd); }
@@ -480,7 +471,7 @@ async function handleExecuteMode(
           if (!ir.clean) allClean = false;
           // Only auto-merge clean improvements — failed loops leave the branch for manual review
           if (ir.clean) {
-            const mergeResult = autoMergeBranch(root, ctxCwd, execId, item.description);
+            const mergeResult = autoMergeBranch(ctxCwd, execId, item.description);
             if (!mergeResult.retainForManualReview) {
               cleanupWorktree(root, execId, true);
               subAgents.delete(execId);
@@ -1104,14 +1095,17 @@ export default function (pi: ExtensionAPI) {
           try { ag.proc?.kill("SIGKILL"); } catch { /* already dead */ }
           // Wait for process to fully exit before cleaning up worktree to avoid
           // file handle races (e.g., rmSync on locked files after SIGKILL).
+          // Attach the close listener BEFORE checking if the pid is alive to avoid
+          // a TOCTOU race where the process exits between the check and the listener.
           if (ag.proc) {
             const { pid } = ag.proc;
             if (pid !== undefined) {
-              try { process.kill(pid, 0); /* check if alive */
-                await new Promise<void>((resolveWait) => {
-                  const timeout = setTimeout(() => resolveWait(), 3000);
-                  ag.proc!.on("close", () => { clearTimeout(timeout); resolveWait(); });
-                });
+              const closePromise = new Promise<void>((resolveWait) => {
+                const timeout = setTimeout(() => resolveWait(), 3000);
+                ag.proc!.on("close", () => { clearTimeout(timeout); resolveWait(); });
+              });
+              try { process.kill(pid, 0); /* check if alive — wait for close */
+                await closePromise;
               } catch { /* already dead */ }
             }
           }
@@ -1187,7 +1181,11 @@ export default function (pi: ExtensionAPI) {
       // ── ANALYZE mode ────────────────────────────────────────────────
       if (params.mode === "analyze") {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
-        const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal);
+        const tb = (globalThis as any).__pi_todo;
+        const todoMatchKey = `analyze:${params.task.substring(0, 50)}`;
+        if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
+        const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey);
+        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
       }
 
@@ -1217,7 +1215,7 @@ export default function (pi: ExtensionAPI) {
             const ag = subAgents.get(params.subagentId);
             if (ag && ag.status !== "running") {
               const { retainForManualReview } = autoMergeBranch(
-                projectRoot(ctx.cwd), ctx.cwd, params.subagentId,
+                ctx.cwd, params.subagentId,
                 ag?.task || "delegated task"
               );
               if (!retainForManualReview) {
@@ -1711,15 +1709,18 @@ export default function (pi: ExtensionAPI) {
       if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
       // Wait for process to fully exit before cleaning up worktree to avoid
       // file handle races (e.g., rmSync on locked files after SIGKILL).
+      // Attach the close listener BEFORE checking if the pid is alive to avoid
+      // a TOCTOU race where the process exits between the check and the listener.
       const { proc } = ag;
       if (proc) {
         const { pid } = proc;
         if (pid !== undefined) {
-          try { process.kill(pid, 0); /* check if alive */
-            await new Promise<void>((resolveWait) => {
-              const timeout = setTimeout(() => resolveWait(), 3000);
-              proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
-            });
+          const closePromise = new Promise<void>((resolveWait) => {
+            const timeout = setTimeout(() => resolveWait(), 3000);
+            proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
+          });
+          try { process.kill(pid, 0); /* check if alive — wait for close */
+            await closePromise;
           } catch { /* already dead */ }
         }
       }
@@ -1752,7 +1753,12 @@ export default function (pi: ExtensionAPI) {
     // Only remove worktrees that still have a sentinel file — these are agents that
     // were interrupted (crashed/killed) before reaching a terminal state.
     // Completed-but-unmerged agents do NOT have sentinel files and are preserved.
-    const root = process.env.PI_SUBAGENT_ROOT || resolveGitRoot(process.cwd());
+    const root = process.env.PI_SUBAGENT_ROOT;
+    if (!root) {
+      // At session start, process.cwd() may not be the project directory.
+      // Without PI_SUBAGENT_ROOT we can't safely determine where worktrees live.
+      return;
+    }
     const subDir = join(root, ".pi", "subagent");
     if (existsSync(subDir)) {
       try {
@@ -1764,6 +1770,15 @@ export default function (pi: ExtensionAPI) {
           const sentinel = join(subDir, `.${entry}.sentinel`);
           // Only clean up if sentinel file still exists (agent was interrupted)
           if (!existsSync(sentinel)) continue;
+          // Read PID from sentinel to avoid nuking worktrees of a still-running pi session.
+          // If the PID is still alive, this sentinel belongs to a live process — skip it.
+          try {
+            const pidStr = readFileSync(sentinel, "utf-8").trim();
+            const pid = parseInt(pidStr, 10);
+            if (!isNaN(pid)) {
+              try { process.kill(pid, 0); continue; } catch { /* dead, proceed with cleanup */ }
+            }
+          } catch { /* can't read sentinel, treat as stale and clean up */ }
           const branch = `pi/subagent/${entry}`;
           try {
             // Remove sentinel first to prevent re-processing
