@@ -112,7 +112,7 @@ async function reviewLoop(
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
-    const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash");
+    const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash,serena_search_pattern,serena_overview");
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
 
     // Abort if reviewer crashed or produced no output
@@ -554,7 +554,7 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   // Sub-processes (reviewers, fixers) should use a shorter timeout — 30s floor, 2min default, 20min ceiling
-  const killTimeout = Math.max(Math.min(timeoutMs || 120_000, 1_200_000), 30_000);
+  const killTimeout = Math.max(Math.min(600_000, 1_800_000), 60_000); // 10 min floor, 30 min ceiling
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
