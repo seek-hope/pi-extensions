@@ -548,6 +548,7 @@ function runSubProcess(task: string, cwd: string, model?: string, timeoutMs?: nu
     const args: string[] = ["-p"];
     if (model) args.push("--model", model);
     args.push("\n" + task);
+    try { require("fs").appendFileSync("/tmp/pi-spawn-args.log", JSON.stringify(args) + "\n"); } catch {}
     const proc = spawn("pi", args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -698,6 +699,7 @@ function spawnSubAgent(
     if (options?.systemPrompt) args.push("--system-prompt", options.systemPrompt);
     // Prefix with "\n" to prevent task text from being parsed as a CLI option
     args.push("\n" + task);
+    try { require("fs").appendFileSync("/tmp/pi-spawn-args.log", JSON.stringify(args) + "\n"); } catch {}
 
     const proc = spawn("pi", args, {
       cwd: worktreePath,

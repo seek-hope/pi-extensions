@@ -33,6 +33,18 @@ let _pi: ExtensionAPI | null = null;
 let todo: TodoList = { items: [], updatedAt: 0 };
 let detailWidgetActive = false;
 
+/** Narrow a string to a valid TodoStatus after user input or session restore. */
+function isValidTodoStatus(s: string): s is TodoStatus {
+  return s === "pending" || s === "in_progress" || s === "completed" || s === "cancelled";
+}
+
+/** Coerce an unknown status string to a valid TodoStatus, defaulting to pending. */
+function normalizeStatus(raw: string | undefined): TodoStatus {
+  if (!raw) return "pending";
+  const s = String(raw).trim().toLowerCase();
+  return isValidTodoStatus(s) ? s : "pending";
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 /**
@@ -74,7 +86,13 @@ function restoreFromBranch(ctx?: any): void {
         // Array.isArray catches both populated and empty lists so that a
         // todo_write that cleared everything is honoured on restore.
         if (Array.isArray(details?.items)) {
-          todo = { items: details.items, updatedAt: Date.now() };
+          // Normalize restored items so stale/corrupted status values don't
+          // break widget rendering (STATUS_ICONS lookup).
+          const safe = details.items.map(i => ({
+            content: String(i.content ?? ""),
+            status: normalizeStatus(i.status),
+          }));
+          todo = { items: safe, updatedAt: Date.now() };
           break;
         }
       }
@@ -157,10 +175,6 @@ export default function (pi: ExtensionAPI) {
       }), { description: "The complete todo list. Replaces all previous items." }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      // Type guard — narrows string to TodoStatus after validation
-      function isValidTodoStatus(s: string): s is TodoStatus {
-        return s === "pending" || s === "in_progress" || s === "completed" || s === "cancelled";
-      }
 
       const warnings: string[] = [];
 
@@ -312,10 +326,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── session_shutdown: clear widgets and release references ───────────
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     try {
       _pi?.ui?.setWidget?.("todo", undefined);
       _pi?.ui?.setWidget?.("todo-detail", undefined);
+      ctx?.ui?.setWidget?.("todo", undefined);
+      ctx?.ui?.setWidget?.("todo-detail", undefined);
     } catch { /* ignore — ui may already be torn down */ }
     detailWidgetActive = false;
     todo = { items: [], updatedAt: 0 };
