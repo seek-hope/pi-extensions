@@ -687,8 +687,8 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
       }
     } catch { /* best effort undo */ }
     // Reset the index to HEAD to prevent dirty staging area from leaking into the next
-    // iteration. If `git add -A` succeeded but `git commit` failed, the index holds staged
-    // changes. Without a reset, the next call's `git add -A` re-stages everything (no-op
+    // iteration. If `git add -u` succeeded but `git commit` failed, the index holds staged
+    // changes. Without a reset, the next call's `git add -u` re-stages everything (no-op
     // for already-staged files), and a successful commit would bundle changes from *both*
     // iterations under a single message, losing the per-iteration audit trail.
     try { git(["reset", "HEAD"], worktreePath); } catch { /* best effort */ }
@@ -1083,7 +1083,11 @@ function spawnSubAgent(
       // This prevents a TOCTOU race where the cancelled status is overwritten by a
       // simultaneous success exit.
       if (agent.status === "cancelled") {
-        cleanupWorktree(root, id, true);
+        // Preserve the branch if the sub-agent exited successfully (code === 0). The
+        // session_shutdown handler may have set status to "cancelled" before this close
+        // event fired — without this guard, a successful commit would be nuked by the
+        // branch deletion, losing the sub-agent's work.
+        cleanupWorktree(root, id, code !== 0);
         settle("[Sub-agent cancelled]", "cancelled");
         return;
       }
@@ -1874,7 +1878,22 @@ export default function (pi: ExtensionAPI) {
             const pidStr = readFileSync(sentinel, "utf-8").trim();
             const pid = parseInt(pidStr, 10);
             if (!isNaN(pid)) {
-              try { process.kill(pid, 0); continue; } catch { /* dead, proceed with cleanup */ }
+              try {
+                process.kill(pid, 0);
+                // PID is alive — verify it's actually a pi agent process, not a recycled PID
+                // that happened to be reused by an unrelated process (PID-reuse TOCTOU).
+                try {
+                  const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
+                  if (!cmdline.includes("pi")) {
+                    // Not a pi process — sentinel is stale, proceed with cleanup
+                    throw new Error("not pi");
+                  }
+                } catch {
+                  // Can't read /proc/<pid>/cmdline (e.g., not on Linux, permissions error).
+                  // Fall through and trust the kill check — the race window is small.
+                }
+                continue;
+              } catch { /* dead, proceed with cleanup */ }
             }
           } catch { /* can't read sentinel, treat as stale and clean up */ }
           const branch = `pi/subagent/${entry}`;
