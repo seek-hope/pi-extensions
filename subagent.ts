@@ -148,7 +148,6 @@ interface LoopResult {
  * The reviewer runs as a sub-process (no worktree) for speed and to avoid stale-state issues.
  */
 async function reviewLoop(
-  ctxCwd: string,
   workCwd: string,
   buildReviewTask: (i: number) => string,
   runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
@@ -168,7 +167,11 @@ async function reviewLoop(
     const tb = getTodoBridge();
     if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
 
-    evictTerminalAgents(); // periodic cleanup of stale agent records
+    // Throttle evictTerminalAgents to avoid filesystem I/O on every loop iteration
+    if (Date.now() - _lastEvictTime >= EVICT_THROTTLE_MS) {
+      evictTerminalAgents();
+      _lastEvictTime = Date.now();
+    }
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
     let r;
@@ -299,7 +302,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
 
   // Phase 2: review loop — improve analysis quality iteratively
   const result = await reviewLoop(
-    ctxCwd, ctxCwd,
+    ctxCwd,
     (_i) => [
       `Review this analysis. Identify gaps, inaccuracies, or missing details.`,
       `--- ANALYSIS ---`, analysis.substring(0, 24000), `--- END ---`,
@@ -405,10 +408,10 @@ async function handleImproveMode(
     existing.status = "improving";
   }
 
-  let _loopResult: LoopResult = { iterations: 0, clean: false, summary: "" };
+  let _loopResult: LoopResult = { iterations: 0, clean: false, summary: "Unexpected error in review loop" };
   try {
     _loopResult = await reviewLoop(
-      ctxCwd, workCwd,
+      workCwd,
       (_i) => {
       const parts = [`Review criteria: ${reviewCriteria}`];
       if (task) {
@@ -431,7 +434,7 @@ async function handleImproveMode(
         // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
         // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
         const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-        const r = await runSubProcess(fixerTask, workCwd, _defaultModel, "read,edit,write,bash", undefined, signal);
+        const r = await runSubProcess(fixerTask, workCwd, _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, signal);
         const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
         // Check if the fixer was cancelled/aborted mid-execution before trusting its output
         if (signal?.aborted || r.exitCode === -3) {
@@ -971,11 +974,14 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       }
     };
     const closeHandler = (code: number | null) => {
-      // When timeout fired AND the process was killed by signal (null), keep the -1 sentinel.
-      // If the process exited naturally (non-null) concurrent with the timer, trust the real exit code.
-      if (!timedOut || code === null) {
+      // Trust the real exit code whenever we have one, regardless of timeout timeline.
+      // When the timeout fires and kills the process, code will be null (SIGTERM/SIGKILL)
+      // and exitCode stays -1 (set by the timeout handler), which is the correct sentinel.
+      // When the process exits naturally (non-null) concurrent with the timer, trust the real exit code.
+      if (code !== null) {
         exitCode = code;
       }
+      // else: timedOut && code===null → keep exitCode=-1 (set by timeout handler)
       done();
     };
     const errorHandler = (err: Error) => {
@@ -1312,6 +1318,14 @@ function spawnSubAgent(
       };
       extSignal.addEventListener("abort", abortHandler, { once: true });
     }
+    // Early abort check after attaching listener to prevent signal firing between check and listener
+    if (extSignal?.aborted) {
+      if (!settled && agent.status === "running" && proc.exitCode === null) {
+        agent.status = "cancelled";
+        try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+        // closeHandler checks agent.status === "cancelled" and calls settle()
+      }
+    }
 
     killTimer = setTimeout(() => {
       if (agent.status === "running" && !settled) {
@@ -1362,7 +1376,7 @@ export default function (pi: ExtensionAPI) {
         }
         case "list": {
           if (subAgents.size === 0) { ctx.ui.notify("No sub-agents running.", "info"); return; }
-          const lines = ["Running sub-agents:"];
+          const lines = ["Sub-agents:"];
           for (const [id, a] of subAgents) {
             lines.push(`  ${id}: [${a.status}] ${a.task.substring(0, 50)}`);
           }
@@ -1978,7 +1992,7 @@ export default function (pi: ExtensionAPI) {
       if (subAgents.size === 0) {
         return { content: [{ type: "text", text: "No sub-agents running." }], details: {} };
       }
-      const lines = ["Running sub-agents:"];
+      const lines = ["Sub-agents:"];
       for (const [id, a] of subAgents) {
         lines.push(`  ${id}: [${a.status}] branch=${a.branch} task="${a.task.substring(0, 50)}"`);
       }
