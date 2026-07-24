@@ -613,7 +613,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Run a command on a remote server through a persistent SSH connection.",
     promptGuidelines: [
       "MANDATORY: When the user asks to run commands on a remote server, you MUST use ssh_exec instead of bash.",
-      "MANDATORY: Commands with timeout >300s are automatically run in background (nohup). Set timeout <=300000 to run synchronously.",
+      "MANDATORY: Commands with timeout >300s are blocked — you MUST set background:true or use a timeout <=300000.",
       "After background ssh_exec, use another ssh_exec to check progress: 'cat /tmp/task.log' or 'ps aux | grep PID'.",
       "Call ssh_status before running ssh_exec to verify the target host is connected.",
       "If no connection exists, tell the user: /ssh <host>",
@@ -646,8 +646,21 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
-        const isLong = (params.timeout || 120_000) > 300_000;
-        const isBg = params.background === true || isLong;
+        // Block timeouts >300s — model must explicitly use background mode for long tasks
+        const effectiveTimeout = params.timeout || 120_000;
+        if (effectiveTimeout > 300_000 && !params.background) {
+          return {
+            content: [{
+              type: "text",
+              text: `Timeout ${effectiveTimeout / 1000}s exceeds max synchronous limit (300s). Use one of:\n` +
+                `- Set background: true to run as nohup on remote\n` +
+                `- Or use a timeout <= 300000 (5 min) for synchronous execution`,
+            }],
+            details: { blocked: true },
+          };
+        }
+
+        const isBg = params.background === true;
 
         if (isBg) {
           // Deduplicate: if same command already running on this host, return existing

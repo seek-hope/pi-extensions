@@ -73,7 +73,7 @@ try {
     _cheapModel = cfg.cheapModel;
   } else if (_defaultModel) {
     const derived = _defaultModel.replace(/pro/i, "flash");
-    _cheapModel = derived !== _defaultModel ? derived : undefined;
+    _cheapModel = derived !== _defaultModel ? derived : _defaultModel; // fallback to default if no cheaper variant
   }
 } catch (e: any) { /* settings file may not exist yet */ }
 
@@ -678,7 +678,7 @@ function spawnSubAgent(
 
   const promise = new Promise<string>((resolve) => {
     const args: string[] = ["-p"];
-    if (options?.model) args.push("--model", options.model);
+    
     if (options?.tools) {
       const toolsArg = Array.isArray(options.tools) ? options.tools.join(",") : options.tools;
       args.push("--tools", toolsArg);
