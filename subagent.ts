@@ -1899,18 +1899,23 @@ export default function (pi: ExtensionAPI) {
                 // --- Linux: /proc/<pid>/cmdline ---
                 try {
                   const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
-                  isPiProcess = cmdline.includes("pi");
+                  // Match pi agent process signatures to avoid false positives from
+                  // unrelated processes whose names contain "pi" (pipewire, spice-vdagent, etc.).
+                  // The pi agent's cmdline always contains either dist/cli.js (entry point)
+                  // or path components like /pi/ or pi-agent-core/pi-coding-agent.
+                  isPiProcess = /dist\/cli\.js\b/.test(cmdline) || /(?:^|\/)pi(?=[\/\0\s-]|$)/.test(cmdline);
                   procVerifiable = true;
                 } catch {
                   // Not on Linux, or permission denied — try next method
                 }
 
-                // --- macOS / BSD: ps -p <pid> -o comm= ---
+                // --- macOS / BSD: ps -p <pid> -o command= (full command line) ---
                 if (!procVerifiable) {
                   try {
-                    const psOut = spawnSync("ps", ["-p", String(pid), "-o", "comm="], { timeout: 3000, encoding: "utf-8" });
+                    const psOut = spawnSync("ps", ["-p", String(pid), "-o", "command="], { timeout: 3000, encoding: "utf-8" });
                     if (psOut.status === 0) {
-                      isPiProcess = psOut.stdout.trim().toLowerCase().includes("pi");
+                      const psCmdline = psOut.stdout.trim();
+                      isPiProcess = /dist\/cli\.js\b/.test(psCmdline) || /(?:^|\/)pi(?=[\/\0\s-]|$)/.test(psCmdline);
                       procVerifiable = true;
                     }
                   } catch {
