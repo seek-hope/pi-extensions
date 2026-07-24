@@ -554,10 +554,25 @@ export default function (pi: ExtensionAPI) {
     _pi = _pi ?? pi;
     restoreFromBranch(ctx);
     clearDetailWidget(ctx);
+
+    // Auto-clean: remove completed/cancelled items after each interaction
+    const doneBefore = todo.items.filter(i => i.status === "completed" || i.status === "cancelled");
+    if (doneBefore.length > 0) {
+      // Show notification with just-completed items
+      const doneList = doneBefore.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
+      const ui = ctx?.ui ?? _pi?.ui;
+      if (ui) {
+        ui.notify(`✅ ${doneBefore.length} task(s) done:\n${doneList}`, "info");
+      }
+      // Remove them from the active list
+      todo.items = todo.items.filter(i => i.status !== "completed" && i.status !== "cancelled");
+      todo.updatedAt = Date.now();
+    }
+
     renderWidget(ctx);
   });
 
-  // ── session_shutdown: clear widgets and release references ───────────
+  // ── session_shutdown: clear widgets, keep state for restore ─────────
   pi.on("session_shutdown", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     try {
@@ -565,12 +580,8 @@ export default function (pi: ExtensionAPI) {
       _pi?.ui?.setWidget?.("todo-detail", undefined);
       ctx?.ui?.setWidget?.("todo", undefined);
       ctx?.ui?.setWidget?.("todo-detail", undefined);
-    } catch { /* ignore — ui may already be torn down */ }
+    } catch { /* ignore */ }
     detailWidgetActive = false;
-    todo = { items: [], updatedAt: 0 };
-    // Release the ExtensionAPI ref so the GC can collect it between sessions.
-    // session_start / session_tree will restore it from the module-scoped `pi`
-    // captured in the event-handler closures.
     _pi = null;
   });
 }

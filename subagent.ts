@@ -162,7 +162,6 @@ async function reviewLoop(
     // Reviewer runs directly (no worktree) — it only reads and reports
     const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
-    console.error(`[improve] Round ${i}: reviewer done (exit ${r.exitCode}, ${reviewerOutput.length} chars)`);
 
     // Abort if reviewer was killed by signal — output may be partial/garbled
     if (r.exitCode === null) {
@@ -195,10 +194,8 @@ async function reviewLoop(
     const actualIssuesCountForIter = isClean ? 0 : actualIssuesCount;
 
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
-    console.error(`[improve] Round ${i}: ${isClean ? "CLEAN" : `${actualIssuesCount} issue(s) → fixing`}`);
 
     if (isClean) {
-      console.error(`[improve] ✅ CLEAN after ${i} rounds`);
       if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "completed", `✅ improve: clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
