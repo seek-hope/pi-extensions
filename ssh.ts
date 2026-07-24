@@ -486,7 +486,8 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
     const r = spawnSync("which", [t], { stdio: "ignore" });
     return r.status === 0;
   }) || "xterm";
-  const termProc = spawn(termEmu, (termEmu === "gnome-terminal" ? ["--", "bash", "-c"] : ["-e", "bash", "-c"]),
+  const termProc = spawn(termEmu, [
+    ...(termEmu === "gnome-terminal" ? ["--", "bash", "-c"] : ["-e", "bash", "-c"]),
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=12h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
