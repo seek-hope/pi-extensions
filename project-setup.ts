@@ -9,8 +9,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -47,11 +47,37 @@ const checks: Check[] = [
     init: (cwd) => {
       const r1 = sh("git init", cwd);
       if (!r1.ok) return r1;
+      // Safety: create a .gitignore if one doesn't exist to prevent accidentally
+      // committing secrets (.env, credentials, keys) into version control.
+      if (!existsSync(join(cwd, ".gitignore"))) {
+        // Use writeFileSync directly — avoids an unnecessary shell process and eliminates
+        // the risk of heredoc mangling from unexpected shell quirks.
+        writeFileSync(join(cwd, ".gitignore"), [
+          ".env",
+          ".env.*",
+          "*.pem",
+          "*.key",
+          "credentials.*",
+          "*.log",
+          ".DS_Store",
+          "node_modules/",
+          "__pycache__/",
+          "*.pyc",
+          "dist/",
+          "build/",
+          ".vagrant/",
+          ".idea/",
+          "*.swp",
+          "*.swo",
+          "*~",
+        ].join("\n") + "\n");
+      }
       const r2 = sh("git add -A", cwd);
       const r3 = sh(
         'git commit -m "pi: initial snapshot (auto-created for project management)" --allow-empty',
         cwd
       );
+      if (!r2.ok || !r3.ok) return { ok: false, out: `git init done.\n${r2.out}\n${r3.out}` };
       return { ok: true, out: `git init done.\n${r2.out}\n${r3.out}` };
     },
     description: "Version control",
@@ -77,7 +103,7 @@ const checks: Check[] = [
     name: "Serena",
     icon: "🔍",
     exists: (cwd) => existsSync(join(cwd, ".serena")),
-    init: (cwd) => sh("serena project create --index", cwd),
+    init: (cwd) => sh("serena-agent project create --index", cwd),
     description: "Semantic code tools",
     skipInHome: true,
   },
@@ -98,7 +124,7 @@ export default function (pi: ExtensionAPI) {
 
     for (const check of checks) {
       if (!check.exists(cwd)) {
-        if (check.skipInHome && cwd === process.env.HOME) continue;
+        if (check.skipInHome && resolve(cwd) === resolve(process.env.HOME || "")) continue;
         missing.push(check);
       }
     }
@@ -141,7 +167,7 @@ export default function (pi: ExtensionAPI) {
       let allOk = true;
 
       for (const check of checks) {
-        if (check.skipInHome && ctx.cwd === process.env.HOME) {
+        if (check.skipInHome && resolve(ctx.cwd) === resolve(process.env.HOME || "")) {
           lines.push(`${check.icon} ${check.name}: ⏭ skipped (home directory)`);
           continue;
         }

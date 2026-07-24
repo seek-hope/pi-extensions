@@ -41,7 +41,11 @@ export default function (pi: ExtensionAPI) {
         });
 
         if (!res.ok) {
-          const err = await res.text();
+          let err = await res.text();
+          // Redact the API key if the server echoes it back in the error response
+          if (apiKey) {
+            err = err.replaceAll(apiKey, "[REDACTED]");
+          }
           return {
             content: [{ type: "text", text: `Context7 API error (${res.status}): ${err}` }],
             details: {},
@@ -55,7 +59,14 @@ export default function (pi: ExtensionAPI) {
 
         return { content: [{ type: "text", text }], details: {} };
       } catch (e: any) {
-        return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
+        const msg = (e.message || String(e));
+        // Redact the API key if it appears in a network error message (e.g., proxy, DNS)
+        const apiKey = process.env.CONTEXT7_API_KEY;
+        return {
+          content: [{ type: "text", text: apiKey ? msg.replaceAll(apiKey, "[REDACTED]") : msg }],
+          details: {},
+          isError: true,
+        };
       }
     },
   });

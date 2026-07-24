@@ -32,19 +32,18 @@ pi
 
 ### Multi-Agent System
 
-`subagent.ts` — 13 tools. Git-worktree isolation, recursive up to depth 5.
+`subagent.ts` — 9 tools. Git-worktree isolation, recursive up to depth 5.
 
 | Tool | Purpose |
 |------|---------|
-| `subagent_spawn` | Spawn isolated sub-agent in git worktree |
+| `subagent_spawn` | Spawn isolated sub-agent in git worktree (analyze/improve/execute modes) |
 | `subagent_wait` | Collect result when done |
 | `subagent_review` | Inspect git diff before merging |
-| `subagent_refine` | Review → fix → re-review loop until clean |
 | `subagent_merge` / `subagent_reject` | Accept or discard changes |
 | `subagent_parallel` | Fan-out N agents simultaneously |
-| `subagent_chain` | Sequential pipeline with context passing |
-| `subagent_explore` | Read-only code exploration (v4-flash, cheap) |
-| `subagent_plan` | Design plan without modifying code |
+| `subagent_list` | List running sub-agents and worktrees |
+| `subagent_cancel` | Cancel a running sub-agent and clean up |
+| `subagent_ensure_git` | Initialize git repo if one doesn't exist |
 
 ### SSH & Remote
 
@@ -107,7 +106,7 @@ pi session
   │
   ├─ AI Tools (77 across all extensions)
   │   ├─ Code Intelligence:   codegraph_*, serena_*, lsp_*
-  │   ├─ Sub-agents:          subagent_spawn/parallel/chain/explore/plan/review/merge/reject/refine
+  │   ├─ Sub-agents:          subagent_spawn/parallel/review/merge/reject/list/cancel/ensure_git
   │   ├─ SSH & SCP:           ssh_exec, ssh_status, scp_to_remote, scp_from_remote
   │   ├─ Computer Use:        computer_screenshot/move/click/type/key/scroll/drag
   │   ├─ Search:              context7_search, anysearch_web
@@ -180,7 +179,7 @@ Loads automatically every session. Contains:
   ├── serena.ts              Semantic code tools (MCP)
   ├── codegraph.ts           Call graphs & impact analysis
   ├── graphify.ts            Knowledge graph
-  ├── subagent.ts            Git-worktree multi-agent system (13 tools)
+  ├── subagent.ts            Git-worktree multi-agent system (9 tools)
   ├── ssh.ts                 Persistent SSH + SCP (5 tools)
   ├── computer-use.ts        Desktop automation for Wayland (11 tools)
   ├── github.ts              GitHub issues/PRs/search

@@ -190,7 +190,7 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       items: Type.Array(Type.Object({
-        content: Type.String({ description: "Task description (short and action-oriented)" }),
+        content: Type.String({ description: "Task description (short and action-oriented)", minLength: 1 }),
         status: Type.Optional(Type.String({ description: "Status: pending (default), in_progress, completed, cancelled" })),
       }), { description: "The complete todo list. Replaces all previous items." }),
     }),

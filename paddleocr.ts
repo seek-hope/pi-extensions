@@ -38,14 +38,19 @@ export default function (pi: ExtensionAPI) {
           jobResp = await fetch(JOB_URL, {
             method: "POST",
             headers: { "Authorization": `bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ fileUrl: filePath, model: MODEL, optionalPayload: {} }),
+            body: JSON.stringify({ fileUrl: filePath, model: MODEL, language: params.language, optionalPayload: {} }),
             signal: _signal,
           });
         } else {
           const fileData = readFileSync(filePath);
+          // Blob and FormData are globals in Node.js >= 18; guard for older runtimes
+          if (typeof Blob === "undefined" || typeof FormData === "undefined") {
+            return { content: [{ type: "text", text: "Blob/FormData not available. Node.js >= 18 is required for file uploads. Use a URL instead." }], details: {}, isError: true };
+          }
           const form = new FormData();
           form.append("file", new Blob([fileData]), filePath.split("/").pop() || "image.png");
           form.append("model", MODEL);
+          form.append("language", params.language || "en");
           form.append("optionalPayload", JSON.stringify({}));
           jobResp = await fetch(JOB_URL, {
             method: "POST",
@@ -66,6 +71,9 @@ export default function (pi: ExtensionAPI) {
         let state = "", resultUrl = "";
         for (let i = 0; i < 60; i++) {
           await new Promise((r) => setTimeout(r, 3000));
+          if (_signal?.aborted) {
+            return { content: [{ type: "text", text: "OCR cancelled by abort signal." }], details: {}, isError: true };
+          }
           const pollResp = await fetch(`${JOB_URL}/${jobId}`, { headers: { "Authorization": `bearer ${token}` }, signal: _signal });
           if (pollResp.status !== 200) continue;
           const pollData: any = await pollResp.json();

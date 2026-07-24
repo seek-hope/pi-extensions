@@ -17,8 +17,10 @@ import { Type } from "typebox";
 import { execFileSync, spawnSync } from "node:child_process";
 
 
+let uid: number;
+try { uid = process.getuid(); } catch { uid = 0; }
 const YDOTOOL_SOCKET = process.env.YDOTOOL_SOCKET
-  || (process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/.ydotool_socket` : "/run/user/1000/.ydotool_socket");
+  || (process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/.ydotool_socket` : `/run/user/${uid}/.ydotool_socket`);
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -29,8 +31,39 @@ function sh(cmd: string, timeout = 5_000): string {
   return r.stdout.trim();
 }
 
+/** Cache for passwordless sudo availability */
+let sudoAvailable: boolean | null = null;
+function ensureSudo(): void {
+  if (sudoAvailable === true) return;
+  if (sudoAvailable === false) {
+    throw new Error(
+      "Passwordless sudo is not configured. ydotool requires root privileges for mouse/keyboard operations. " +
+      "Run: echo 'ALL ALL=(ALL) NOPASSWD: /usr/bin/ydotool' | sudo tee /etc/sudoers.d/ydotool"
+    );
+  }
+  const r = spawnSync("sudo", ["-n", "true"], { encoding: "utf-8", timeout: 5_000 });
+  sudoAvailable = r.status === 0;
+  if (!sudoAvailable) {
+    throw new Error(
+      "Passwordless sudo is not configured. ydotool requires root privileges for mouse/keyboard operations. " +
+      "Run: echo 'ALL ALL=(ALL) NOPASSWD: /usr/bin/ydotool' | sudo tee /etc/sudoers.d/ydotool"
+    );
+  }
+}
+
 function sudoSh(cmd: string, timeout = 5_000): string {
-  return sh(`sudo YDOTOOL_SOCKET=${YDOTOOL_SOCKET} ${cmd}`, timeout);
+  ensureSudo();
+  // Use spawnSync with explicit env object and arg array to avoid shell injection.
+  // sudo normally strips env vars set in the command string; passing YDOTOOL_SOCKET
+  // via the env option to spawnSync avoids shell interpretation entirely.
+  const r = spawnSync("sudo", ["env", `YDOTOOL_SOCKET=${YDOTOOL_SOCKET}`, "sh", "-c", cmd], {
+    encoding: "utf-8",
+    maxBuffer: 50 * 1024 * 1024,
+    timeout,
+  });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(r.stderr?.trim() || `Command exited with code ${r.status}: ${cmd.substring(0, 80)}`);
+  return r.stdout.trim();
 }
 
 /** Non-blocking promise-based sleep for use inside async execute() */
@@ -61,7 +94,10 @@ function getScreenBounds(): { width: number; height: number; monitors: string; m
     maxX = Math.max(maxX, x + w);
     maxY = Math.max(maxY, y + h);
   }
-  return { width: Math.max(maxX - minX, 2560), height: Math.max(maxY - minY, 1440), monitors: out, minX, minY };
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+    throw new Error(`Unable to parse monitor geometry from hyprctl monitors output: "${out.substring(0, 200)}"`);
+  }
+  return { width: maxX - minX, height: maxY - minY, monitors: out, minX, minY };
 }
 
 /** Convert normalized (0-1000) coords to absolute pixel, accounting for monitor origin offset */

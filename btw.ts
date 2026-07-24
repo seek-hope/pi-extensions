@@ -37,7 +37,11 @@ class ScrollViewer {
       if (this.scroll > 0) { this.scroll = 0; this.invalidate(); }
       return true;
     }
-    if (matchesKey(data, Key.home) || data === "G") {
+    if (matchesKey(data, Key.home)) {
+      if (this.scroll > 0) { this.scroll = 0; this.invalidate(); }
+      return true;
+    }
+    if (data === "G") {
       const bottom = Math.max(0, this.lines.length - visible);
       if (this.scroll < bottom) { this.scroll = bottom; this.invalidate(); }
       return true;
@@ -53,7 +57,8 @@ class ScrollViewer {
 
   private visibleLines(): number {
     // Terminal height minus header/footer/borders (~6 lines overhead)
-    const rows = process.stdout.rows || 24; return Math.max(5, rows - 8);
+    const rows = process.stdout.rows || 24; // fallback to 24 if stdout is not a TTY
+    return Math.max(5, rows - 8);
   }
 
   render(width: number): string[] {
@@ -92,13 +97,27 @@ class ScrollViewer {
   }
 }
 
+// ── resolve pi binary path ─────────────────────────────────────────────────
+
+export function resolvePiBin(): string {
+  // Allow explicit override via env var
+  if (process.env.PI_BIN) return process.env.PI_BIN;
+  // Use argv[1] if it looks like the pi entry point
+  if (process.argv[1]) {
+    const base = process.argv[1].split("/").pop() || "";
+    if (base === "pi") return process.argv[1];
+  }
+  // Fall back to PATH lookup
+  return "pi";
+}
+
 // ── spawn pi in ephemeral print mode ────────────────────────────────────────
 
 function runSideQuery(question: string, cwd: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn(
-      "pi",
-      ["-p", "--no-context-files", "--no-session", question],
+      resolvePiBin(),
+      ["-p", "--no-context-files", "--no-session", "--", question],
       {
         cwd,
         env: { ...process.env },
@@ -113,10 +132,11 @@ function runSideQuery(question: string, cwd: string): Promise<string> {
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
     child.on("close", (code) => {
-      if (code === 0 && stdout.trim()) {
-        resolve(stdout.trim());
+      const combined = stdout + stderr;
+      if (code === 0 && combined.trim()) {
+        resolve(combined.trim());
       } else {
-        resolve(stderr.trim() || stdout.trim() || `(pi exited with code ${code})`);
+        resolve(combined.trim() || `(pi exited with code ${code})`);
       }
     });
 
@@ -169,17 +189,11 @@ export default function (pi: ExtensionAPI) {
         // Spacer
         container.addChild(new Text("", 0, 0));
 
-        // Content (wrapped in a component so it scrolls)
-        const contentComp = {
-          render: (w: number) => viewer.render(w),
-          invalidate: () => viewer.invalidate(),
-        };
-
         // We need to integrate handleInput with the container
         return {
           render: (w: number) => {
             const lines = container.render(w);
-            const contentLines = contentComp.render(w);
+            const contentLines = viewer.render(w);
             return [...lines, ...contentLines];
           },
           invalidate: () => {

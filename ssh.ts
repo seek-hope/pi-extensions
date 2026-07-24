@@ -203,6 +203,8 @@ function resolveSshConfig(host: string): { user: string; hostname: string; port:
 }
 
 function parseArgs(args: string): { alias: string; user: string; hostname: string; port: number; command: string } | null {
+  // SSH options that take a value — everything else is boolean (no value consumed)
+  const VALUE_FLAGS = new Set(["p", "i", "o", "l", "b", "c", "E", "F", "I", "J", "m", "Q", "w", "e", "O", "S", "D", "R", "L"]);
   const parts = args.trim().split(/\s+/);
   let user = "", hostname = "", port = 0, command = "", i = 0;
   while (i < parts.length) {
@@ -212,8 +214,9 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
       else { return null; } // -p without port value: invalid
     }
     else if (p.startsWith("-")) {
-      // Consume option and its value (if next token doesn't look like another flag)
-      if (i + 1 < parts.length && !parts[i + 1].startsWith("-")) { i += 2; }
+      // Only consume next token as value if this flag is known to take values
+      const flag = p.replace(/^-+/, "");
+      if (VALUE_FLAGS.has(flag) && i + 1 < parts.length && !parts[i + 1].startsWith("-")) { i += 2; }
       else { i += 1; }
     }
     else if (p.includes("@")) {
@@ -222,11 +225,26 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
       user = p.substring(0, atIdx);
       const hostPart = p.substring(atIdx + 1);
       if (hostPart.includes(":")) {
-        const colonIdx = hostPart.lastIndexOf(":");
-        hostname = hostPart.substring(0, colonIdx);
-        const pt = parseInt(hostPart.substring(colonIdx + 1));
-        if (!isNaN(pt)) port = port || pt;
-        else hostname = hostPart; // colon but no valid port — treat as hostname
+        // Handle bracketed IPv6: [::1]:22 or [::1]
+        if (hostPart.startsWith("[")) {
+          const closeBracket = hostPart.indexOf("]");
+          if (closeBracket > 0) {
+            hostname = hostPart.substring(0, closeBracket + 1);
+            const afterBracket = hostPart.substring(closeBracket + 1);
+            if (afterBracket.startsWith(":")) {
+              const pt = parseInt(afterBracket.substring(1));
+              if (!isNaN(pt)) port = port || pt;
+            }
+          } else {
+            hostname = hostPart; // malformed bracket — treat as literal hostname
+          }
+        } else {
+          const colonIdx = hostPart.lastIndexOf(":");
+          hostname = hostPart.substring(0, colonIdx);
+          const pt = parseInt(hostPart.substring(colonIdx + 1));
+          if (!isNaN(pt)) port = port || pt;
+          else hostname = hostPart; // colon but no valid port — treat as hostname
+        }
       } else hostname = hostPart;
       if (i + 1 < parts.length) command = parts.slice(i + 1).join(" ");
       i = parts.length;
@@ -243,7 +261,9 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
 
 function ensureShell(conn: Connection): void {
   // Already alive — don't reset
-  if (conn.proc && conn.proc.exitCode === null && conn.proc.stdin?.writable) return;
+  // Must check both exitCode and signalCode: exitCode is null while running OR when
+  // killed by a signal, while signalCode is only set when killed by a signal.
+  if (conn.proc && conn.proc.exitCode === null && conn.proc.signalCode === null && conn.proc.stdin?.writable) return;
 
   // Clean up dead/dying proc
   if (conn.proc) {
@@ -320,16 +340,22 @@ function extractResponses(conn: Connection): void {
     const m = conn.buf.match(/__END__(\d+)_(\w+):(\d+)\n/);
     if (!m) break;
     const idx = conn.buf.indexOf(m[0]);
-    const output = conn.buf.substring(0, idx);
-    conn.buf = conn.buf.substring(idx + m[0].length);
     const reqId = parseInt(m[1]);
     const rand = m[2];
     const p = conn.pending.get(reqId);
     // Validate the random token to prevent marker injection from command output
     if (p && p.rand === rand) {
+      // Valid marker — resolve with output before it and truncate buffer
+      const output = conn.buf.substring(0, idx);
+      conn.buf = conn.buf.substring(idx + m[0].length);
       conn.pending.delete(reqId);
       if (p.timer) clearTimeout(p.timer);
       p.resolve(output);
+    } else {
+      // Rand mismatch or orphaned marker — remove only the marker text itself
+      // to avoid discarding legitimate command output that happens to contain
+      // a string resembling the end-of-response marker.
+      conn.buf = conn.buf.substring(0, idx) + conn.buf.substring(idx + m[0].length);
     }
   }
 }
@@ -376,6 +402,9 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         conn.pending.delete(reqId);
         reject(new Error(`SSH shell exited (code ${code}) before command could be written`));
       });
+      // Remove drain listener to prevent listener leak when process exits
+      // before drain fires (backpressure case).
+      conn.proc?.stdin?.removeListener("drain", onDrain);
     };
     conn.proc.once("exit", onProcExit);
 
@@ -387,18 +416,20 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     // Don't wrap in quotes (that would treat semicolons literally)
     try {
       const wrote = conn.proc.stdin!.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
+      const onDrain = () => {
+        // Data flushed successfully — response will arrive via extractResponses.
+        // Listeners remain active; done() prevents double-settle.
+      };
       if (!wrote) {
-        // Backpressure: wait for drain, but also listen for errors during drain
-        conn.proc.stdin!.once("drain", () => {
-          // Data flushed successfully — response will arrive via extractResponses
-          conn.proc.stdin!.removeListener("error", onStdinError);
-          conn.proc!.removeListener("exit", onProcExit);
-        });
-        // If the process dies during drain, the exit handler on the proc will reject
-      } else {
-        conn.proc.stdin!.removeListener("error", onStdinError);
-        conn.proc.removeListener("exit", onProcExit);
+        // Backpressure: wait for drain, but keep exit/error listeners alive.
+        // The done() guard prevents double-settling, and removing listeners
+        // early could leave the promise hanging if drain fires but the
+        // process then errors/exits before extractResponses finds the marker.
+        conn.proc.stdin!.once("drain", onDrain);
       }
+      // On successful write (wrote=true or after drain), exit/error listeners
+      // remain active so the promise settles even if the process crashes
+      // before extractResponses fires. The done() guard prevents double-settle.
     } catch (writeErr: any) {
       done(() => {
         clearTimeout(timer);
@@ -407,6 +438,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
       });
       conn.proc?.removeListener("exit", onProcExit);
       conn.proc?.stdin?.removeListener("error", onStdinError);
+      conn.proc?.stdin?.removeListener("drain", onDrain);
     }
   });
 }
@@ -447,7 +479,14 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   if (existsSync(sock)) { try { rmSync(sock); } catch { /* ok */ } }
   ctx.ui.notify(`Opening SSH to ${user}@${hostname}:${port}...`, "info");
   const displayHost = alias !== hostname ? `${alias} (${user}@${hostname}:${port})` : `${user}@${hostname}:${port}`;
-  const termProc = spawn("alacritty", ["-e", "bash", "-c",
+  // Determine which terminal emulator to use
+  const termEnv = process.env.TERMINAL || "";
+  const termCandidates = [termEnv, "alacritty", "kitty", "gnome-terminal", "xterm"].filter(Boolean);
+  const termEmu = termCandidates.find((t) => {
+    const r = spawnSync("which", [t], { stdio: "ignore" });
+    return r.status === 0;
+  }) || "xterm";
+  const termProc = spawn(termEmu, (termEmu === "gnome-terminal" ? ["--", "bash", "-c"] : ["-e", "bash", "-c"]),
     `echo "Connecting to ${displayHost}..."; ` +
     `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=12h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
@@ -527,9 +566,15 @@ function findConnection(host: string): Connection | undefined {
   for (const [, c] of connections) {
     if (c.alias.toLowerCase() === s || c.key.toLowerCase() === s) return c;
   }
-  // Substring match as fallback
-  for (const [, c] of connections) {
-    if (c.key.toLowerCase().includes(s) || c.alias.toLowerCase().includes(s)) return c;
+  // Substring match as fallback — require exactly one match to avoid ambiguity
+  const substringMatches: Array<[string, Connection]> = [];
+  for (const [key, c] of connections) {
+    if (c.key.toLowerCase().includes(s) || c.alias.toLowerCase().includes(s)) {
+      substringMatches.push([key, c]);
+    }
+  }
+  if (substringMatches.length === 1) {
+    return substringMatches[0][1];
   }
   return undefined;
 }
@@ -688,7 +733,7 @@ export default function (pi: ExtensionAPI) {
             const val = parseFloat(m[1]);
             // Default to seconds when no unit given — models are far more likely
             // to write "300" meaning 300s than 300ms.
-            const unit = (m[2] || "ms").toLowerCase();
+            const unit = (m[2] || "s").toLowerCase();
             const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
             effectiveTimeout = Math.round(val * (multipliers[unit] || 1000));
           }

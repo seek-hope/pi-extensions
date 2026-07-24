@@ -10,7 +10,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, mkdirSync, writeFileSync, unlinkSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -27,6 +28,7 @@ interface Task {
   exitCode?: number;
   logFile: string;
   model?: string;
+  timeout?: number;
 }
 
 // ── persist tasks to disk ──────────────────────────────────────────────────
@@ -37,7 +39,17 @@ function loadTasks(): Map<string, Task> {
     if (existsSync(TASK_FILE)) {
       for (const t of JSON.parse(readFileSync(TASK_FILE, "utf-8"))) m.set(t.id, t);
     }
-  } catch { /* ignore */ }
+  } catch (err) {
+    // If tasks.json is corrupted, log a warning and fall back to log-file-only recovery.
+    // The task completion poller will detect EXIT_CODE in the log files on next check.
+    console.warn(`bg-tasks: failed to load ${TASK_FILE} — ${(err as Error)?.message || String(err)}. Tasks will be recovered from log files on next poll.`);
+    try {
+      // Attempt backup: append .corrupt suffix so the file isn't silently overwritten
+      const bak = TASK_FILE + ".corrupt." + Date.now();
+      writeFileSync(bak, readFileSync(TASK_FILE));
+      console.warn(`bg-tasks: backed up corrupted tasks.json to ${bak}`);
+    } catch { /* backup also failed — proceed without */ }
+  }
   return m;
 }
 
@@ -57,12 +69,12 @@ function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): v
 
 // ── spawn background task ──────────────────────────────────────────────────
 
-function spawnTask(description: string, cwd: string, timeout: number): Task {
-  const lockKey = `${description}||${cwd}`;
-  // Deduplicate: if identical task (same description and cwd) already running, return existing.
+async function spawnTask(description: string, cwd: string, timeout: number): Promise<Task> {
+  const lockKey = createHash("sha256").update(description).update("\0").update(cwd).digest("hex").slice(0, 16);
+  // Deduplicate: if identical task (same description, cwd, and timeout) already running, return existing.
   // Verify the tmux session is actually still alive before deduplicating.
   for (const [, t] of tasks) {
-    if (t.status === "running" && t.description === description && t.cwd === cwd) {
+    if (t.status === "running" && t.description === description && t.cwd === cwd && t.timeout === timeout) {
       try {
         execSync(`tmux has-session -t "${t.id}"`, { stdio: "pipe", timeout: 5_000 });
         return t; // session confirmed alive — deduplicate
@@ -75,22 +87,27 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
       }
     }
   }
-  // Guard against TOCTOU: if another concurrent spawn for the same (desc, cwd) is in
-  // progress, wait for it to finish and return its task.
-  if (spawningLocks.has(lockKey)) {
-    // Busy-wait with backoff until the lock is released or a task matching our criteria appears.
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      const existing = [...tasks.values()].find(
-        t => t.status === "running" && t.description === description && t.cwd === cwd
-      );
-      if (existing) return existing;
-      if (!spawningLocks.has(lockKey)) break;
-      // Brief yield to let the other call proceed
-      execSync("sleep 0.1", { stdio: "ignore", timeout: 5_000 });
+  // Guard against TOCTOU: atomically check-and-acquire the lock (no await between check and add).
+  // This prevents two concurrent spawns for the same (desc, cwd) from both passing the gate.
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    if (!spawningLocks.has(lockKey)) {
+      spawningLocks.add(lockKey);
+      break;
     }
+    // Lock held by another call — wait for its task to appear or lock to release
+    const existing = [...tasks.values()].find(
+      t => t.status === "running" && t.description === description && t.cwd === cwd
+    );
+    if (existing) return existing;
+    if (Date.now() > deadline) {
+      // Deadline reached — force-acquire to prevent deadlock (potential duplicate)
+      spawningLocks.add(lockKey);
+      break;
+    }
+    // Async yield to let the other call proceed without blocking the event loop
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
-  spawningLocks.add(lockKey);
   try {
     const id = `task-${Date.now().toString(36)}`;
     const logFile = join(TASK_DIR, `${id}.log`);
@@ -119,7 +136,7 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
       throw new Error(`Failed to start tmux session for task ${id}`);
     }
 
-    const task: Task = { id, description, cwd, status: "running", startTime, logFile };
+    const task: Task = { id, description, cwd, status: "running", startTime, logFile, timeout };
     tasks.set(id, task);
     saveTasks(tasks);
 
@@ -149,7 +166,12 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
   }
 }
 
-function getTaskOutput(task: Task): string {
+/**
+ * Read a task's log file and finalize its status if EXIT_CODE was found.
+ * Despite its getter-like name, this mutates task.status/task.exitCode/task.endTime
+ * when it detects that the background process has finished.
+ */
+function finalizeTaskOutput(task: Task): string {
   if (!existsSync(task.logFile)) return "(no output yet)";
   try {
     const content = readFileSync(task.logFile, "utf-8");
@@ -223,7 +245,9 @@ function pollCompletion(id: string): void {
     } catch (e: any) {
       // exit code 1 = session does not exist (normal completion)
       // any other exit code = tmux error (don't assume task completed)
-      if (e.status !== 1) {
+      // ENOENT means tmux is not installed — don't treat as a task error
+      if (e.code === 'ENOENT') { /* tmux not available, skip */ }
+      else if (e.status !== 1) {
         // tmux error — retry later rather than falsely marking task complete
         consecutiveErrors++;
         if (consecutiveErrors >= MAX_POLL_ERRORS) {
@@ -257,9 +281,9 @@ function pollCompletion(id: string): void {
       pollingTasks.delete(id);
       return;
     }
-    getTaskOutput(current);  // attempts to set status to done/error from EXIT_CODE
+    finalizeTaskOutput(current);  // attempts to set status to done/error from EXIT_CODE
 
-    // If status is still "running" after getTaskOutput, the log lacks EXIT_CODE
+    // If status is still "running" after finalizeTaskOutput, the log lacks EXIT_CODE
     // (e.g. script was killed before writing it). Mark as error.
     if (current.status === "running") {
       current.status = "error";
@@ -306,7 +330,8 @@ export default function (pi: ExtensionAPI) {
         // exit code 1 = session does not exist (task completed while we were away)
         // any other error (tmux missing, signal, etc.) — fall through to log file recovery
         // instead of leaving the task stuck in "running" state forever.
-        if (e.status !== 1) {
+        // ENOENT means tmux is not installed — skip silently.
+        if (e.status !== 1 && e.code !== 'ENOENT') {
           console.debug("syncTasks: tmux error for", id, e.message || e.status);
         }
       }
@@ -317,9 +342,9 @@ export default function (pi: ExtensionAPI) {
       } else {
         // Session gone — check log for exit code
         try {
-          getTaskOutput(task);
+          finalizeTaskOutput(task);
         } catch { /* log file may be gone */ }
-        // If still "running" after getTaskOutput, the log file is missing
+        // If still "running" after finalizeTaskOutput, the log file is missing
         // or lacks EXIT_CODE. Mark as error to prevent perpetual "running" state.
         if (task.status === "running") {
           task.status = "error";
@@ -329,6 +354,25 @@ export default function (pi: ExtensionAPI) {
         saveTasks(tasks);
       }
     }
+    // GC: remove orphaned .sh and _wrapper.sh files that are not associated
+    // with any known task. These accumulate if pi crashes mid-task or the
+    // tmux cleanup rm fails, and would otherwise grow unbounded over time.
+    try {
+      const files = readdirSync(TASK_DIR);
+      for (const file of files) {
+        let taskId: string | null = null;
+        if (file.endsWith("_wrapper.sh")) {
+          taskId = file.slice(0, -"_wrapper.sh".length);
+        } else if (file.endsWith(".sh")) {
+          taskId = file.slice(0, -".sh".length);
+        } else {
+          continue;
+        }
+        if (!tasks.has(taskId)) {
+          try { unlinkSync(join(TASK_DIR, file)); } catch { /* ok */ }
+        }
+      }
+    } catch { /* TASK_DIR may not exist yet */ }
     updateTaskWidget();
   }
   syncTasks();
@@ -359,8 +403,8 @@ export default function (pi: ExtensionAPI) {
       const task = tasks.get(id);
       if (!task) { ctx.ui.notify(`Task ${id} not found.`, "error"); return; }
 
-      const output = getTaskOutput(task);
-      // Persist any status change that getTaskOutput may have applied
+      const output = finalizeTaskOutput(task);
+      // Persist any status change that finalizeTaskOutput may have applied
       saveTasks(tasks);
       const lines = output.split("\n");
       ctx.ui.setWidget("task-" + id, [
@@ -424,7 +468,7 @@ export default function (pi: ExtensionAPI) {
       timeoutMs: Type.Optional(Type.Number({ description: "Max runtime in ms (default: 3600000 = 60 min)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const task = spawnTask(params.task, ctx.cwd, params.timeoutMs || 3_600_000); // default 60 min
+      const task = await spawnTask(params.task, ctx.cwd, params.timeoutMs || 3_600_000); // default 60 min
       return {
         content: [{
           type: "text",

@@ -19,6 +19,11 @@ import { readFileSync, existsSync } from "node:fs";
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Escape regex special characters in a string. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** Check if a command is available in PATH. Returns its full path or null. */
 function which(cmd: string): string | null {
   try {
@@ -86,16 +91,17 @@ function filterDiagForLine(diagOutput: string, targetLine: number): string {
 function findDefinitions(symbol: string, language: string, cwd?: string): string {
   if (!symbol) return "Could not determine symbol at cursor position.";
 
+  const escaped = escapeRegex(symbol);
   const patterns: Record<string, string> = {
-    python: `(def |class )${symbol}\\b`,
-    cpp: `\\b${symbol}\\s*\\([^)]*\\)\\s*\\{`,
-    c: `\\b${symbol}\\s*\\([^)]*\\)\\s*\\{`,
-    rust: `(fn |struct |enum |trait |impl |type |mod )${symbol}\\b`,
-    typescript: `(function |class |interface |type |const |let |var )${symbol}\\b`,
-    ts: `(function |class |interface |type |const |let |var )${symbol}\\b`,
+    python: `(def |class )${escaped}\\b`,
+    cpp: `\\b${escaped}\\s*\\([^)]*\\)\\s*\\{`,
+    c: `\\b${escaped}\\s*\\([^)]*\\)\\s*\\{`,
+    rust: `(fn |struct |enum |trait |impl |type |mod )${escaped}\\b`,
+    typescript: `(function |class |interface |type |const |let |var )${escaped}\\b`,
+    ts: `(function |class |interface |type |const |let |var )${escaped}\\b`,
   };
 
-  const pattern = patterns[language] || `\\b${symbol}\\b`;
+  const pattern = patterns[language] || `\\b${escaped}\\b`;
 
   try {
     const args = ["--no-heading", "-n", "-E", pattern, "--max-count=10"];
@@ -121,7 +127,7 @@ function findDefinitions(symbol: string, language: string, cwd?: string): string
 function findReferences(symbol: string, _language: string, cwd?: string): string {
   if (!symbol) return "Could not determine symbol at cursor position.";
 
-  const pattern = `\\b${symbol}\\b`;
+  const pattern = `\\b${escapeRegex(symbol)}\\b`;
 
   try {
     const args = ["--no-heading", "-n", pattern, "--max-count=50"];

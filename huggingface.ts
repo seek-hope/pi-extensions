@@ -7,6 +7,42 @@ import { Type } from "typebox";
 
 const BASE_URL = "https://router.huggingface.co/v1";
 
+/** Shared helper: call HuggingFace chat completions API, handle errors, redact tokens. */
+async function callHuggingFace(
+  body: Record<string, any>,
+  signal?: AbortSignal
+): Promise<{ content: { type: string; text: string }[]; details: Record<string, any>; isError?: boolean }> {
+  const token = process.env.HF_TOKEN;
+  if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
+  try {
+    const res = await fetch(`${BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) {
+      let errBody = await res.text();
+      if (token) errBody = errBody.replaceAll(token, "[REDACTED]");
+      throw new Error(`HuggingFace API error (${res.status}): ${errBody.substring(0, 500)}`);
+    }
+    const rawBody = await res.text();
+    let data: any;
+    try {
+      data = JSON.parse(rawBody);
+    } catch {
+      let sanitized = rawBody;
+      if (token) sanitized = sanitized.replaceAll(token, "[REDACTED]");
+      throw new Error(`HuggingFace API returned non-JSON response: ${sanitized.substring(0, 500)}`);
+    }
+    const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
+    return { content: [{ type: "text", text }], details: {} };
+  } catch (e: any) {
+    const msg = token ? (e.message || String(e)).replaceAll(token, "[REDACTED]") : (e.message || String(e));
+    return { content: [{ type: "text", text: msg }], details: {}, isError: true };
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "huggingface_inference",
@@ -19,30 +55,12 @@ export default function (pi: ExtensionAPI) {
       temperature: Type.Optional(Type.Number({ description: "Temperature (default 0.7)" })),
     }),
     async execute(_id, params, _signal) {
-      const token = process.env.HF_TOKEN;
-      if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
-      try {
-        const res = await fetch(`${BASE_URL}/chat/completions`, {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: params.model,
-            messages: [{ role: "user", content: params.prompt }],
-            max_tokens: params.maxTokens || 256,
-            temperature: params.temperature ?? 0.7,
-          }),
-          signal: _signal,
-        });
-        let data: any;
-        try {
-          data = await res.json();
-        } catch {
-          const body = await res.text();
-          throw new Error(`HuggingFace API returned non-JSON response (${res.status}): ${body.substring(0, 500)}`);
-        }
-        const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
-        return { content: [{ type: "text", text }], details: {} };
-      } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
+      return callHuggingFace({
+        model: params.model,
+        messages: [{ role: "user", content: params.prompt }],
+        max_tokens: params.maxTokens || 256,
+        temperature: params.temperature ?? 0.7,
+      }, _signal);
     },
   });
 
@@ -57,32 +75,14 @@ export default function (pi: ExtensionAPI) {
       temperature: Type.Optional(Type.Number({ description: "Temperature (default 0.7)" })),
     }),
     async execute(_id, params, _signal) {
-      const token = process.env.HF_TOKEN;
-      if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
-      try {
-        let msgs;
-        try { msgs = JSON.parse(params.messages); } catch { msgs = [{ role: "user", content: params.messages }]; }
-        const res = await fetch(`${BASE_URL}/chat/completions`, {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: params.model,
-            messages: msgs,
-            max_tokens: params.maxTokens || 512,
-            temperature: params.temperature ?? 0.7,
-          }),
-          signal: _signal,
-        });
-        let data: any;
-        try {
-          data = await res.json();
-        } catch {
-          const body = await res.text();
-          throw new Error(`HuggingFace API returned non-JSON response (${res.status}): ${body.substring(0, 500)}`);
-        }
-        const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
-        return { content: [{ type: "text", text }], details: {} };
-      } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
+      let msgs;
+      try { msgs = JSON.parse(params.messages); } catch { msgs = [{ role: "user", content: params.messages }]; }
+      return callHuggingFace({
+        model: params.model,
+        messages: msgs,
+        max_tokens: params.maxTokens || 512,
+        temperature: params.temperature ?? 0.7,
+      }, _signal);
     },
   });
 
@@ -97,34 +97,16 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(Type.String({ description: "Model ID (default: facebook/nllb-200-distilled-600M)" })),
     }),
     async execute(_id, params, _signal) {
-      const token = process.env.HF_TOKEN;
-      if (!token) return { content: [{ type: "text", text: "HF_TOKEN not set." }], details: {}, isError: true };
-      try {
-        const model = params.model || "facebook/nllb-200-distilled-600M";
-        const prompt = params.sourceLang
-          ? `Translate from ${params.sourceLang} to ${params.targetLang || "English"}: ${params.text}`
-          : `Translate: ${params.text}`;
-        const res = await fetch(`${BASE_URL}/chat/completions`, {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model,
-            messages: [{ role: "user", content: prompt }],
-            max_tokens: 512,
-            temperature: 0.3,
-          }),
-          signal: _signal,
-        });
-        let data: any;
-        try {
-          data = await res.json();
-        } catch {
-          const body = await res.text();
-          throw new Error(`HuggingFace API returned non-JSON response (${res.status}): ${body.substring(0, 500)}`);
-        }
-        const text = data.choices?.[0]?.message?.content || JSON.stringify(data);
-        return { content: [{ type: "text", text }], details: {} };
-      } catch (e: any) { return { content: [{ type: "text", text: e.message }], details: {}, isError: true }; }
+      const model = params.model || "facebook/nllb-200-distilled-600M";
+      const prompt = params.sourceLang
+        ? `Translate from ${params.sourceLang} to ${params.targetLang || "English"}: ${params.text}`
+        : `Translate: ${params.text}`;
+      return callHuggingFace({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 512,
+        temperature: 0.3,
+      }, _signal);
     },
   });
 }

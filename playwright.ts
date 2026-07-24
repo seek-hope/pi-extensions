@@ -9,6 +9,7 @@ import { Type } from "typebox";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
+import { Script } from "node:vm";
 
 const PROCESS_TIMEOUT_MS = 60_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
@@ -190,6 +191,15 @@ main().catch((error) => {
 });
 `;
 
+// Validate PLAYWRIGHT_RUNNER syntax at load time — catches typos before runtime
+let _runnerValidated = false;
+try {
+  new Script(PLAYWRIGHT_RUNNER);
+  _runnerValidated = true;
+} catch (e: any) {
+  console.error(`Playwright runner has syntax errors: ${e.message}`);
+}
+
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -200,7 +210,7 @@ function errorText(error: unknown): string {
   }
 }
 
-const URL_REGEX = /^https?:\/\/([^\s/:]+)(:\d+)?(\/[^\s]*)?$/i;
+const URL_REGEX = /^https?:\/\/(\[[\da-f:.]+\]|[^\s\/:]+)(:\d+)?(\/[^\s?#]*)?(\?[^\s]*)?(#[^\s]*)?$/i;
 
 function validateUrl(url: unknown): string {
   if (typeof url !== "string" || url.trim() === "") {
@@ -274,7 +284,10 @@ function runPlaywright(request: PlaywrightRequest, cwd: string, signal?: AbortSi
     }
 
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-      if (error.code === "EPIPE") return;
+      if (error.code === "EPIPE") {
+        finish(new Error(`Unable to send the browser request: ${errorText(error)}`));
+        return;
+      }
       child.kill();
       finish(new Error(`Unable to send the browser request: ${errorText(error)}`));
     });
@@ -283,6 +296,10 @@ function runPlaywright(request: PlaywrightRequest, cwd: string, signal?: AbortSi
 }
 
 export default function (pi: ExtensionAPI) {
+  if (!_runnerValidated) {
+    throw new Error("Playwright runner script failed validation — tools not registered.");
+  }
+
   pi.registerTool({
     name: "playwright_snapshot",
     label: "Playwright Snapshot",

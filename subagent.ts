@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
+import { resolvePiBin } from "./btw.js";
 
 // ── types ───────────────────────────────────────────────────────────────────
 
@@ -62,20 +63,28 @@ function safeId(raw: string): string | null {
 // Read default/cheap model from pi settings
 let _defaultModel: string | undefined;
 let _cheapModel: string | undefined;
-try {
-  const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf-8"));
-  _defaultModel = cfg.defaultModel;
-  // Derive a cheaper/faster model for analyze/exploration tasks:
-  // 1. Use explicit cheapModel from settings if available
-  // 2. Fall back to replacing "pro" → "flash" (common naming convention across providers)
-  // 3. If neither produces a different model, cheapModel stays undefined (default model is used)
-  if (cfg.cheapModel && typeof cfg.cheapModel === "string") {
-    _cheapModel = cfg.cheapModel;
-  } else if (_defaultModel) {
-    const derived = _defaultModel.replace(/pro/i, "flash");
-    _cheapModel = derived !== _defaultModel ? derived : _defaultModel; // fallback to default if no cheaper variant
+
+function refreshModels() {
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf-8"));
+    _defaultModel = cfg.defaultModel;
+    // Derive a cheaper/faster model for analyze/exploration tasks:
+    // 1. Use explicit cheapModel from settings if available
+    // 2. Fall back to replacing "pro" → "flash" (common naming convention across providers)
+    // 3. If neither produces a different model, cheapModel stays undefined (default model is used)
+    if (cfg.cheapModel && typeof cfg.cheapModel === "string") {
+      _cheapModel = cfg.cheapModel;
+    } else if (_defaultModel) {
+      const derived = _defaultModel.replace(/pro/i, "flash");
+      _cheapModel = derived !== _defaultModel ? derived : undefined;
+    }
+  } catch (e: any) {
+    // Settings file may not exist yet, or may contain invalid JSON
+    console.debug("subagent: failed to load settings.json", e.message);
   }
-} catch (e: any) { /* settings file may not exist yet */ }
+}
+
+refreshModels();
 
 function branchName(id: string): string {
   const safe = safeId(id);
@@ -127,8 +136,8 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Reviewer produced no output at round ${i}` };
     }
 
-    const cleanMatch = reviewerOutput.match(/CLEAN:\s*(true|false)/i);
-    const foundMatch = reviewerOutput.match(/FOUND:\s*(\d+)/i);
+    const cleanMatch = reviewerOutput.match(/^CLEAN:\s*(true|false)/im);
+    const foundMatch = reviewerOutput.match(/^FOUND:\s*(\d+)/im);
     const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
     const issuesCount = foundMatch ? parseInt(foundMatch[1], 10) : (isClean ? 0 : 1);
     // Guard: CLEAN: false but FOUND: 0 is contradictory — ensure at least 1 fix iteration
@@ -151,7 +160,9 @@ async function reviewLoop(
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
     }
-    if (/^\[Sub-agent (error|spawn error|denied|timeout)/.test(fixerOutput)) {
+    // Require the full bracketed pattern (including closing `]`) to avoid false positives
+    // from legitimate output that happens to start with "[Sub-agent error...".
+    if (/^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
@@ -273,7 +284,7 @@ async function handleImproveMode(
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },
-    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "improve"
+    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : ""
   );
 }
 
@@ -300,7 +311,7 @@ async function handleExecuteMode(
       const execResult = await execPromise;
       const ag = subAgents.get(execId);
       if (ag) {
-        if (ag.status === "error" || execResult.startsWith("[Sub-agent error") || execResult.startsWith("[Sub-agent denied") || execResult.startsWith("[Sub-agent timeout") || execResult.startsWith("[Sub-agent spawn error")) {
+        if (ag.status === "error" || /^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(execResult)) {
           results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
           allClean = false;
           // Reject: delete branch + worktree for failed items
@@ -324,8 +335,21 @@ async function handleExecuteMode(
               }
               try {
                 git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
-                git(["commit", "-m", `pi: auto-merge ${execId}: ${item.description.substring(0, 60)}`, "--no-edit"], ctxCwd);
-                // Pop stash on successful merge
+                // Separate commit from merge to handle commit failures gracefully.
+                // Use --allow-empty so a no-diff merge doesn't cause data loss.
+                try {
+                  git(["commit", "-m", `pi: auto-merge ${execId}: ${item.description.substring(0, 60)}`, "--no-edit", "--allow-empty"], ctxCwd);
+                } catch (commitErr: any) {
+                  // Merge applied but commit failed (e.g. pre-commit hook).
+                  // Do NOT abort the merge — that would discard all changes.
+                  // Retain the branch for manual review instead.
+                  mergeHadConflicts = true;
+                  retainForManualReview = true;
+                  results.push(`  ⚠ Auto-merge of ${execId} applied but commit failed (${(commitErr.message || "").substring(0, 80)}). Branch retained for manual review.`);
+                  if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
+                  continue itemLoop;
+                }
+                // Pop stash on successful merge + commit
                 if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
               } catch (mergeErr: any) {
                 // Check if this is actually a conflict (unmerged files) vs. a transient error
@@ -554,14 +578,14 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   // Sub-processes (reviewers, fixers) should use a shorter timeout — 30s floor, 2min default, 20min ceiling
-  const killTimeout = Math.max(Math.min(1_200_000, 1_800_000), 60_000); // 20 min floor, 30 min ceiling
+  const killTimeout = Math.min(Math.max(timeoutMs ?? 120_000, 30_000), 1_200_000); // 30s floor, 20min ceiling
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
     if (model) args.push("--model", model);
     if (tools) args.push("--tools", tools);
     args.push("\n" + task);
-    const proc = spawn("pi", args, {
+    const proc = spawn(resolvePiBin(), args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
@@ -714,7 +738,7 @@ function spawnSubAgent(
     // Prefix with "\n" to prevent task text from being parsed as a CLI option
     args.push("\n" + task);
 
-    const proc = spawn("pi", args, {
+    const proc = spawn(resolvePiBin(), args, {
       cwd: worktreePath,
       env: {
         ...process.env,
@@ -892,6 +916,7 @@ export default function (pi: ExtensionAPI) {
       todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      refreshModels(); // pick up any model changes made mid-session
 
       // ── ANALYZE mode ────────────────────────────────────────────────
       if (params.mode === "analyze") {
@@ -1130,8 +1155,27 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        // Clean merge — commit it
-        git(["commit", "-m", `pi: merge subagent ${params.id}: ${ag?.task?.substring(0, 60) || "delegated task"}`, "--no-edit"], ctx.cwd);
+        // Clean merge — commit it (with --allow-empty for no-diff merges)
+        try {
+          git(["commit", "-m", `pi: merge subagent ${params.id}: ${ag?.task?.substring(0, 60) || "delegated task"}`, "--no-edit", "--allow-empty"], ctx.cwd);
+        } catch (commitErr: any) {
+          // Commit failed — don't abort the merge (would discard changes).
+          // Report the error so the user can manually finalize.
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `✅ Merge of sub-agent ${params.id} was applied but commit failed.`,
+                `The merged changes are staged in the working tree.`,
+                `Commit error: ${(commitErr.message || "").substring(0, 200)}`,
+                ``,
+                `To complete: git commit -m "merge ${params.id}"`,
+                `To abort:    git merge --abort`,
+              ].join("\n"),
+            }],
+            details: { merged: true, commitFailed: true, branch },
+          };
+        }
 
         // Update agent status
         if (ag) ag.status = "merged";
@@ -1244,7 +1288,9 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: "tasks must be a JSON array of strings." }], details: {}, isError: true };
         }
         tasks = parsed;
-      } catch {
+      } catch (e: any) {
+        // If JSON.parse fails, fall back to newline-delimited tasks
+        if (!(e instanceof SyntaxError)) throw e;
         tasks = params.tasks.split("\n").filter((t: string) => t.trim());
       }
       if (tasks.length === 0) {
@@ -1368,7 +1414,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     for (const [id, ag] of subAgents) {
       ag.status = "cancelled";
-      ag.proc?.kill();
+      try { ag.proc?.kill(); } catch { /* process may have already exited */ }
     }
     // Don't auto-cleanup worktrees — they contain committed work that may be valuable
     subAgents.clear();

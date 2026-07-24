@@ -41,7 +41,7 @@ interface PendingRequest {
 let server: ServerState | null = null;
 let initialization: { state: ServerState; promise: Promise<void> } | null = null;
 let messageId = 0;
-const pending = new Map<number, PendingRequest>();
+const pending = new Map<number | string, PendingRequest>();
 let startMutex: Promise<void> = Promise.resolve();
 
 function findProjectRoot(cwd: string): string {
@@ -90,7 +90,7 @@ function sendMessage(state: ServerState, msg: unknown): void {
   child.stdin.write(header + body);
 }
 
-function takePending(id: number): PendingRequest | undefined {
+function takePending(id: number | string): PendingRequest | undefined {
   const request = pending.get(id);
   if (!request) return undefined;
 
@@ -144,16 +144,35 @@ function mcpRequest(
       signal.addEventListener("abort", request.onAbort, { once: true });
     }
 
-    pending.set(id, request);
+    // Register in pending map AFTER sendMessage to avoid a TOCTOU race:
+    // if the child process exits immediately after sendMessage writes to stdin,
+    // the exit handler fires asynchronously and rejects the request via
+    // rejectPendingForState. By adding to pending only after sendMessage
+    // succeeds, we ensure the request is either:
+    //   a) rejected synchronously by the catch block, or
+    //   b) the message was sent and the request is safely in the pending map
+    //      for the exit handler to find and reject if the child crashes.
     if (signal?.aborted) {
-      request.onAbort?.();
+      clearTimeout(timeout);
+      reject(new Error(`Serena MCP request cancelled before send: ${method}`));
       return;
     }
 
     try {
       sendMessage(state, { jsonrpc: "2.0", id, method, params: params ?? {} });
     } catch (error) {
-      takePending(id)?.reject(asError(error, `Failed to send Serena MCP request: ${method}`));
+      clearTimeout(timeout);
+      reject(asError(error, `Failed to send Serena MCP request: ${method}`));
+      return;
+    }
+
+    // Message sent successfully — now register the pending request.
+    // The response (or an exit-handler rejection) will arrive on a subsequent
+    // event-loop tick, so there is no race between registration and delivery.
+    pending.set(id, request);
+    if (signal?.aborted) {
+      const aborted = takePending(id);
+      if (aborted) aborted.reject(new Error(`Serena MCP request cancelled: ${method}`));
     }
   });
 }
@@ -180,7 +199,9 @@ function handleMessage(state: ServerState, value: unknown): void {
 
   const msg = value as Record<string, unknown>;
   if (typeof msg.method === "string") {
-    if (typeof msg.id === "number" || typeof msg.id === "string" || msg.id === null) {
+    // Per JSON-RPC 2.0 §4.1: The Server MUST NOT reply to a Notification.
+    // Notifications have id === null or id === undefined. Skip responses.
+    if (typeof msg.id === "number" || typeof msg.id === "string") {
       try {
         if (msg.method === "ping") {
           sendMessage(state, { jsonrpc: "2.0", id: msg.id, result: {} });
@@ -268,6 +289,9 @@ function deactivateServerState(state: ServerState, error: Error): void {
   state.buffer = Buffer.alloc(0);
   state.child.stdout.removeAllListeners("data");
   state.child.stderr.removeAllListeners("data");
+  state.child.stdin.removeAllListeners("error");
+  state.child.removeAllListeners("exit");
+  state.child.removeAllListeners("error");
   rejectPendingForState(state, error);
 
   if (server === state) server = null;
@@ -513,15 +537,6 @@ export default function (pi: ExtensionAPI) {
       },
     },
     {
-      name: "serena_find_definition",
-      label: "Serena Find Definition",
-      description: "Find the declaration/definition of a symbol.",
-      params: {
-        query: Type.String({ description: "Symbol name to find definition for" }),
-        relativePath: Type.Optional(Type.String({ description: "File containing the symbol reference" })),
-      },
-    },
-    {
       name: "serena_rename_symbol",
       label: "Serena Rename Symbol",
       description: "Rename a symbol throughout the codebase using LSP refactoring.",
@@ -552,7 +567,6 @@ export default function (pi: ExtensionAPI) {
     serena_search_pattern: "search_for_pattern",
     serena_overview: "get_symbols_overview",
     serena_diagnostics: "get_diagnostics_for_file",
-    serena_find_definition: "find_symbol",
     serena_rename_symbol: "rename_symbol",
     serena_onboarding: "onboarding",
     serena_get_config: "get_current_config",
@@ -612,7 +626,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ── session shutdown cleanup ───────────────────────────────────────
-  pi.on("session_shutdown", () => {
-    stopServer();
+  pi.on("session_shutdown", async () => {
+    try {
+      await stopServer();
+    } catch { /* best-effort shutdown */ }
   });
 }
