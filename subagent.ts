@@ -104,7 +104,7 @@ async function reviewLoop(
   workCwd: string,
   buildReviewTask: (i: number) => string,
   runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
-  maxIterations = 5,
+  maxIterations = 20,
   commitPrefix = "loop"
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
@@ -890,11 +890,11 @@ export default function (pi: ExtensionAPI) {
       timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms (min: 20 min, default: 20 min)" })),
       subagentId: Type.Optional(Type.String({ description: "Target sub-agent ID to improve (any source). If omitted, improves current codebase." })),
       criteria: Type.Optional(Type.String({ description: "Review criteria (improve mode)" })),
-      maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 5, max: 5)" })),
+      maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 20, max: 20)" })),
       todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const maxIt = Math.min(params.maxIterations || 5, 5);
+      const maxIt = Math.min(params.maxIterations || 20, 20);
 
       // ── ANALYZE mode ────────────────────────────────────────────────
       if (params.mode === "analyze") {
