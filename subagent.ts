@@ -104,12 +104,17 @@ async function reviewLoop(
   workCwd: string,
   buildReviewTask: (i: number) => string,
   runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
-  maxIterations = 20,
-  commitPrefix = "loop"
+  maxIterations = 5,
+  commitPrefix = "loop",
+  maxRounds = 20
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
-  for (let i = 1; i <= maxIterations; i++) {
+  const totalRounds = Math.min(maxIterations, maxRounds);
+  const softCap = maxIterations;
+  let extended = false;
+
+  for (let i = 1; i <= maxRounds; i++) {
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
@@ -156,12 +161,18 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
+
+    // At soft cap, log extension notice and continue
+    if (i === softCap && i < maxRounds && !extended) {
+      extended = true;
+      console.error(`[reviewLoop] ${softCap} rounds reached without CLEAN — extending to ${maxRounds} max`);
+    }
   }
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
   ).join("\n");
-  return { iterations: maxIterations, clean: false, summary: `⚠ MAX ROUNDS (${maxIterations})\n` + summary };
+  return { iterations: maxRounds, clean: false, summary: `⚠ MAX ROUNDS (${maxRounds})\n` + summary };
 }
 
 // ── Mode Handlers ───────────────────────────────────────────────────────
@@ -890,7 +901,7 @@ export default function (pi: ExtensionAPI) {
       timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms (min: 20 min, default: 20 min)" })),
       subagentId: Type.Optional(Type.String({ description: "Target sub-agent ID to improve (any source). If omitted, improves current codebase." })),
       criteria: Type.Optional(Type.String({ description: "Review criteria (improve mode)" })),
-      maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 20, max: 20)" })),
+      maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 5). Will auto-extend to 20 if not clean." })),
       todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
