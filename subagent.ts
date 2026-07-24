@@ -148,8 +148,12 @@ async function reviewLoop(
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
+  const loopStartTime = Date.now();
   for (let i = 1; i <= MAX_ROUNDS; i++) {
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
+    if (Date.now() - loopStartTime > MAX_LOOP_DURATION_MS) {
+      return { iterations: i - 1, clean: false, summary: `❌ Overall review loop deadline (${(MAX_LOOP_DURATION_MS / 1000).toFixed(0)}s) exceeded at round ${i}.` };
+    }
     // Update todo progress if bridge available
     const tb = (globalThis as any).__pi_todo;
     if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
@@ -323,6 +327,11 @@ async function handleImproveMode(
   signal?: AbortSignal,
   todoMatchKey?: string // unique key for todo bridge updates
 ): Promise<LoopResult> {
+  // Early cancellation check before any filesystem or validation work
+  if (signal?.aborted) {
+    return { iterations: 0, clean: false, summary: "❌ Cancelled by user before starting improvement." };
+  }
+
   const existing = targetAgentId ? subAgents.get(targetAgentId) : null;
   if (existing && existing.status === "running") {
     return { iterations: 0, clean: false, summary: "Sub-agent still running." };
@@ -668,7 +677,16 @@ function getDiff(projectRoot: string, id: string): string {
  *  Returns "" on failure (git add/commit error, or hash retrieval failure).
  *  Callers: check for empty string to detect failure, check for "no-changes" to skip. */
 function commitWorktree(worktreePath: string, id: string, task: string): string {
-  const truncated = [...task].slice(0, 80).join('');
+  // Use Intl.Segmenter for grapheme-cluster-aware truncation (avoids splitting combining characters).
+  // Fall back to code-point spread if Segmenter is unavailable (e.g., older Node.js).
+  let truncated: string;
+  try {
+    const segmenter = new Intl.Segmenter("en", { granularity: "grapheme" });
+    const segments = [...segmenter.segment(task)].slice(0, 80);
+    truncated = segments.map(s => s.segment).join('');
+  } catch {
+    truncated = [...task].slice(0, 80).join('');
+  }
   const msg = id ? `pi: ${id} — ${truncated}` : `pi: ${truncated}`;
 
   if (!worktreePath || !existsSync(join(worktreePath, ".git"))) return "";
@@ -908,6 +926,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
 
 const MAX_DEPTH = 5;
 const MAX_ROUNDS = 20;
+const MAX_LOOP_DURATION_MS = 180_000; // 3-minute absolute deadline for the entire review loop
 
 function currentDepth(): number {
   const d = parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10);
@@ -1118,6 +1137,11 @@ function spawnSubAgent(
         agent.result = stdout.trim();
         // Auto-commit changes made by the sub-agent
         const ch = commitWorktree(worktreePath, id, task);
+        if (ch === "") {
+          agent.error = "Sub-agent completed but git commit failed. Check worktree for uncommitted work.";
+          settle(`[Sub-agent commit failed]\n${stdout.trim()}\n\nSub-agent completed but could not commit changes to git. The worktree at ${worktreePath} may contain uncommitted work.`, "error");
+          return;
+        }
         agent.commitHash = ch === "no-changes" ? "" : ch;
         settle(stdout.trim(), "done");
         return;
@@ -1921,6 +1945,54 @@ export default function (pi: ExtensionAPI) {
                 if (pid === process.pid) {
                   isPiProcess = true;
                   procVerifiable = true;
+                }
+
+                // --- PID-reuse TOCTOU guard: verify process start time against sentinel creation time.
+                // If the process started AFTER the sentinel was created, the PID has been recycled
+                // by an unrelated process and the original pi agent is dead. This check runs before
+                // the cmdline read to definitively detect PID reuse regardless of the new process's name.
+                if (!procVerifiable && creationTime > 0) {
+                  let processStartTime = 0;
+                  // Linux: /proc/<pid>/stat field 22 (1-indexed) = starttime in jiffies since boot
+                  try {
+                    const statRaw = readFileSync(`/proc/${pid}/stat`, "utf-8");
+                    const rparen = statRaw.lastIndexOf(')');
+                    if (rparen !== -1) {
+                      const fields = statRaw.slice(rparen + 1).trim().split(/\s+/);
+                      if (fields.length >= 20) {
+                        const starttimeJiffies = parseInt(fields[19], 10);
+                        if (!isNaN(starttimeJiffies)) {
+                          try {
+                            const statFile = readFileSync("/proc/stat", "utf-8");
+                            const btimeMatch = statFile.match(/btime\s+(\d+)/);
+                            if (btimeMatch) {
+                              const CLK_TCK = 100;
+                              const bootTimeMs = parseInt(btimeMatch[1], 10) * 1000;
+                              processStartTime = bootTimeMs + (starttimeJiffies / CLK_TCK * 1000);
+                            }
+                          } catch { /* cannot read /proc/stat */ }
+                        }
+                      }
+                    }
+                  } catch { /* not Linux or permission denied */ }
+
+                  // macOS / BSD: ps -o lstart= gives absolute start time
+                  if (processStartTime === 0) {
+                    try {
+                      const psOut = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], { timeout: 3000, encoding: "utf-8" });
+                      if (psOut.status === 0 && psOut.stdout.trim()) {
+                        const parsed = Date.parse(psOut.stdout.trim());
+                        if (!isNaN(parsed)) processStartTime = parsed;
+                      }
+                    } catch { /* ps not available */ }
+                  }
+
+                  if (processStartTime > 0 && processStartTime > creationTime + 5000) {
+                    // Process started after sentinel creation (5s tolerance for clock skew).
+                    // The PID has been recycled by a different process — treat original as dead.
+                    isPiProcess = false;
+                    procVerifiable = true;
+                  }
                 }
 
                 // --- Linux: /proc/<pid>/cmdline ---
