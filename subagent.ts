@@ -623,7 +623,11 @@ function createWorktree(projectRoot: string, id: string): string {
   // Ensure HEAD is valid (needed for branch creation)
   let headRef: string;
   try { headRef = git(["rev-parse", "--verify", "HEAD"], projectRoot).trim(); }
-  catch { git(["commit", "-m", "pi: placeholder", "--allow-empty"], projectRoot); headRef = git(["rev-parse", "--verify", "HEAD"], projectRoot).trim(); }
+  catch {
+    git(["commit", "-m", "pi: placeholder", "--allow-empty"], projectRoot);
+    try { headRef = git(["rev-parse", "--verify", "HEAD"], projectRoot).trim(); }
+    catch (e: any) { throw new Error(`Failed to resolve HEAD after placeholder commit: ${e.stderr || e.message}`); }
+  }
 
   // Create branch from resolved HEAD ref
   git(["branch", branch, headRef], projectRoot);
@@ -829,6 +833,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     let stderr = "";
     let resolved = false;
     let exitCode: number | null = null;
+    let timedOut = false;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
@@ -848,8 +853,9 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       }
     };
     proc.on("close", (code) => {
-      // Preserve -1 sentinel when timeout killed the process (don't overwrite with null from SIGTERM)
-      if (exitCode !== -1) {
+      // When timeout fired AND the process was killed by signal (null), keep the -1 sentinel.
+      // If the process exited naturally (non-null) concurrent with the timer, trust the real exit code.
+      if (!timedOut || code === null) {
         exitCode = code;
       }
       done();
@@ -877,9 +883,10 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     }
 
     const timer = setTimeout(() => {
-      // Set exitCode sentinel BEFORE kill to prevent a race where the close event
-      // fires between kill and the assignment, capturing the real exit code and
-      // resolving the promise before exitCode = -1 takes effect.
+      // Use a separate timedOut flag instead of setting exitCode = -1 as a sentinel.
+      // This avoids a race where the process exits naturally with code 0 between the
+      // assignment and the close handler firing, permanently masking the real exit code.
+      timedOut = true;
       exitCode = -1;
       stderr = `[sub-process timeout after ${Math.round(killTimeout / 60_000)} min]`;
       try { proc.kill("SIGTERM"); } catch { /* already dead */ }
@@ -1051,6 +1058,7 @@ function spawnSubAgent(
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
     let settled = false;
+    let timedOut = false;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
     let killTimer: NodeJS.Timeout;
@@ -1113,13 +1121,16 @@ function spawnSubAgent(
       }
 
       if (code === null) {
-        // Preserve timeout message if already set by killTimer (don't overwrite with generic signal message)
-        if (!agent.error) {
+        // Use the timedOut flag (set by killTimer) to classify the signal, not string matching
+        // on agent.error. This avoids misclassifying stderr output that happens to start with
+        // "timeout" (e.g., test runner output).
+        if (timedOut) {
+          agent.error = agent.error || `timeout (${Math.round(killTimeout / 60_000)} min)`;
+        } else {
           agent.error = stderr.trim() || "killed by signal";
         }
         cleanupWorktree(root, id, true);
-        // Differentiate timeout (agent.error starts with "timeout") from signal kills
-        const prefix = agent.error.startsWith("timeout") ? "[Sub-agent timeout]" : "[Sub-agent killed by signal]";
+        const prefix = timedOut ? "[Sub-agent timeout]" : "[Sub-agent killed by signal]";
         settle(`${prefix} ${agent.error}\n\nOutput:\n${stdout.trim().substring(0, 3000)}`, "error");
       } else {
         agent.error = stderr.trim() || `exit code ${code}`;
@@ -1155,6 +1166,10 @@ function spawnSubAgent(
     const killTimeout = Math.max(options?.timeoutMs || 1_200_000, 1_200_000);
     killTimer = setTimeout(() => {
       if (agent.status === "running" && !settled) {
+        // Use a boolean flag to indicate timeout, not a string sentinel in agent.error.
+        // The closeHandler checks this flag to classify signal kills vs. timeouts,
+        // avoiding a fragile startsWith("timeout") check on possibly-user-generated stderr.
+        timedOut = true;
         // Escalation: SIGTERM → 10s grace → SIGKILL
         try { proc.kill("SIGTERM"); } catch { /* already dead */ }
         agent.error = `timeout (${Math.round(killTimeout / 60_000)} min)`;
@@ -1899,17 +1914,25 @@ export default function (pi: ExtensionAPI) {
                 let isPiProcess = false;
                 let procVerifiable = false;
 
-                // --- Linux: /proc/<pid>/cmdline ---
-                try {
-                  const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
-                  // Match pi agent process signatures to avoid false positives from
-                  // unrelated processes whose names contain "pi" (pipewire, spice-vdagent, etc.).
-                  // The pi agent's cmdline always contains either dist/cli.js (entry point)
-                  // or path components like /pi/ or pi-agent-core/pi-coding-agent.
-                  isPiProcess = /dist\/cli\.js\b/.test(cmdline) || /(?:^|\/)pi(?=[\/\0\s-]|$)/.test(cmdline);
+                // Quick check: if this PID matches our own process, it's definitely a pi session
+                if (pid === process.pid) {
+                  isPiProcess = true;
                   procVerifiable = true;
-                } catch {
-                  // Not on Linux, or permission denied — try next method
+                }
+
+                // --- Linux: /proc/<pid>/cmdline ---
+                if (!procVerifiable) {
+                  try {
+                    const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
+                    // Match pi agent process signatures to avoid false positives from
+                    // unrelated processes whose names contain "pi" (pipewire, spice-vdagent, etc.).
+                    // The pi agent's cmdline always contains either dist/cli.js (entry point)
+                    // or path components like /pi/ or pi-agent-core/pi-coding-agent.
+                    isPiProcess = /dist\/cli\.js\b/.test(cmdline) || /(?:^|\/)pi(?=[\/\0\s-]|$)/.test(cmdline);
+                    procVerifiable = true;
+                  } catch {
+                    // Not on Linux, or permission denied — try next method
+                  }
                 }
 
                 // --- macOS / BSD: ps -p <pid> -o command= (full command line) ---
@@ -1931,19 +1954,26 @@ export default function (pi: ExtensionAPI) {
                   // verified as NOT pi (recycled PID) → proceed with cleanup
                 } else {
                   // No OS-specific verification available (e.g., Windows without WSL).
-                  // Use timestamp heuristic: if the sentinel is older than 1 hour,
-                  // assume the PID has been recycled and the worktree is stale.
-                  // If recent, conservatively keep the worktree to avoid corrupting
-                  // a still-running (but unverifiable) pi session.
-                  if (Date.now() - creationTime > 3_600_000) {
-                    // Sentinel is >1h old → likely stale, proceed with cleanup
-                  } else {
-                    continue; // recent → conservatively skip
-                  }
+                  // Conservatively skip cleanup when the PID cannot be verified as pi or non-pi.
+                  // Using a timestamp-only heuristic risks nuking worktrees from long-running
+                  // pi sessions (>1h) on platforms where /proc and ps are unavailable.
+                  console.warn(`[subagent] Cannot verify whether PID ${pid} (sentinel ${sentinel}) is a pi process — skipping cleanup to avoid deleting an active worktree.`);
+                  continue;
                 }
               } catch { /* dead, proceed with cleanup */ }
+            } else {
+              // Sentinel file has an unreadable or missing PID (empty file, partial write, corruption).
+              // Do NOT treat this as proof of staleness — it means "cannot determine".
+              // Skipping cleanup is the safer choice to avoid deleting an active worktree.
+              console.warn(`[subagent] Sentinel ${sentinel} has malformed PID (cannot parse): preserving worktree to be safe.`);
+              continue;
             }
-          } catch { /* can't read sentinel, treat as stale and clean up */ }
+          } catch {
+            // Can't read sentinel at all (permissions, fs error). Treat as indeterminate
+            // rather than stale — skip cleanup to be safe.
+            console.warn(`[subagent] Cannot read sentinel ${sentinel}: preserving worktree to be safe.`);
+            continue;
+          }
           const branch = `pi/subagent/${entry}`;
           try {
             git(["worktree", "remove", "--force", wtDir], root);
