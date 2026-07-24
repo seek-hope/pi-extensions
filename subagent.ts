@@ -104,17 +104,11 @@ async function reviewLoop(
   workCwd: string,
   buildReviewTask: (i: number) => string,
   runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
-  maxIterations = 5,
-  commitPrefix = "loop",
-  maxRounds = 20
+  commitPrefix = "loop"
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
-  const totalRounds = Math.min(maxIterations, maxRounds);
-  const softCap = maxIterations;
-  let extended = false;
-
-  for (let i = 1; i <= maxRounds; i++) {
+  for (let i = 1; i <= MAX_ROUNDS; i++) {
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
@@ -161,18 +155,12 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
-
-    // At soft cap, log extension notice and continue
-    if (i === softCap && i < maxRounds && !extended) {
-      extended = true;
-      console.error(`[reviewLoop] ${softCap} rounds reached without CLEAN — extending to ${maxRounds} max`);
-    }
   }
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
   ).join("\n");
-  return { iterations: maxRounds, clean: false, summary: `⚠ MAX ROUNDS (${maxRounds})\n` + summary };
+  return { iterations: MAX_ROUNDS, clean: false, summary: `⚠ MAX ROUNDS (${MAX_ROUNDS})\n` + summary };
 }
 
 // ── Mode Handlers ───────────────────────────────────────────────────────
@@ -180,7 +168,7 @@ async function reviewLoop(
 /**
  * ANALYZE: read-only exploration → review → improve → loop → final report.
  */
-async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): Promise<LoopResult> {
+async function handleAnalyzeMode(task: string, ctxCwd: string): Promise<LoopResult> {
   // Phase 1: initial exploration with cheap model (use sub-process, not worktree)
   const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
   const initR = await runSubProcess(initTask, ctxCwd, _cheapModel);
@@ -215,7 +203,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): P
       if (improved.trim().length > 0) analysis = improved; // update for next review round
       return improved;
     },
-    maxIt, ""
+    ""
   );
   return result;
 }
@@ -225,7 +213,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): P
  */
 async function handleImproveMode(
   targetAgentId: string | null, ctxCwd: string,
-  criteria: string | undefined, maxIt: number,
+  criteria: string | undefined,
   task?: string
 ): Promise<LoopResult> {
   const existing = targetAgentId ? subAgents.get(targetAgentId) : null;
@@ -285,7 +273,6 @@ async function handleImproveMode(
       const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
       return output;
     },
-    maxIt,
     targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "improve"
   );
 }
@@ -295,7 +282,7 @@ async function handleImproveMode(
  * After each item, the sub-agent's branch is auto-merged (on success) or rejected (on failure).
  */
 async function handleExecuteMode(
-  items: { description: string }[], ctxCwd: string, maxIt: number
+  items: { description: string }[], ctxCwd: string
 ): Promise<{ results: string[]; allClean: boolean }> {
   const results: string[] = [];
   let allClean = true;
@@ -320,7 +307,7 @@ async function handleExecuteMode(
           cleanupWorktree(root, execId, true);
         } else {
           try {
-            const ir = await handleImproveMode(execId, ctxCwd, undefined, maxIt);
+            const ir = await handleImproveMode(execId, ctxCwd, undefined);
             results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
             if (!ir.clean) allClean = false;
             // Auto-merge the improved branch into main
@@ -616,6 +603,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
 // ── depth tracking ─────────────────────────────────────────────────────────
 
 const MAX_DEPTH = 5;
+const MAX_ROUNDS = 20;
 
 function currentDepth(): number {
   const d = parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10);
@@ -901,15 +889,13 @@ export default function (pi: ExtensionAPI) {
       timeoutMs: Type.Optional(Type.Number({ description: "Max runtime ms (min: 20 min, default: 20 min)" })),
       subagentId: Type.Optional(Type.String({ description: "Target sub-agent ID to improve (any source). If omitted, improves current codebase." })),
       criteria: Type.Optional(Type.String({ description: "Review criteria (improve mode)" })),
-      maxIterations: Type.Optional(Type.Number({ description: "Max review-action rounds (default: 5). Will auto-extend to 20 if not clean." })),
       todoItems: Type.Optional(Type.String({ description: "JSON array of {description: string} (execute mode)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const maxIt = Math.min(params.maxIterations || 20, 20);
 
       // ── ANALYZE mode ────────────────────────────────────────────────
       if (params.mode === "analyze") {
-        const result = await handleAnalyzeMode(params.task, ctx.cwd, maxIt);
+        const result = await handleAnalyzeMode(params.task, ctx.cwd);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
       }
 
@@ -918,12 +904,12 @@ export default function (pi: ExtensionAPI) {
         // If no subagentId, improve the current codebase directly (no worktree)
         // This avoids cross-repo mismatch when extensions live in a different git repo
         if (!params.subagentId) {
-          const result = await handleImproveMode(null, ctx.cwd, params.criteria, maxIt, params.task);
+          const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
         // If subagentId provided, improve the target sub-agent's worktree
-        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, maxIt);
+        const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria);
         try {
           const ag = subAgents.get(params.subagentId);
           if (ag && ag.status !== "running") {
@@ -955,7 +941,7 @@ export default function (pi: ExtensionAPI) {
         if (items.length === 0) {
           return { content: [{ type: "text", text: "No todo items provided." }], details: {}, isError: true };
         }
-        const result = await handleExecuteMode(items, ctx.cwd, maxIt);
+        const result = await handleExecuteMode(items, ctx.cwd);
         const summary = [
           `┌─ Execute Complete ──────────────────────`,
           ...result.results.map(r => `│ ${r}`),
