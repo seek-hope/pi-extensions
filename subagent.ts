@@ -38,6 +38,10 @@ const subAgents = new Map<string, SubAgent>();
 /** Eviction age: terminal-state agents older than this are auto-removed from the map */
 const EVICTION_AGE_MS = 10 * 60 * 1000; // 10 minutes
 
+/** Throttle eviction calls to avoid excessive filesystem I/O */
+let _lastEvictTime = 0;
+const EVICT_THROTTLE_MS = 10_000;
+
 /** Remove stale terminal-state agents from the map to prevent unbounded growth */
 function evictTerminalAgents(): void {
   const now = Date.now();
@@ -113,7 +117,7 @@ function refreshModels() {
     }
   } catch (e: any) {
     // Settings file may not exist yet, or may contain invalid JSON
-    console.debug("subagent: failed to load settings.json", e.message);
+    console.warn("subagent: failed to load settings.json", e.message);
   }
 }
 
@@ -550,8 +554,10 @@ async function handleExecuteMode(
         if (branchExists && hasUnmergedCommits) {
           results.push(`${i + 1}. ${item.description}: ⚠ evicted but had committed work (branch preserved)`);
         } else if (branchExists) {
-          results.push(`${i + 1}. ${item.description}: ✗ failed (no agent record)`);
-          allClean = false;
+          // Branch exists but has no unmerged commits — agent either completed
+          // with no changes ("no-changes" from commitWorktree) or was already
+          // merged. Either way this is not a failure.
+          results.push(`${i + 1}. ${item.description}: ✅ completed (no uncommitted changes)`);
         } else {
           // Branch doesn't exist at all → already merged and cleaned up, report as completed
           results.push(`${i + 1}. ${item.description}: ✅ already merged (evicted)`);
@@ -1498,8 +1504,8 @@ export default function (pi: ExtensionAPI) {
 
         // If no subagentId, improve the current codebase directly (no worktree)
         // This avoids cross-repo mismatch when extensions live in a different git repo
-        // Only treat undefined/null as "no subagentId" — empty string is an invalid ID
-        if (params.subagentId === undefined || params.subagentId === null) {
+        // Treat undefined, null, empty, or whitespace-only as "no subagentId"
+        if (params.subagentId === undefined || params.subagentId === null || params.subagentId.trim() === "") {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey);
           if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
@@ -2281,6 +2287,11 @@ export default function (pi: ExtensionAPI) {
         try { ag.proc?.kill("SIGKILL"); } catch { /* process may have already exited */ }
       }
     }
+    // Yield to event loop so close handlers of killed processes can fire and settle
+    // before we clear the map. Without this, a closeHandler's resolve() call could
+    // race with subAgents.clear(), potentially leaving stale agent references in
+    // running promise chains.
+    await new Promise(r => setTimeout(r, 200));
     // Don't auto-cleanup worktrees — they contain committed work that may be valuable
     subAgents.clear();
   });
