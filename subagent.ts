@@ -113,7 +113,7 @@ async function reviewLoop(
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
-    const r = await runSubProcess(reviewTask, ctxCwd, _defaultModel, "read,bash");
+    const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash");
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
 
     // Abort if reviewer crashed or produced no output
