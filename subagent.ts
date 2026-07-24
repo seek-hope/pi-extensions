@@ -155,7 +155,7 @@ async function reviewLoop(
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
     // Update todo progress if bridge available
     const tb = (globalThis as any).__pi_todo;
-    if (tb) tb.updateItemByContent(todoMatchKey || "improve:", "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
+    if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
 
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
@@ -199,7 +199,7 @@ async function reviewLoop(
 
     if (isClean) {
       console.error(`[improve] ✅ CLEAN after ${i} rounds`);
-      if (tb) tb.updateItemByContent(todoMatchKey || "improve:", "completed", `✅ improve: clean after ${i} rounds`);
+      if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "completed", `✅ improve: clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -216,7 +216,7 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb) tb.updateItemByContent(todoMatchKey || "improve:", "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} issue(s)`);
+    if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey || "improve:"}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} issue(s)`);
     // Detect fixer failure — empty output or spawn errors
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
@@ -365,7 +365,7 @@ async function handleImproveMode(
       }
       return output;
     },
-    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
+    targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "improve",
     signal,
     todoMatchKey
   );
@@ -654,21 +654,30 @@ function getDiff(projectRoot: string, id: string): string {
  *  Callers should check for empty hash to detect failure. */
 function commitWorktree(worktreePath: string, id: string, task: string): string {
   const msg = id ? `pi: ${id} — ${task.substring(0, 80)}` : `pi: ${task.substring(0, 80)}`;
-  // Try to commit directly within the worktree path if it's a git repo
-  if (!existsSync(join(worktreePath, ".git"))) return "";
-  try {
-    if (gitQuiet(["status", "--porcelain"], worktreePath).trim()) {
-      // Use git() (throws on error) so failures propagate to the outer catch
-      // and are not silently swallowed as they would be with gitQuiet.
-      git(["add", "-A"], worktreePath);
-      git(["commit", "-m", msg], worktreePath);
-    }
-    // Capture any commit hash (including commits made by the sub-agent process)
-    return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
-  } catch (e: any) {
-    console.warn(`  \u26a0 commitWorktree failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
-    return "";
+  let lastHash = "";
+
+  // CRITICAL: The extensions dir is a NESTED git repo separate from the home dir.
+  // Changes are always in the extensions repo. The home repo only hosts worktrees.
+  // DO NOT REMOVE this — the worktreePath (home dir) .git is a different repo!
+  const exts = join(homedir(), ".pi", "agent", "extensions");
+  const repos = [exts];
+  if (worktreePath && existsSync(join(worktreePath, ".git"))) {
+    repos.push(worktreePath);
   }
+
+  for (const repo of [...new Set(repos)]) {
+    if (!existsSync(join(repo, ".git"))) continue;
+    try {
+      if (gitQuiet(["status", "--porcelain"], repo).trim()) {
+        gitQuiet(["add", "-A"], repo);
+        gitQuiet(["commit", "-m", msg], repo);
+        lastHash = gitQuiet(["rev-parse", "--short", "HEAD"], repo).trim() || lastHash;
+      }
+    } catch (e: any) {
+      console.error(`commitWorktree failed in ${repo}: ${(e.message || e).substring(0, 200)}`);
+    }
+  }
+  return lastHash;
 }
 
 /** Clean up worktree and optionally the branch */
@@ -1167,13 +1176,13 @@ export default function (pi: ExtensionAPI) {
         // This avoids cross-repo mismatch when extensions live in a different git repo
         if (!params.subagentId) {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey);
-          if (tb) tb.updateItemByContent(todoMatchKey, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+          if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
         // If subagentId provided, improve the target sub-agent's worktree
         const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, undefined, _signal, todoMatchKey);
-        if (tb) tb.updateItemByContent(todoMatchKey, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         // Only auto-merge when the improve loop completed cleanly; failed loops leave the branch for review
         if (result.clean) {
           try {

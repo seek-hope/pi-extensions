@@ -8,17 +8,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, readdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 const SOCKET_DIR = join(homedir(), ".ssh", "pi-sockets");
+const REMOTE_TASKS_FILE = join(SOCKET_DIR, "remote-tasks.json");
 
 interface PendingEntry {
   resolve: (v: string) => void;
   reject: (e: Error) => void;
   rand: string;
   timer: ReturnType<typeof setTimeout> | null;
+  onProcExit: (code: number | null) => void;
+  onStdinError: (err: Error) => void;
+  bufAtWrite: string;
 }
 
 interface Connection {
@@ -44,19 +48,42 @@ interface RemoteBgTask {
   cmd: string;
   pid: string | null;
   startTime: number;
-  active: boolean; // whether a poll loop is currently running for this task
 }
 const remoteTasks: RemoteBgTask[] = [];
 
+function saveRemoteTasks(): void {
+  try {
+    mkdirSync(SOCKET_DIR, { recursive: true });
+    writeFileSync(REMOTE_TASKS_FILE, JSON.stringify(remoteTasks, null, 2));
+  } catch { /* best effort */ }
+}
+
+function loadRemoteTasks(): void {
+  try {
+    if (existsSync(REMOTE_TASKS_FILE)) {
+      const data = readFileSync(REMOTE_TASKS_FILE, "utf-8");
+      const loaded = JSON.parse(data);
+      if (Array.isArray(loaded)) {
+        remoteTasks.length = 0;
+        for (const t of loaded) {
+          remoteTasks.push(t);
+        }
+      }
+    }
+  } catch { /* best effort */ }
+}
+
+const pollRemoteActive = new Set<string>();
+
 // Poll remote background task and inject result when done
-function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: string, pid: string | null): void {
+function pollRemoteTask(logPath: string, cmd: string, host: string, pid: string | null): void {
   // Prevent duplicate poll loops for the same task
+  if (pollRemoteActive.has(logPath)) return; // already polling
+  pollRemoteActive.add(logPath);
   const existing = remoteTasks.find(t => t.logPath === logPath);
-  if (existing) {
-    if (existing.active) return; // already polling
-    existing.active = true;
-  } else {
-    remoteTasks.push({ host, logPath, cmd, pid, startTime: Date.now(), active: true });
+  if (!existing) {
+    remoteTasks.push({ host, logPath, cmd, pid, startTime: Date.now() });
+    saveRemoteTasks();
   }
 
   let lastSize = 0;
@@ -64,21 +91,70 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
   let errors = 0;
   const MAX_ERRORS = 5; // ~25s of failures before giving up
   let stopped = false;
+  const MAX_POLLS = 720; // 720 * 5s ≈ 60 min max polling duration per task
+  let pollCount = 0;
 
   function cleanup() {
     if (!stopped) {
       stopped = true;
-      const idx = remoteTasks.findIndex(t => t.logPath === logPath);
-      if (idx >= 0) remoteTasks.splice(idx, 1);
       try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
     }
+    const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+    if (idx >= 0) { remoteTasks.splice(idx, 1); saveRemoteTasks(); }
+    pollRemoteActive.delete(logPath);
   }
 
-  function check() {
+  async function check() {
     if (stopped) return;
+    // If pollRemoteActive no longer has this logPath, session_shutdown cleared it.
+    if (!pollRemoteActive.has(logPath)) { stopped = true; return; }
+    pollCount++;
+    if (pollCount > MAX_POLLS) {
+      // Maximum polling duration reached — force-stop polling and retrieve whatever output exists
+      stopped = true;
+      try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+      const conn4 = await findConnection(host);
+      const doCleanup = () => {
+        pollRemoteActive.delete(logPath);
+        const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+        if (idx >= 0) { remoteTasks.splice(idx, 1); saveRemoteTasks(); }
+      };
+      if (conn4 && await isConnectedAsync(conn4.key, true)) {
+        conn4.lastUse = Date.now();
+        shellExec(conn4, `cat '${logPath}' 2>/dev/null || echo '(unavailable)'`, 15_000).then(output => {
+          doCleanup();
+          if (_sshPi) {
+            _sshPi.sendUserMessage([
+              { type: "text", text: `[SSH background task on ${host} reached max polling duration (60 min)]` },
+              { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+              { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
+            ], { deliverAs: "followUp" });
+          }
+        }).catch(() => {
+          doCleanup();
+          if (_sshPi) {
+            _sshPi.sendUserMessage([
+              { type: "text", text: `[SSH background task on ${host} reached max polling duration (60 min)]` },
+              { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+              { type: "text", text: `Log on remote: ${logPath}` },
+            ], { deliverAs: "followUp" });
+          }
+        });
+      } else if (_sshPi) {
+        doCleanup();
+        _sshPi.sendUserMessage([
+          { type: "text", text: `[SSH background task on ${host} reached max polling duration (60 min), connection lost]` },
+          { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+          { type: "text", text: `Log on remote: ${logPath}` },
+        ], { deliverAs: "followUp" });
+      } else {
+        doCleanup();
+      }
+      return;
+    }
     // Verify connection still alive before polling
-    const conn2 = findConnection(host);
-    if (!conn2 || !isConnected(conn2.key)) {
+    const conn2 = await findConnection(host);
+    if (!conn2 || !(await isConnectedAsync(conn2.key, true))) {
       // Connection lost — task result unreachable; log path is all we can report
       if (_sshPi) {
         _sshPi.sendUserMessage([
@@ -90,6 +166,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       cleanup();
       return;
     }
+    conn2.lastUse = Date.now();
     shellExec(conn2, `wc -c < '${logPath}' 2>/dev/null || echo 0`, 10_000).then(result => {
       if (stopped) return;
       const size = parseInt(result.trim(), 10) || 0;
@@ -99,6 +176,7 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
         if (unchanged >= 5) {
           // Check if the background PID (if known) is still alive
           const pidCheck = pid ? `kill -0 ${pid} 2>/dev/null && echo alive || echo dead` : "echo unknown";
+          conn2.lastUse = Date.now();
           shellExec(conn2, pidCheck, 8_000).then(pidResult => {
             if (stopped) return;
             const stillAlive = pidResult.trim() === "alive";
@@ -109,11 +187,11 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
               setTimeout(check, 5000);
             } else {
               // Process is dead (or PID unknown and size stable for long enough)
-              declareDone(conn2);
+              return declareDone(conn2);
             }
           }).catch(() => {
             // PID check failed — assume done since size is stable
-            declareDone(conn2);
+            return declareDone(conn2);
           });
           return;
         }
@@ -144,15 +222,15 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
     });
   }
 
-  function declareDone(c: Connection) {
+  async function declareDone(c: Connection) {
     if (stopped) return;
     stopped = true;
     try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
+    pollRemoteActive.delete(logPath);
     const idx = remoteTasks.findIndex(t => t.logPath === logPath);
-    if (idx >= 0) remoteTasks.splice(idx, 1);
+    if (idx >= 0) { remoteTasks.splice(idx, 1); saveRemoteTasks(); }
     // Re-verify connection before fetching the log
-    const conn3 = findConnection(host);
-    if (!conn3 || !isConnected(conn3.key)) {
+    if (!c || !(await isConnectedAsync(c.key))) {
       if (_sshPi) {
         _sshPi.sendUserMessage([
           { type: "text", text: `[SSH background task completed on ${host} but connection lost]` },
@@ -162,7 +240,8 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
       }
       return;
     }
-    shellExec(conn3, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
+    c.lastUse = Date.now();
+    shellExec(c, `cat '${logPath}' 2>/dev/null`, 15_000).then(output => {
       if (_sshPi) {
         _sshPi.sendUserMessage([
           { type: "text", text: `[SSH background task completed on ${host}]` },
@@ -170,7 +249,19 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
           { type: "text", text: `Output:\n${output.substring(0, 4000)}` },
         ], { deliverAs: "followUp" });
       }
-    }).catch(() => {});
+    }).catch(() => {
+      // cat failed — notify user with log path so they can try manually
+      try {
+        if (_sshPi) {
+          _sshPi.sendUserMessage([
+            { type: "text", text: `[SSH background task completed on ${host} but output could not be retrieved]` },
+            { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+            { type: "text", text: `The cat command failed when trying to read the log. Log on remote: ${logPath}` },
+            { type: "text", text: `Try manually: ssh_exec("${host}", "cat '${logPath}'")` },
+          ], { deliverAs: "followUp" });
+        }
+      } catch { /* best effort */ }
+    }).catch(() => { /* ignore terminal errors */ });
   }
 
   setTimeout(check, 3000);
@@ -214,9 +305,20 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
       else { return null; } // -p without port value: invalid
     }
     else if (p.startsWith("-")) {
-      // Only consume next token as value if this flag is known to take values
+      // Handle no-space syntax: -p22, -i~/.ssh/id_rsa, -oStrictHostKeyChecking=no
       const flag = p.replace(/^-+/, "");
-      if (VALUE_FLAGS.has(flag) && i + 1 < parts.length && !parts[i + 1].startsWith("-")) { i += 2; }
+      if (flag.length > 1 && VALUE_FLAGS.has(flag[0])) {
+        const value = flag.substring(1);
+        if (flag[0] === "p") { const v = parseInt(value); if (!isNaN(v)) port = v; }
+        else if (flag[0] === "l" && !user) { user = value; }
+        i += 1;
+      }
+      else if (VALUE_FLAGS.has(flag) && i + 1 < parts.length && !parts[i + 1].startsWith("-")) {
+        const value = parts[i + 1];
+        if (flag === "p") { const v = parseInt(value); if (!isNaN(v)) port = v; }
+        else if (flag === "l" && !user) { user = value; }
+        i += 2;
+      }
       else { i += 1; }
     }
     else if (p.includes("@")) {
@@ -263,10 +365,20 @@ function ensureShell(conn: Connection): void {
   // Already alive — don't reset
   // Must check both exitCode and signalCode: exitCode is null while running OR when
   // killed by a signal, while signalCode is only set when killed by a signal.
-  if (conn.proc && conn.proc.exitCode === null && conn.proc.signalCode === null && conn.proc.stdin?.writable) return;
+  // Use .destroyed and .writableEnded instead of .writable — .writable is false
+  // during backpressure (buffer full, drain pending), which would falsely trigger
+  // a shell restart and lose in-flight commands.
+  if (conn.proc && conn.proc.exitCode === null && conn.proc.signalCode === null &&
+      conn.proc.stdin && !conn.proc.stdin.destroyed && !conn.proc.stdin.writableEnded) return;
 
   // Clean up dead/dying proc
   if (conn.proc) {
+    // Remove stream-level listeners (data, error) on stdout/stderr — these are
+    // separate EventEmitters not covered by proc.removeAllListeners().
+    // If left attached, buffered pipe data from the old process can fire 'data'
+    // events after replacement, corrupting conn.buf with stale output.
+    conn.proc.stdout?.removeAllListeners();
+    conn.proc.stderr?.removeAllListeners();
     conn.proc.removeAllListeners();
     try { conn.proc.kill(); } catch { /* ok */ }
     conn.proc = null;
@@ -325,15 +437,31 @@ function extractResponses(conn: Connection): void {
   // Safety: if buffer grows too large without a valid marker, truncate from front
   const MAX_BUF = 2 * 1024 * 1024; // 2 MB
   if (conn.buf.length > MAX_BUF) {
-    // Find the last valid marker or keep the most recent data
-    const lastMarker = conn.buf.lastIndexOf("__END__");
-    if (lastMarker > 0) {
-      // Discard everything before the last marker (stale data)
-      conn.buf = conn.buf.substring(lastMarker);
+    // Find the last VALID marker (matching a real pending entry) to truncate from,
+    // rather than using lastIndexOf("__END__") which can match orphan text in command output.
+    let truncatePos = -1;
+    const markerRegex = /__END__(\d+)_(\w+):(\d+)\n/g;
+    let match;
+    while ((match = markerRegex.exec(conn.buf)) !== null) {
+      const reqId = parseInt(match[1], 10);
+      const rand = match[2];
+      const p = conn.pending.get(reqId);
+      if (p && p.rand === rand) {
+        truncatePos = match.index;
+      }
+    }
+    if (truncatePos > 0) {
+      // Discard everything before the last valid marker (stale data)
+      conn.buf = conn.buf.substring(truncatePos);
     } else {
-      // No marker at all — keep the most recent 1 MB to avoid losing a pending marker
+      // No marker at all — keep the most recent 1 MB to avoid losing a pending marker.
+      // Align truncation to the nearest newline boundary so we never split a
+      // partially-received __END__ marker across the discarded/kept boundary.
       const keep = Math.floor(MAX_BUF / 2);
-      conn.buf = conn.buf.substring(conn.buf.length - keep);
+      const discardEnd = conn.buf.length - keep;
+      const lastNewline = conn.buf.lastIndexOf('\n', discardEnd);
+      const truncateFrom = lastNewline >= 0 ? lastNewline + 1 : discardEnd;
+      conn.buf = conn.buf.substring(truncateFrom);
     }
   }
   while (true) {
@@ -350,6 +478,11 @@ function extractResponses(conn: Connection): void {
       conn.buf = conn.buf.substring(idx + m[0].length);
       conn.pending.delete(reqId);
       if (p.timer) clearTimeout(p.timer);
+      // Remove per-command listeners to prevent unbounded accumulation
+      if (conn.proc) {
+        conn.proc.removeListener("exit", p.onProcExit);
+        conn.proc.stdin?.removeListener("error", p.onStdinError);
+      }
       p.resolve(output);
     } else {
       // Rand mismatch or orphaned marker — remove only the marker text itself
@@ -364,7 +497,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
   return new Promise((resolve, reject) => {
     ensureShell(conn);
     // Re-check: the process may have exited between ensureShell and now
-    if (!conn.proc || conn.proc.exitCode !== null || !conn.proc.stdin?.writable) {
+    if (!conn.proc || conn.proc.exitCode !== null || conn.proc.signalCode !== null || !conn.proc.stdin || conn.proc.stdin.destroyed || conn.proc.stdin.writableEnded) {
       reject(new Error("SSH shell not available"));
       return;
     }
@@ -372,14 +505,22 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     const rand = Math.random().toString(36).slice(2, 10);
     let settled = false;
     const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+    // Shared cleanup: remove per-command listeners to prevent unbounded accumulation
+    const cleanupListeners = () => {
+      if (conn.proc) {
+        conn.proc.removeListener("exit", onProcExit);
+        conn.proc.stdin?.removeListener("error", onStdinError);
+      }
+    };
 
     const timer = setTimeout(() => {
       done(() => {
+        cleanupListeners();
         if (conn.pending.has(reqId)) {
           const entry = conn.pending.get(reqId)!;
           conn.pending.delete(reqId);
           if (entry.timer) clearTimeout(entry.timer);
-          const partial = conn.buf;
+          const partial = conn.buf || entry.bufAtWrite;
           entry.reject(new Error(`SSH command timeout after ${timeout / 1000}s. Partial output: ${partial.substring(0, 1000)}`));
         }
       });
@@ -389,6 +530,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     const onStdinError = (err: Error) => {
       done(() => {
         clearTimeout(timer);
+        cleanupListeners();
         conn.pending.delete(reqId);
         reject(new Error(`SSH stdin error: ${err.message}`));
       });
@@ -399,24 +541,27 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     const onProcExit = (code: number | null) => {
       done(() => {
         clearTimeout(timer);
+        cleanupListeners();
         conn.pending.delete(reqId);
-        reject(new Error(`SSH shell exited (code ${code}) before command could be written`));
+        reject(new Error(`SSH shell exited (code ${code}) unexpectedly`));
       });
       // Remove drain listener to prevent listener leak when process exits
       // before drain fires (backpressure case).
-      conn.proc?.stdin?.removeListener("drain", onDrain);
+      if (onDrain) conn.proc?.stdin?.removeListener("drain", onDrain);
     };
     conn.proc.once("exit", onProcExit);
 
     conn.proc.stdin!.once("error", onStdinError);
 
-    conn.pending.set(reqId, { resolve, reject, rand, timer });
+    const bufAtWrite = conn.buf;
+    conn.pending.set(reqId, { resolve, reject, rand, timer, onProcExit, onStdinError, bufAtWrite });
 
     // Pass command directly via stdin — the shell reads lines and executes them
     // Don't wrap in quotes (that would treat semicolons literally)
+    let onDrain: (() => void) | undefined;
     try {
       const wrote = conn.proc.stdin!.write(`${cmd}\necho __END__${reqId}_${rand}:$?\n`);
-      const onDrain = () => {
+      onDrain = () => {
         // Data flushed successfully — response will arrive via extractResponses.
         // Listeners remain active; done() prevents double-settle.
       };
@@ -433,43 +578,64 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
     } catch (writeErr: any) {
       done(() => {
         clearTimeout(timer);
+        cleanupListeners();
         conn.pending.delete(reqId);
         reject(new Error(`SSH write failed: ${writeErr.message}`));
       });
-      conn.proc?.removeListener("exit", onProcExit);
-      conn.proc?.stdin?.removeListener("error", onStdinError);
-      conn.proc?.stdin?.removeListener("drain", onDrain);
+      if (onDrain) conn.proc?.stdin?.removeListener("drain", onDrain);
     }
   });
 }
 
 // ── connection management ───────────────────────────────────────────────────
 
-function isConnected(key: string): boolean {
-  // Try new format first (user@host:port.sock), then legacy (_-encoded)
+// Async version of isConnected — does not block the event loop with spawnSync.
+// Used by the background task poll loop to avoid blocking other async work.
+function spawnAsync(cmd: string, args: string[], options: { timeout: number }): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stderr.on("error", () => {});
+    const timer = setTimeout(() => { child.kill(); reject(new Error("timed out")); }, options.timeout);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ status: code, stdout, stderr });
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+async function isConnectedAsync(key: string, quick = false): Promise<boolean> {
   let sock = socketPath(key);
   if (!existsSync(sock)) {
     const legacySock = join(SOCKET_DIR, key.replace(/[@:]/g, "_") + ".sock");
     if (existsSync(legacySock)) sock = legacySock;
     else return false;
   }
+  const timeout = quick ? 2_000 : 5_000;
   try {
-    const result = spawnSync("ssh", ["-o", `ControlPath=${sock}`, "-O", "check", "x"], {
-      encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 5_000
-    });
+    const result = await spawnAsync("ssh", ["-o", `ControlPath=${sock}`, "-O", "check", "x"], { timeout });
     if (result.status === 0) return true;
-    const combined = (result.stdout || "") + (result.stderr || "");
+    const combined = result.stdout + result.stderr;
     return /master running/i.test(combined);
+  } catch {
+    return false;
   }
-  catch { return false; }
 }
 
-function connect(alias: string, user: string, hostname: string, port: number, ctx: any): void {
+async function connect(alias: string, user: string, hostname: string, port: number, ctx: any): Promise<void> {
   const key = connKey(user, hostname, port);
   const sock = socketPath(key);
   const sshTarget = targetStr(alias, user, hostname, port);
   // Re-check right before connecting (master may have died since last check)
-  const alreadyUp = isConnected(key);
+  const alreadyUp = await isConnectedAsync(key);
   if (alreadyUp) {
     if (!connections.has(key)) addConn(key, alias, sock, sshTarget);
     ctx.ui.notify(`Already connected to ${user}@${hostname}:${port}.`, "info");
@@ -503,10 +669,10 @@ function connect(alias: string, user: string, hostname: string, port: number, ct
   });
   ctx.ui.setStatus("ssh-" + key, `Waiting...`);
   let tries = 0;
-  function poll() {
+  async function poll() {
     if (!connectPolling) return;
     tries++;
-    if (isConnected(key)) { addConn(key, alias, sock, sshTarget); ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify(`Connected.`, "info"); return; }
+    if (await isConnectedAsync(key)) { connectPolling = false; addConn(key, alias, sock, sshTarget); ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify(`Connected.`, "info"); return; }
     if (tries < 10) { ctx.ui.setStatus("ssh-" + key, `Waiting... (${tries * 2}s)`); setTimeout(poll, 2000); }
     else { ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify("Timeout.", "warning"); }
   }
@@ -527,41 +693,73 @@ function keyFromFilename(name: string): string {
   return `${raw.substring(0, i1)}@${raw.substring(i1 + 1, i2)}:${raw.substring(i2 + 1)}`;
 }
 
-function syncFromDisk(): void {
+async function syncFromDiskAsync(): Promise<void> {
   if (!existsSync(SOCKET_DIR)) return;
   try {
     const entries = readdirSync(SOCKET_DIR);
+    const checks: Promise<void>[] = [];
     for (const name of entries) {
       if (!name.endsWith(".sock")) continue;
       const sock = join(SOCKET_DIR, name);
-      try {
-        // Quick check with short timeout
-        const result = spawnSync("ssh", ["-O", "check", "-o", `ControlPath=${sock}`, "x"], {
-          encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000
-        });
-        const combined = (result.stdout || "") + (result.stderr || "");
-        if (result.status !== 0 && !/master running/i.test(combined)) {
-          // Master dead — clean up stale socket
+      checks.push((async () => {
+        try {
+          const result = await spawnAsync("ssh", ["-O", "check", "-o", `ControlPath=${sock}`, "x"], { timeout: 5000 });
+          const combined = result.stdout + result.stderr;
+          if (result.status !== 0 && !/master running/i.test(combined)) {
+            try { rmSync(sock); } catch { /* ok */ }
+            return;
+          }
+          const key = keyFromFilename(name);
+          if (![...connections.values()].some(c => c.socket === sock)) {
+            const [uh, pt] = key.split(":");
+            addConn(key, uh, sock, pt && pt !== "22" ? `-p ${pt} ${uh}` : uh);
+          }
+        } catch (syncErr: any) {
+          if (syncErr.code === 'ENOENT' || syncErr.code === 'EACCES') return;
           try { rmSync(sock); } catch { /* ok */ }
-          continue;
         }
-        const key = keyFromFilename(name);
-        if (![...connections.values()].some(c => c.socket === sock)) {
-          const [uh, pt] = key.split(":");
-          addConn(key, uh, sock, pt && pt !== "22" ? `-p ${pt} ${uh}` : uh);
-        }
-      } catch (syncErr: any) {
-        // Don't delete socket on transient spawn errors (ssh not found, permission denied)
-        if (syncErr.code === 'ENOENT' || syncErr.code === 'EACCES') continue;
-        // For other errors (e.g., SSH connection issues), remove stale socket
-        try { rmSync(sock); } catch { /* ok */ }
-      }
+      })());
     }
+    await Promise.all(checks);
   } catch { /* empty */ }
+  // Prune stale in-memory connections
+  const pruneChecks: Promise<void>[] = [];
+  for (const [key, conn] of connections) {
+    pruneChecks.push((async () => {
+      const sockExists = existsSync(conn.socket);
+      if (!sockExists) {
+        if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
+        for (const [, p] of conn.pending) {
+          if (p.timer) clearTimeout(p.timer);
+          try { p.reject(new Error("Connection pruned (socket missing)")); } catch { /* ok */ }
+        }
+        conn.pending.clear();
+        connections.delete(key);
+        return;
+      }
+      try {
+        const result = await spawnAsync("ssh", ["-o", `ControlPath=${conn.socket}`, "-O", "check", "x"], { timeout: 2000 });
+        const combined = result.stdout + result.stderr;
+        if (result.status !== 0 && !/master running/i.test(combined)) {
+          if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
+          for (const [, p] of conn.pending) {
+            if (p.timer) clearTimeout(p.timer);
+            try { p.reject(new Error("Connection pruned (master dead)")); } catch { /* ok */ }
+          }
+          conn.pending.clear();
+          try { rmSync(conn.socket); } catch { /* ok */ }
+          connections.delete(key);
+        }
+      } catch {
+        // Transient error — leave the entry in place
+      }
+    })());
+  }
+  await Promise.all(pruneChecks);
 }
 
-function findConnection(host: string): Connection | undefined {
-  syncFromDisk();
+async function findConnection(host: string): Promise<Connection | undefined> {
+  await syncFromDiskAsync();
   const s = host.toLowerCase();
   // Exact match first: alias or key
   for (const [, c] of connections) {
@@ -638,6 +836,7 @@ function destroyConn(key: string, c: Connection, ctx: any): void {
       remoteTasks.splice(i, 1);
     }
   }
+  saveRemoteTasks();
   ctx.ui.notify(`Closed ${c.key}.`, "info");
 }
 
@@ -668,14 +867,14 @@ export default function (pi: ExtensionAPI) {
     description: "SSH with persistent connections. /ssh [-p PORT] user@host [command]  |  status  |  close <host>",
     handler: async (args, ctx) => {
       if (!args?.trim()) { ctx.ui.notify("/ssh [-p PORT] user@host [command]", "warning"); return; }
-      if (args.trim() === "status") { syncFromDisk(); showStatus(ctx); return; }
+      if (args.trim() === "status") { await syncFromDiskAsync(); await showStatus(ctx); return; }
       if (args.trim().startsWith("close ")) { closeConn(args.trim().slice(6).trim(), ctx); return; }
       const p = parseArgs(args);
       if (!p) { ctx.ui.notify("Invalid syntax.", "error"); return; }
       if (p.command) {
-        runRemote(p.alias, p.user, p.hostname, p.port, p.command, ctx);
+        await runRemote(p.alias, p.user, p.hostname, p.port, p.command, ctx);
       } else {
-        connect(p.alias, p.user, p.hostname, p.port, ctx);
+        await connect(p.alias, p.user, p.hostname, p.port, ctx);
       }
     },
   });
@@ -712,12 +911,14 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      syncFromDisk();
-      const conn = findConnection(params.host);
+      if (!params.host || !params.host.trim()) {
+        return { content: [{ type: "text", text: "Host is required — specify an SSH host alias." }], details: {}, isError: true };
+      }
+      const conn = await findConnection(params.host);
       if (!conn) {
         return { content: [{ type: "text", text: `No connection matching "${params.host}". Connect: /ssh ${params.host}` }], details: {}, isError: true };
       }
-      if (!isConnected(conn.key)) {
+      if (!(await isConnectedAsync(conn.key))) {
         if (conn.proc) { try { conn.proc.kill(); } catch { /* ok */ } }
         connections.delete(conn.key);
         // Clean up stale socket
@@ -725,18 +926,33 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Connection stale. Reconnect: /ssh ${conn.alias}` }], details: {}, isError: true };
       }
       try {
+        // Reject non-positive timeout values early before any parsing
+        if (typeof params.timeout === "number" && params.timeout <= 0) {
+          return { content: [{ type: "text", text: `Invalid timeout: ${params.timeout}. Timeout must be a positive number (ms) or a string like '60s'.` }], details: {}, isError: true };
+        }
+        if (typeof params.timeout === "string" && /^\s*-/.test(params.timeout)) {
+          return { content: [{ type: "text", text: `Invalid timeout: "${params.timeout}". Timeout must be a positive value like '60s' or '10000'.` }], details: {}, isError: true };
+        }
         // Block timeouts >300s — model must explicitly use background mode for long tasks
-        let effectiveTimeout: number | undefined = typeof params.timeout === "number" && params.timeout > 0 ? params.timeout : undefined;
+        let effectiveTimeout: number | undefined = typeof params.timeout === "number" && Number.isFinite(params.timeout) && params.timeout > 0 ? params.timeout : undefined;
         // Handle string timeouts like "10000s" or "10m" that models sometimes pass
         if (effectiveTimeout === undefined && typeof params.timeout === "string") {
-          const m = (params.timeout as string).match(/^(\d+(?:\.\d+)?)\s*(s|m|h|ms)?$/i);
+          const m = (params.timeout as string).trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i);
           if (m) {
             const val = parseFloat(m[1]);
-            // Default to seconds when no unit given — models are far more likely
-            // to write "300" meaning 300s than 300ms.
-            const unit = (m[2] || "s").toLowerCase();
+            // Reject zero and negative values in string format (e.g., "0", "0s", "0ms")
+            if (val <= 0) {
+              return { content: [{ type: "text", text: `Invalid timeout: "${params.timeout}". Timeout must be a positive value like '60s' or '10000'.` }], details: {}, isError: true };
+            }
+            // Default to milliseconds when no unit given — numeric paths treat values
+            // as ms, and bare strings like "30000" are more likely intended as 30s.
+            // Explicit suffixes ("10s", "5m", "2h") work as expected.
+            const unit = (m[2] || "ms").toLowerCase();
             const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
             effectiveTimeout = Math.round(val * (multipliers[unit] || 1000));
+          } else {
+            // String didn't match expected format — return error instead of silently defaulting
+            return { content: [{ type: "text", text: `Invalid timeout format: "${params.timeout}". Expected a number (ms) or suffixed string like '60s', '10m', '2h'.` }], details: {}, isError: true };
           }
         }
         if (effectiveTimeout === undefined) effectiveTimeout = 120_000;
@@ -771,18 +987,25 @@ export default function (pi: ExtensionAPI) {
 
           // Long-running task: register BEFORE await to prevent concurrent dedup misses
           const logPath = `/tmp/pi-bg-${Date.now().toString(36)}.log`;
-          remoteTasks.push({ host: params.host, logPath, cmd: params.command, pid: null, startTime: Date.now(), active: false });
+          remoteTasks.push({ host: params.host, logPath, cmd: params.command, pid: null, startTime: Date.now() });
+          saveRemoteTasks();
 
           const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
           const result = await shellExec(conn, bgCmd, 15000);
           conn.lastUse = Date.now();
 
           // Extract PID from result for liveness checks during polling
-          const pidMatch = result.match(/PID=(\d+)/);
+          // Use LAST match of PID= in the result (command output may contain earlier spurious matches)
+          let pidMatch: RegExpExecArray | null = null;
+          let match: RegExpExecArray | null;
+          const pidRe = /PID=(\d+)/g;
+          while ((match = pidRe.exec(result)) !== null) {
+            pidMatch = match;
+          }
           const pid = pidMatch ? pidMatch[1] : null;
 
           // Poll remote log and inject result when done
-          pollRemoteTask(conn, logPath, params.command, params.host, pid);
+          pollRemoteTask(logPath, params.command, params.host, pid);
 
           return {
             content: [{
@@ -793,7 +1016,7 @@ export default function (pi: ExtensionAPI) {
                 `Check progress: ssh_exec("${params.host}", "tail -20 ${logPath}")\n` +
                 `Read full log: ssh_exec("${params.host}", "cat '${logPath}'")`,
             }],
-            details: { pid: result.trim(), logPath },
+            details: { pid, logPath },
           };
         }
         const result = await shellExec(conn, params.command, Math.min(effectiveTimeout, 600_000));
@@ -816,10 +1039,10 @@ export default function (pi: ExtensionAPI) {
       remotePath: Type.String({ description: "Remote destination path (e.g. '/data/file.pt' or '/data/')" }),
     }),
     async execute(_id, params, _signal) {
-      syncFromDisk();
-      const conn = findConnection(params.host);
+      await syncFromDiskAsync();
+      const conn = await findConnection(params.host);
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
-      if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
+      if (!(await isConnectedAsync(conn.key))) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
         // ControlMaster handles the connection — just use alias:path
         const scpArgs = [
@@ -836,7 +1059,7 @@ export default function (pi: ExtensionAPI) {
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: `Copied: ${params.localPath} → ${conn.alias}:${params.remotePath}\n${result.stdout || "OK"}` }], details: {} };
       } catch (e: any) {
-        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+        return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
       }
     },
   });
@@ -852,10 +1075,10 @@ export default function (pi: ExtensionAPI) {
       localPath: Type.String({ description: "Local destination path" }),
     }),
     async execute(_id, params, _signal) {
-      syncFromDisk();
-      const conn = findConnection(params.host);
+      await syncFromDiskAsync();
+      const conn = await findConnection(params.host);
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
-      if (!isConnected(conn.key)) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
+      if (!(await isConnectedAsync(conn.key))) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
       try {
         // ControlMaster handles the connection — just use alias:path
         const scpArgs = [
@@ -872,7 +1095,7 @@ export default function (pi: ExtensionAPI) {
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: `Copied: ${conn.alias}:${params.remotePath} → ${params.localPath}\n${result.stdout || "OK"}` }], details: {} };
       } catch (e: any) {
-        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+        return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
       }
     },
   });
@@ -886,17 +1109,18 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: ["Call ssh_status before ssh_exec to verify the target host is connected.", "If not connected, tell the user: /ssh <host>"],
     parameters: Type.Object({}),
     async execute() {
-      syncFromDisk();
+      await syncFromDiskAsync();
       if (connections.size === 0) return { content: [{ type: "text", text: "No active SSH connections." }], details: {} };
       const lines = ["Active SSH connections:"];
-      for (const [, c] of connections) lines.push(`  ${isConnected(c.key) ? "🟢" : "⚫"} ${c.key}`);
+      for (const [, c] of connections) lines.push(`  ${await isConnectedAsync(c.key) ? "🟢" : "⚫"} ${c.key}`);
       return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
     },
   });
 
   // ── session_start: recover running remote tasks ─────────────────
   pi.on("session_start", async () => {
-    syncFromDisk();
+    await syncFromDiskAsync();
+    loadRemoteTasks();
     const now = Date.now();
     const MAX_TASK_AGE = 60 * 60 * 1000; // 1 hour — older tasks are considered stale
     // Build a set of logPaths to remove (avoids findIndex-in-loop fragility)
@@ -906,11 +1130,10 @@ export default function (pi: ExtensionAPI) {
         toRemove.add(t.logPath);
         continue;
       }
-      const conn = findConnection(t.host);
-      if (conn && isConnected(conn.key)) {
-        // Reset active flag so pollRemoteTask starts a fresh loop
-        t.active = false;
-        pollRemoteTask(conn, t.logPath, t.cmd, t.host, t.pid);
+      const conn = await findConnection(t.host);
+      if (conn && await isConnectedAsync(conn.key)) {
+        // pollRemoteTask will start a fresh loop (pollRemoteActive dedup prevents duplicates)
+        pollRemoteTask(t.logPath, t.cmd, t.host, t.pid);
       } else {
         toRemove.add(t.logPath);
       }
@@ -925,6 +1148,7 @@ export default function (pi: ExtensionAPI) {
         try { _sshPi?.ui?.setStatus?.("ssh-bg", ""); } catch { /* ok */ }
       }
     }
+    saveRemoteTasks();
   });
 
   pi.on("session_shutdown", () => {
@@ -937,14 +1161,19 @@ export default function (pi: ExtensionAPI) {
       }
       c.pending.clear();
     }
+    // Persist remote tasks before clearing so session_start can recover them
+    saveRemoteTasks();
+    // Clear remote task tracking to prevent stale poll loops from continuing
+    remoteTasks.length = 0;
+    pollRemoteActive.clear();
   });
 }
 
 // ── runRemote helper ────────────────────────────────────────────────────────
 
-function runRemote(alias: string, user: string, hostname: string, port: number, command: string, ctx: any): void {
+async function runRemote(alias: string, user: string, hostname: string, port: number, command: string, ctx: any): Promise<void> {
   const key = connKey(user, hostname, port);
-  if (!isConnected(key)) { ctx.ui.notify(`No connection. /ssh ${alias} first.`, "warning"); return; }
+  if (!(await isConnectedAsync(key))) { ctx.ui.notify(`No connection. /ssh ${alias} first.`, "warning"); return; }
   if (!connections.has(key)) addConn(key, alias, socketPath(key), targetStr(alias, user, hostname, port));
   const conn = connections.get(key)!;
   ctx.ui.setStatus("ssh-" + key, `running...`);
@@ -959,7 +1188,8 @@ function runRemote(alias: string, user: string, hostname: string, port: number, 
   }).catch(e => { ctx.ui.setStatus("ssh-" + key, ""); ctx.ui.notify(`Failed: ${e.message}`, "error"); });
 }
 
-function showStatus(ctx: any): void {
+async function showStatus(ctx: any): Promise<void> {
   if (connections.size === 0) { ctx.ui.notify("No connections.", "info"); return; }
-  ctx.ui.setWidget("ssh-status", [...connections.entries()].map(([k, c]) => `│ ${isConnected(c.key) ? "🟢" : "⚫"} ${k}`));
+  const lines = await Promise.all([...connections.entries()].map(async ([k, c]) => `│ ${await isConnectedAsync(c.key) ? "🟢" : "⚫"} ${k}`));
+  ctx.ui.setWidget("ssh-status", lines);
 }

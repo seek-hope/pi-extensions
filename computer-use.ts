@@ -14,7 +14,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 
 
 let uid: number;
@@ -24,25 +24,21 @@ const YDOTOOL_SOCKET = process.env.YDOTOOL_SOCKET
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function sh(cmd: string, timeout = 5_000): string {
-  const r = spawnSync("sh", ["-c", cmd], { encoding: "utf-8", maxBuffer: 50*1024*1024, timeout });
-  if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(r.stderr?.trim() || `Command exited with code ${r.status}: ${cmd.substring(0, 80)}`);
-  return r.stdout.trim();
-}
-
-/** Cache for passwordless sudo availability */
+/** Cache for passwordless sudo availability with time-based invalidation */
 let sudoAvailable: boolean | null = null;
-function ensureSudo(): void {
-  if (sudoAvailable === true) return;
-  if (sudoAvailable === false) {
-    throw new Error(
-      "Passwordless sudo is not configured. ydotool requires root privileges for mouse/keyboard operations. " +
-      "Run: echo 'ALL ALL=(ALL) NOPASSWD: /usr/bin/ydotool' | sudo tee /etc/sudoers.d/ydotool"
-    );
+let sudoCacheTime = 0;
+const SUDO_CACHE_TTL = 60_000; // recheck every 60 seconds
+async function ensureSudo(): Promise<void> {
+  // Use a time-to-live cache: recheck every SUDO_CACHE_TTL ms so that if
+  // passwordless sudo is revoked mid-session, subsequent calls detect it.
+  if (sudoAvailable === true && Date.now() - sudoCacheTime < SUDO_CACHE_TTL) return;
+  try {
+    await execFileAsync("sudo", ["-n", "true"], { timeout: 5_000 });
+    sudoAvailable = true;
+  } catch {
+    sudoAvailable = false;
   }
-  const r = spawnSync("sudo", ["-n", "true"], { encoding: "utf-8", timeout: 5_000 });
-  sudoAvailable = r.status === 0;
+  sudoCacheTime = Date.now();
   if (!sudoAvailable) {
     throw new Error(
       "Passwordless sudo is not configured. ydotool requires root privileges for mouse/keyboard operations. " +
@@ -51,37 +47,89 @@ function ensureSudo(): void {
   }
 }
 
-function sudoSh(cmd: string, timeout = 5_000): string {
-  ensureSudo();
-  // Use spawnSync with explicit env object and arg array to avoid shell injection.
-  // sudo normally strips env vars set in the command string; passing YDOTOOL_SOCKET
-  // via the env option to spawnSync avoids shell interpretation entirely.
-  const r = spawnSync("sudo", ["env", `YDOTOOL_SOCKET=${YDOTOOL_SOCKET}`, "sh", "-c", cmd], {
-    encoding: "utf-8",
-    maxBuffer: 50 * 1024 * 1024,
-    timeout,
-  });
-  if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(r.stderr?.trim() || `Command exited with code ${r.status}: ${cmd.substring(0, 80)}`);
-  return r.stdout.trim();
-}
-
 /** Non-blocking promise-based sleep for use inside async execute() */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function getCursorPos(): { x: number; y: number } {
-  const out = sh("hyprctl cursorpos");
-  // Support optional negative coords just in case
+/** Async version of sh — non-blocking, for use inside async tool execute() */
+async function shAsync(cmd: string, timeout = 5_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", cmd], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stderr.on("error", () => {});
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${timeout}ms`)); }, timeout);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(stderr.trim() || `Command exited with code ${code}: ${cmd.substring(0, 80)}`));
+    });
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+/** Async version of sudoSh — non-blocking, for use inside async tool execute() */
+async function sudoShAsync(cmd: string, timeout = 5_000): Promise<string> {
+  await ensureSudo();
+  return new Promise((resolve, reject) => {
+    const child = spawn("sudo", ["env", `YDOTOOL_SOCKET=${YDOTOOL_SOCKET}`, "sh", "-c", cmd], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stderr.on("error", () => {});
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${timeout}ms`)); }, timeout);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(stderr.trim() || `Command exited with code ${code}: ${cmd.substring(0, 80)}`));
+    });
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+/** Non-blocking version of execFileSync — returns Buffer, for use inside async tool execute() */
+function execFileAsync(cmd: string, args: string[], options: { timeout?: number; input?: string; } = {}): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: options.input ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => chunks.push(d));
+    child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stderr.on("error", () => {});
+    const ms = options.timeout || 10_000;
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${ms}ms`)); }, ms);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(stderr.trim() || `Command "${cmd}" exited with code ${code}`));
+    });
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    if (options.input) {
+      child.stdin!.on("error", () => {}); // prevent unhandled pipe errors on stdin
+      child.stdin!.end(options.input);
+    }
+  });
+}
+
+/** Async version of getCursorPos — non-blocking */
+async function getCursorPosAsync(): Promise<{ x: number; y: number }> {
+  const out = await shAsync("hyprctl cursorpos");
   const m = out.match(/(-?\d+),\s*(-?\d+)/);
   if (m) return { x: parseInt(m[1]), y: parseInt(m[2]) };
-  // If hyprctl output is unrecognized, throw so callers don't silently get (0,0)
   throw new Error(`Unable to parse cursor position from hyprctl output: "${out}"`);
 }
 
-function getScreenBounds(): { width: number; height: number; monitors: string; minX: number; minY: number } {
-  const out = sh("hyprctl monitors");
+/** Extract screen bounds from raw hyprctl monitors output */
+function parseScreenBounds(out: string): { width: number; height: number; monitors: string; minX: number; minY: number } {
   if (!out) throw new Error("hyprctl monitors returned no output");
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   const re = /(-?\d+)x(-?\d+)@[\d.]+ at (-?\d+)x(-?\d+)/g;
@@ -100,8 +148,17 @@ function getScreenBounds(): { width: number; height: number; monitors: string; m
   return { width: maxX - minX, height: maxY - minY, monitors: out, minX, minY };
 }
 
+/** Async version of getScreenBounds — non-blocking */
+async function getScreenBoundsAsync(): Promise<{ width: number; height: number; monitors: string; minX: number; minY: number }> {
+  const out = await shAsync("hyprctl monitors");
+  return parseScreenBounds(out);
+}
+
 /** Convert normalized (0-1000) coords to absolute pixel, accounting for monitor origin offset */
 function normalizeToPixel(nx: number, ny: number, bound: { width: number; height: number; minX: number; minY: number }) {
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+    throw new Error(`Invalid normalized coordinates: (${nx}, ${ny}) — must be finite numbers`);
+  }
   return {
     x: Math.round((nx / 1000) * bound.width + bound.minX),
     y: Math.round((ny / 1000) * bound.height + bound.minY),
@@ -110,6 +167,9 @@ function normalizeToPixel(nx: number, ny: number, bound: { width: number; height
 
 /** Clamp to screen bounds accounting for non-zero origin */
 function clamp(x: number, y: number, bound: { width: number; height: number; minX: number; minY: number }) {
+  // Guard against NaN/Infinity — treat as origin if non-finite
+  if (!Number.isFinite(x)) x = bound.minX;
+  if (!Number.isFinite(y)) y = bound.minY;
   return {
     x: Math.max(bound.minX, Math.min(x, bound.minX + bound.width - 1)),
     y: Math.max(bound.minY, Math.min(y, bound.minY + bound.height - 1)),
@@ -123,7 +183,7 @@ async function ydotoolRetry(action: string, attempts = 3, delayMs = 200): Promis
   let lastErr: any;
   for (let i = 0; i < attempts; i++) {
     try {
-      sudoSh(action, 5_000);
+      await sudoShAsync(action, 5_000);
       return;
     } catch (e) {
       lastErr = e;
@@ -140,19 +200,21 @@ async function moveToVerified(x: number, y: number, bound: { width: number; heig
   const { x: cx, y: cy } = clamp(x, y, bound);
   let lastPos: { x: number; y: number } | null = null;
   let readSucceeded = false;
+  let moveSucceeded = false;
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
-    sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
-    await sleep(50);
     try {
-      const pos = getCursorPos();
+      await sudoShAsync(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
+      moveSucceeded = true;
+      await sleep(50);
+      const pos = await getCursorPosAsync();
       readSucceeded = true;
       lastPos = pos;
       // Accept if within 5px tolerance
       if (Math.abs(pos.x - cx) <= 5 && Math.abs(pos.y - cy) <= 5) return;
     } catch (e) {
       lastErr = e;
-      // getCursorPos failed — may be transient; retry
+      // ydotool or getCursorPos failed — may be transient; retry
     }
   }
   if (readSucceeded && lastPos) {
@@ -161,13 +223,18 @@ async function moveToVerified(x: number, y: number, bound: { width: number; heig
       `Last known position: (${lastPos.x}, ${lastPos.y}) — still off-target. ` +
       `The mouse may not have moved correctly.`
     );
+  } else if (moveSucceeded) {
+    const detail = lastErr instanceof Error ? lastErr.message : String(lastErr ?? "unknown");
+    throw new Error(
+      `Mouse move to (${cx}, ${cy}) likely succeeded, but position could not be confirmed after 3 attempts. ` +
+      `getCursorPos failed each time (last error: ${detail}). ` +
+      `The cursor may be at (${cx}, ${cy}) despite the verification failure.`
+    );
   } else {
     const detail = lastErr instanceof Error ? lastErr.message : String(lastErr ?? "unknown");
     throw new Error(
-      `Failed to move mouse to (${cx}, ${cy}) after 3 attempts. ` +
-      `Could not read cursor position (getCursorPos failed each time). ` +
-      `Last error: ${detail}. ` +
-      `The mouse may not have moved correctly.`
+      `Mouse move to (${cx}, ${cy}) failed after 3 attempts. ` +
+      `ydotool mousemove never returned successfully (last error: ${detail}).`
     );
   }
 }
@@ -197,8 +264,8 @@ export default function (pi: ExtensionAPI) {
         }
         const nums = parts.map(Number);
         for (let i = 0; i < 4; i++) {
-          if (isNaN(nums[i])) {
-            return { content: [{ type: "text", text: `Invalid region: '${parts[i]}' is not a valid number.` }], details: {}, isError: true };
+          if (!Number.isFinite(nums[i])) {
+            return { content: [{ type: "text", text: `Invalid region: '${parts[i]}' is not a valid finite number.` }], details: {}, isError: true };
           }
         }
         const [x, y, w, h] = nums;
@@ -212,7 +279,7 @@ export default function (pi: ExtensionAPI) {
       try {
         // Pipe grim to stdout (PNG) — no temp file, no cleanup needed
         const grimArgs = geometry ? ["-g", geometry, "-"] : ["-"];
-        const data = execFileSync("grim", grimArgs, { maxBuffer: 50 * 1024 * 1024, timeout: 10_000 });
+        const data = await execFileAsync("grim", grimArgs, { timeout: 10_000 });
         const base64 = data.toString("base64");
         return {
           content: [
@@ -243,13 +310,19 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
-        const bound = getScreenBounds();
+        if (!Number.isFinite(params.x) || !Number.isFinite(params.y)) {
+          throw new Error(`Invalid coordinates: (${params.x}, ${params.y}) — must be finite numbers`);
+        }
+        const bound = await getScreenBoundsAsync();
         let tx = params.x, ty = params.y;
 
+        if (params.coordSystem && !["absolute", "normalized", "relative"].includes(params.coordSystem)) {
+          throw new Error(`Invalid coordSystem: "${params.coordSystem}". Must be "absolute", "normalized", or "relative".`);
+        }
         if (params.coordSystem === "normalized") {
           ({ x: tx, y: ty } = normalizeToPixel(params.x, params.y, bound));
         } else if (params.coordSystem === "relative") {
-          const pos = getCursorPos();
+          const pos = await getCursorPosAsync();
           tx = pos.x + params.x;
           ty = pos.y + params.y;
         }
@@ -273,11 +346,14 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
-        const btn = params.button || 1;
+        const btn = params.button ?? 1;
+        if (btn < 1 || btn > 3) {
+          return { content: [{ type: "text", text: `Invalid button: ${btn}. Must be 1 (left), 2 (middle), or 3 (right).` }], details: {}, isError: true };
+        }
         await ydotoolRetry(`ydotool click ${btn}`);
         // Settle delay — ensures UI responds before next action
         await sleep(80);
-        const pos = getCursorPos();
+        const pos = await getCursorPosAsync();
         return { content: [{ type: "text", text: `Clicked button ${btn} at (${pos.x}, ${pos.y})` }], details: { button: btn, ...pos } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Click failed: ${e.message}` }], details: {}, isError: true };
@@ -298,20 +374,29 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
-        const bound = getScreenBounds();
+        if (!Number.isFinite(params.x) || !Number.isFinite(params.y)) {
+          throw new Error(`Invalid coordinates: (${params.x}, ${params.y}) — must be finite numbers`);
+        }
+        const bound = await getScreenBoundsAsync();
         let tx = params.x, ty = params.y;
+        if (params.coordSystem && !["absolute", "normalized", "relative"].includes(params.coordSystem)) {
+          throw new Error(`Invalid coordSystem: "${params.coordSystem}". Must be "absolute", "normalized", or "relative".`);
+        }
         if (params.coordSystem === "normalized") {
           ({ x: tx, y: ty } = normalizeToPixel(params.x, params.y, bound));
         } else if (params.coordSystem === "relative") {
-          const pos = getCursorPos();
+          const pos = await getCursorPosAsync();
           tx = pos.x + params.x;
           ty = pos.y + params.y;
         }
         await moveToVerified(tx, ty, bound);
-        const btn = params.button || 1;
+        const btn = params.button ?? 1;
+        if (btn < 1 || btn > 3) {
+          return { content: [{ type: "text", text: `Invalid button: ${btn}. Must be 1 (left), 2 (middle), or 3 (right).` }], details: {}, isError: true };
+        }
         await ydotoolRetry(`ydotool click ${btn}`);
         await sleep(80);
-        const pos = getCursorPos();
+        const pos = await getCursorPosAsync();
         return { content: [{ type: "text", text: `Clicked button ${btn} at (${pos.x}, ${pos.y})` }], details: { button: btn, x: tx, y: ty } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Click-at failed: ${e.message}` }], details: {}, isError: true };
@@ -329,7 +414,7 @@ export default function (pi: ExtensionAPI) {
       try {
         await ydotoolRetry("ydotool click --repeat 2 --next-delay 100 1");
         await sleep(100);
-        const pos = getCursorPos();
+        const pos = await getCursorPosAsync();
         return { content: [{ type: "text", text: `Double-clicked at (${pos.x}, ${pos.y})` }], details: { ...pos } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Double-click failed: ${e.message}` }], details: {}, isError: true };
@@ -348,12 +433,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal) {
       try {
         // Pass text via stdin (-) to avoid shell escaping issues entirely
-        execFileSync("wtype", ["-"], {
-          encoding: "utf-8",
-          maxBuffer: 50 * 1024 * 1024,
-          timeout: 10_000,
-          input: params.text,
-        });
+        await execFileAsync("wtype", ["-"], { timeout: 10_000, input: params.text });
         return { content: [{ type: "text", text: `Typed: ${params.text.substring(0, 100)}` }], details: { length: params.text.length } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Type failed: ${e.message}` }], details: {}, isError: true };
@@ -371,15 +451,17 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
-        const parts = params.combo.toLowerCase().split("+");
+        const parts = params.combo.split("+");
         const modifiers: string[] = [];
         const keys: string[] = [];
 
         for (const p of parts) {
           const trimmed = p.trim();
-          if (["ctrl", "alt", "shift", "super", "logo", "win"].includes(trimmed)) {
+          if (trimmed.length === 0) continue; // skip empty parts from malformed combos like "ctrl+"
+          const lower = trimmed.toLowerCase();
+          if (["ctrl", "alt", "shift", "super", "logo", "win"].includes(lower)) {
             // Map common names to wtype's expected names
-            const modName = trimmed === "super" || trimmed === "win" ? "logo" : trimmed;
+            const modName = lower === "super" || lower === "win" ? "logo" : lower;
             modifiers.push(modName);
           } else {
             keys.push(trimmed);
@@ -399,7 +481,7 @@ export default function (pi: ExtensionAPI) {
           wtypeArgs.push("-M", mod);
         }
         wtypeArgs.push("-k", keys[0]);
-        execFileSync("wtype", wtypeArgs, { encoding: "utf-8", maxBuffer: 5 * 1024, timeout: 5_000 });
+        await execFileAsync("wtype", wtypeArgs, { timeout: 5_000 });
         return { content: [{ type: "text", text: `Pressed: ${params.combo}` }], details: { combo: params.combo } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Key combo failed: ${e.message}` }], details: {}, isError: true };
@@ -417,6 +499,9 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
+        if (!Number.isFinite(params.amount)) {
+          return { content: [{ type: "text", text: `Invalid scroll amount: ${params.amount} — must be a finite number.` }], details: {}, isError: true };
+        }
         if (params.amount === 0) {
           return { content: [{ type: "text", text: "Scroll amount is 0 — nothing to do." }], details: { amount: 0 } };
         }
@@ -425,7 +510,7 @@ export default function (pi: ExtensionAPI) {
         for (let i = 0; i < count; i++) {
           await ydotoolRetry(`ydotool click ${dir}`, 3, 50);
         }
-        const pos = getCursorPos();
+        const pos = await getCursorPosAsync();
         return { content: [{ type: "text", text: `Scrolled ${params.amount > 0 ? "up" : "down"} ${count} at (${pos.x}, ${pos.y})` }], details: { amount: params.amount, ...pos } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Scroll failed: ${e.message}` }], details: {}, isError: true };
@@ -447,18 +532,24 @@ export default function (pi: ExtensionAPI) {
       // Track whether mousedown was issued so we can release it on error
       let mouseDown = false;
       try {
-        const bound = getScreenBounds();
+        if (!Number.isFinite(params.toX) || !Number.isFinite(params.toY)) {
+          throw new Error(`Invalid coordinates: (${params.toX}, ${params.toY}) — must be finite numbers`);
+        }
+        const bound = await getScreenBoundsAsync();
         let tx = params.toX, ty = params.toY;
+        if (params.coordSystem && !["absolute", "normalized", "relative"].includes(params.coordSystem)) {
+          throw new Error(`Invalid coordSystem: "${params.coordSystem}". Must be "absolute", "normalized", or "relative".`);
+        }
         if (params.coordSystem === "normalized") {
           ({ x: tx, y: ty } = normalizeToPixel(params.toX, params.toY, bound));
         } else if (params.coordSystem === "relative") {
-          const pos = getCursorPos();
+          const pos = await getCursorPosAsync();
           tx = pos.x + params.toX;
           ty = pos.y + params.toY;
         }
         ({ x: tx, y: ty } = clamp(tx, ty, bound));
 
-        const start = getCursorPos();
+        const start = await getCursorPosAsync();
         await ydotoolRetry("ydotool mousedown 1");
         mouseDown = true;
         await sleep(50);
@@ -473,7 +564,7 @@ export default function (pi: ExtensionAPI) {
       } catch (e: any) {
         // Always attempt to release the mouse button if we pressed it down
         if (mouseDown) {
-          try { sudoSh("ydotool mouseup 1", 2_000); } catch { /* best effort */ }
+          try { await sudoShAsync("ydotool mouseup 1", 2_000); } catch { /* best effort */ }
         }
         return { content: [{ type: "text", text: `Drag failed: ${e.message}` }], details: {}, isError: true };
       }
@@ -488,7 +579,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_id, _params, _signal) {
       try {
-        const pos = getCursorPos();
+        const pos = await getCursorPosAsync();
         return { content: [{ type: "text", text: `Cursor at (${pos.x}, ${pos.y})` }], details: pos };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Position query failed: ${e.message}` }], details: {}, isError: true };
@@ -504,7 +595,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_id, _params, _signal) {
       try {
-        const bounds = getScreenBounds();
+        const bounds = await getScreenBoundsAsync();
         return {
           content: [{ type: "text", text: `Screen: ${bounds.width}x${bounds.height}\n\nMonitor details:\n${bounds.monitors}` }],
           details: { width: bounds.width, height: bounds.height },

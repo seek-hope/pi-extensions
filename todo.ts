@@ -14,6 +14,7 @@ const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"] as co
 type TodoStatus = (typeof TODO_STATUSES)[number];
 
 interface TodoItem {
+  id?: string;
   content: string;
   status: TodoStatus;
 }
@@ -32,30 +33,128 @@ const STATUS_ICONS: Record<TodoStatus, string> = {
 
 let _pi: ExtensionAPI | null = null;
 let todo: TodoList = { items: [], updatedAt: 0 };
+let detailWidgetActive = false;
+let _autoClearTimer: ReturnType<typeof setTimeout> | null = null;
+let _notify: ((message: string, level?: string) => void) | null = null;
+let _itemIdCounter = 0;
 
 // ── global bridge: allow other extensions (e.g. subagent) to push/update items ──
 (globalThis as any).__pi_todo = {
-  addItem(content: string, status: TodoStatus = "in_progress"): string {
-    const id = `auto-${Date.now().toString(36)}`;
-    todo.items.push({ content, status });
+  addItem(content: string, status: TodoStatus = "pending"): string | null {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    const trimmed = String(content ?? "").trim();
+    if (!trimmed) throw new Error("Todo item content cannot be empty");
+    const sanitized = sanitizeContent(trimmed);
+    if (!sanitized) throw new Error("Todo item content is empty after sanitization");
+    const truncated = truncate(sanitized, 200);
+    const s = String(status).trim().toLowerCase();
+    const validStatus = isValidTodoStatus(s) ? s : "pending";
+    // Reject duplicates — return null so callers know the item wasn't added
+    if (todo.items.some(i => i.content === truncated)) {
+      console.warn(`todo-bridge: duplicate item — "${truncated}" already exists`);
+      return null;
+    }
+    const id = String(++_itemIdCounter);
+    todo.items.push({ id, content: truncated, status: validStatus });
+    if (validStatus === "in_progress") enforceOneInProgress(todo.items.length - 1);
     todo.updatedAt = Date.now();
+    renderWidget();
+    checkAndAutoClear();
+    clearDetailWidget();
     return id;
   },
-  updateItemByContent(partialContent: string, newStatus: TodoStatus, newContent?: string) {
-    const item = todo.items.find(i => i.content.includes(partialContent));
-    if (item) {
-      item.status = newStatus;
-      if (newContent) item.content = newContent;
+  updateItemByContent(content: string, newStatus: TodoStatus, newContent?: string): boolean {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    const trimmed = String(content ?? "").trim();
+    if (!trimmed) return false;
+    const sanitized = sanitizeContent(trimmed);
+    if (!sanitized) return false;
+    const truncated = truncate(sanitized, 200);
+    const s = String(newStatus).trim().toLowerCase();
+    const valid = isValidTodoStatus(s) ? s : "pending";
+    const idx = todo.items.findIndex(item => item.content === truncated);
+    if (idx !== -1) {
+      const item = todo.items[idx];
+      item.status = valid;
+      if (newContent !== undefined) {
+        const nc = sanitizeContent(String(newContent ?? "").trim());
+        if (nc) {
+          item.content = truncate(nc, 200);
+        } else {
+          console.warn(`todo-bridge: updateItemByContent — newContent for "${truncated}" sanitized to empty; content unchanged`);
+        }
+      }
+      if (valid === "in_progress") enforceOneInProgress(idx);
       todo.updatedAt = Date.now();
+      renderWidget();
+      checkAndAutoClear();
+      clearDetailWidget();
+      return true;
     }
+    console.debug(`todo-bridge: updateItemByContent — no item found for content "${truncated}"`);
+    return false;
   },
-  removeItemByContent(partialContent: string) {
-    const idx = todo.items.findIndex(i => i.content.includes(partialContent));
-    if (idx >= 0) { todo.items.splice(idx, 1); todo.updatedAt = Date.now(); }
+  removeItemByContent(content: string): boolean {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    const trimmed = String(content ?? "").trim();
+    if (!trimmed) return false;
+    const sanitized = sanitizeContent(trimmed);
+    if (!sanitized) return false;
+    const truncated = truncate(sanitized, 200);
+    const idx = todo.items.findIndex(i => i.content === truncated);
+    if (idx !== -1) {
+      todo.items.splice(idx, 1);
+      todo.updatedAt = Date.now();
+      renderWidget();
+      checkAndAutoClear();
+      clearDetailWidget();
+      return true;
+    }
+    console.debug(`todo-bridge: removeItemByContent — no item found for content "${truncated}"`);
+    return false;
   },
-  getItems() { return todo.items; },
+  updateItemById(id: string, newStatus: TodoStatus, newContent?: string): boolean {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    const s = String(newStatus).trim().toLowerCase();
+    const valid = isValidTodoStatus(s) ? s : "pending";
+    const idx = todo.items.findIndex(item => item.id === id);
+    if (idx !== -1) {
+      const item = todo.items[idx];
+      item.status = valid;
+      if (newContent !== undefined) {
+        const nc = sanitizeContent(String(newContent ?? "").trim());
+        if (nc) {
+          item.content = truncate(nc, 200);
+        } else {
+          console.warn(`todo-bridge: updateItemById — newContent for item "${id}" sanitized to empty; content unchanged`);
+        }
+      }
+      if (valid === "in_progress") enforceOneInProgress(idx);
+      todo.updatedAt = Date.now();
+      renderWidget();
+      checkAndAutoClear();
+      clearDetailWidget();
+      return true;
+    }
+    console.debug(`todo-bridge: updateItemById — no item found for id "${id}"`);
+    return false;
+  },
+  removeItemById(id: string): boolean {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    const idx = todo.items.findIndex(item => item.id === id);
+    if (idx !== -1) {
+      todo.items.splice(idx, 1);
+      todo.updatedAt = Date.now();
+      renderWidget();
+      checkAndAutoClear();
+      clearDetailWidget();
+      return true;
+    }
+    console.debug(`todo-bridge: removeItemById — no item found for id "${id}"`);
+    return false;
+  },
+  getItems() { return [...todo.items]; },
 };
-let detailWidgetActive = false;
 
 /** Narrow a string to a valid TodoStatus after user input or session restore. */
 function isValidTodoStatus(s: string): s is TodoStatus {
@@ -79,13 +178,64 @@ function normalizeStatus(raw: string | undefined): TodoStatus {
  */
 function sanitizeContent(raw: string): string {
   return raw
-    .replace(/\x1b\[[0-9;?>=]*[a-zA-Z]/g, "")   // CSI sequences (include ? > = params)
-    .replace(/\x1b\].*?(?:\x07|\x1b\\)/g, "")   // OSC sequences
-    .replace(/\x1b[PX^_].*?\x1b\\/g, "")        // DCS, SOS, PM, APC
-    .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "") // remaining C0 controls (bare ESC, CR, etc.)
+    .replace(/\x1b\[[0-9;?>=<:]*[\x20-\x2F]*[@-~]/g, "")   // CSI sequences (include ? > = < : params, intermediate bytes)
+    .replace(/\x1b\].*?(?:\x07|\x1b\\)/g, "")   // OSC sequences (with BEL or ST terminator)
+    .replace(/\x1b\][^\x1b]*/g, "")               // Unterminated OSC (truncated input — no ST/BEL)
+    .replace(/\x1b[PX^_].*?\x1b\\/g, "")        // DCS, SOS, PM, APC (with ST terminator)
+    .replace(/\x1b[PX^_][^\x1b]*/g, "")         // Unterminated DCS/SOS/PM/APC (no ST terminator — truncated input edge case)
+    .replace(/\x1b[\x20-\x2F]*[\x30-\x7E]/g, "") // Remaining ESC sequences (single-byte like ESC c, ESC 7, etc.)
+    .replace(/[\x00-\x08\x0B-\x1F\x7F\x80-\x9F]/g, "") // remaining C0 + C1 controls (bare ESC, CR, CSI, etc.)
     .replace(/\t/g, " ")
     .replace(/\n/g, " ")
     .replace(/[\p{Cf}\p{Cs}]/gu, "");        // Unicode format chars + surrogates
+}
+
+/** Truncate a string to maxLen code points (surrogate-safe). */
+function truncate(str: string, maxLen: number): string {
+  const chars = Array.from(str);
+  if (chars.length <= maxLen) return str;
+  return chars.slice(0, maxLen - 1).join('') + '…';
+}
+
+/** Enforce the "only one in_progress" rule by demoting all but the preferred item.
+ *  When preferredIdx is provided, that item is kept as in_progress (used when
+ *  updateItemByContent or updateItemById sets a specific item to in_progress).
+ *  Otherwise, the last in_progress item by index is kept (most recently added). */
+function enforceOneInProgress(preferredIdx?: number): void {
+  const inProgressIndices: number[] = [];
+  for (let i = 0; i < todo.items.length; i++) {
+    if (todo.items[i].status === "in_progress") {
+      inProgressIndices.push(i);
+    }
+  }
+  if (inProgressIndices.length > 1) {
+    // Keep the preferred index (most recently updated), falling back to the last one (most recently added)
+    const keepIdx = preferredIdx !== undefined ? preferredIdx : inProgressIndices[inProgressIndices.length - 1];
+    for (const idx of inProgressIndices) {
+      if (idx !== keepIdx) {
+        todo.items[idx].status = "pending";
+      }
+    }
+  }
+}
+
+/** Check if all items are done and schedule auto-clear if so. */
+function checkAndAutoClear(ctx?: any): void {
+  const items = todo.items;
+  const allDone = items.length > 0 && items.every(i => i.status === "completed" || i.status === "cancelled");
+  if (allDone) {
+    const doneList = items.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
+    const truncatedList = doneList.length > 500 ? truncate(doneList, 500) + "\n  … and more" : doneList;
+    const notify = ctx?.ui?.notify?.bind(ctx?.ui) ?? _notify;
+    if (notify) (notify as any)(`All tasks complete:\n${truncatedList}`, "info");
+    clearDetailWidget(ctx);
+    if (_autoClearTimer !== null) clearTimeout(_autoClearTimer);
+    _autoClearTimer = setTimeout(() => {
+      _autoClearTimer = null;
+      todo = { items: [], updatedAt: Date.now() };
+      renderWidget();
+    }, 3000);
+  }
 }
 
 /** Clear the full-detail widget and sync the toggle flag. */
@@ -119,9 +269,10 @@ function restoreFromBranch(ctx?: any): void {
       const entry = branch[i];
       // Validate each entry's structure before accessing nested properties
       if (!entry || typeof entry !== 'object') continue;
-      if (entry?.type !== "message") continue;
-      const msg = entry?.message;
+      if (entry.type !== "message") continue;
+      const msg = entry.message;
       if (!msg || typeof msg !== 'object') continue;
+      if (msg.toolName !== "todo_write") continue;
       const details = msg?.details as { items?: TodoItem[] } | undefined;
       if (!details || typeof details !== 'object') continue;
       // Array.isArray catches both populated and empty lists so that a
@@ -131,8 +282,11 @@ function restoreFromBranch(ctx?: any): void {
         const safe: TodoItem[] = [];
         for (const item of details.items) {
           if (!item || typeof item !== 'object') continue;
+          const sanitized = sanitizeContent(String(item.content ?? ""));
+          if (!sanitized) continue;
           safe.push({
-            content: String(item.content ?? ""),
+            id: item.id || String(++_itemIdCounter),
+            content: truncate(sanitized, 200),
             status: normalizeStatus(item.status),
           });
         }
@@ -152,6 +306,8 @@ function renderWidget(ctx?: any): void {
   const active = todo.items.filter(i => i.status === "pending" || i.status === "in_progress");
   if (active.length === 0) {
     ui.setWidget("todo", undefined);
+    ui.setWidget("todo-detail", undefined);
+    detailWidgetActive = false;
     return;
   }
 
@@ -169,12 +325,11 @@ function renderWidget(ctx?: any): void {
   for (let i = 0; i < visible.length; i++) {
     const item = visible[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    const safe = sanitizeContent(item.content).substring(0, 40);
-    const connector = i < visible.length - 1 ? "│" : " ";
+    const safe = truncate(item.content, 40);
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
     lines.push(`│  ${bold}${icon}${reset} ${bold}${safe}${reset}`);
-    if (i < visible.length - 1) lines.push(`│  ${connector}`);
+    if (i < visible.length - 1) lines.push(`│  │`);
   }
 
   if (!showAll) {
@@ -189,6 +344,7 @@ function renderWidget(ctx?: any): void {
 
 export default function (pi: ExtensionAPI) {
   _pi = pi;
+  _notify = pi?.ui?.notify?.bind?.(pi?.ui) ?? null;
 
   // ── todo_write tool ──────────────────────────────────────────────────
   pi.registerTool({
@@ -221,9 +377,19 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Expected items to be an array, got ${typeof params.items}`);
       }
 
-      const items: TodoItem[] = params.items.map((item: { content: string; status?: string }, i: number) => {
+      // Cap items before processing to prevent unnecessary work on large arrays
+      const totalProvided = params.items.length;
+      if (totalProvided > 100) {
+        warnings.push(`List capped at 100 items (${totalProvided} provided). The first 100 items were kept.`);
+      }
+      const slice = params.items.slice(0, 100);
+
+      let items: TodoItem[] = slice.map((item: { content: string; status?: string }, i: number) => {
         const content = (item.content || "").trim();
-        if (!content) throw new Error(`Todo item ${i + 1} has empty content.`);
+        // Sanitize BEFORE empty check and truncation to avoid splitting ANSI escape
+        // sequences mid-sequence and to catch content that is only escape codes.
+        const sanitized = sanitizeContent(content);
+        if (!sanitized) throw new Error(`Todo item ${i + 1} has empty content after sanitization.`);
 
         let status: TodoStatus = "pending";
         if (item.status) {
@@ -235,11 +401,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        // Sanitize BEFORE truncation to avoid splitting ANSI escape sequences mid-sequence,
-        // which would leave garbled escape artifacts in the widget.
-        const sanitized = sanitizeContent(content);
-        const needsTruncation = sanitized.length > 200;
-        return { content: sanitized.substring(0, 200) + (needsTruncation ? "…" : ""), status };
+        return { id: String(++_itemIdCounter), content: truncate(sanitized, 200), status };
       });
 
       // Enforce: only one in_progress
@@ -258,39 +420,29 @@ export default function (pi: ExtensionAPI) {
         warnings.push(`Auto-fixed: demoted ${demoted} extra in_progress item(s) → pending (only one allowed).`);
       }
 
-      // Cap items to prevent widget bloat
-      if (items.length > 100) {
-        warnings.push(`List capped at 100 items (${items.length} provided). The first 100 items were kept.`);
-        items.length = 100;
-      }
-
-      // Detect duplicate content and warn (once per unique content)
+      // Remove duplicate items, keeping only the first occurrence of each unique content.
+      // This is consistent with the bridge addItem which also rejects duplicates.
       const seen = new Set<string>();
-      const warned = new Set<string>();
-      for (const item of items) {
-        if (seen.has(item.content) && !warned.has(item.content)) {
+      items = items.filter(item => {
+        if (seen.has(item.content)) {
           const preview = item.content.length > 40 ? item.content.substring(0, 40) + "…" : item.content;
-          warnings.push(`Duplicate item: "${preview}" appears multiple times.`);
-          warned.add(item.content);
+          warnings.push(`Duplicate item: "${preview}" — keeping only first occurrence.`);
+          return false;
         }
         seen.add(item.content);
-      }
+        return true;
+      });
 
       todo = { items, updatedAt: Date.now() };
       renderWidget(ctx);
 
-      // Auto-clear when all done: show full completed list as notification, then clear widget
-      const allDone = items.length > 0 && items.every(i => i.status === "completed" || i.status === "cancelled");
-      if (allDone) {
-        const doneList = items.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
-        const notify = _pi?.ui?.notify || ctx?.ui?.notify?.bind(ctx?.ui);
-        if (notify) (notify as any)(`All tasks complete:\n${doneList}`, "info");
-        // Clear widget after brief display
-        setTimeout(() => {
-          todo = { items: [], updatedAt: Date.now() };
-          renderWidget(ctx);
-        }, 3000);
-      }
+      // Cancel any pending auto-clear timer to avoid race conditions.
+      // This must run unconditionally so that a new non-done list written
+      // after an all-done list does not get erroneously auto-cleared.
+      if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+
+      // Auto-clear when all done: show completed list as notification, then clear widget
+      checkAndAutoClear(ctx);
 
       // Count by status for response
       const counts: Record<string, number> = {};
@@ -354,9 +506,9 @@ export default function (pi: ExtensionAPI) {
       for (let i = 0; i < limit; i++) {
         const item = sorted[i];
         const icon = STATUS_ICONS[item.status] || "○";
-        const safeContent = sanitizeContent(item.content);
+        const safeContent = truncate(item.content, 60);
         if (item.status === "in_progress") {
-          detailLines.push(`│ ${icon} \x1b[1m${safeContent}\x1b[0m`);
+          detailLines.push(`│ \x1b[1m${icon}\x1b[0m \x1b[1m${safeContent}\x1b[0m`);
         } else {
           detailLines.push(`│ ${icon} ${safeContent}`);
         }
@@ -384,6 +536,8 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: restore widget on resume ─────────────────────────
   pi.on("session_start", async (_event, ctx) => {
+    // Clear any stale auto-clear timer from a previous session
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     // Ensure _pi is alive (may have been nulled by a prior shutdown)
     _pi = _pi ?? pi;
 
@@ -396,6 +550,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_tree: rebuild state after tree navigation ────────────────
   pi.on("session_tree", async (_event, ctx) => {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     _pi = _pi ?? pi;
     restoreFromBranch(ctx);
     clearDetailWidget(ctx);
@@ -404,6 +559,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_shutdown: clear widgets and release references ───────────
   pi.on("session_shutdown", async (_event, ctx) => {
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     try {
       _pi?.ui?.setWidget?.("todo", undefined);
       _pi?.ui?.setWidget?.("todo-detail", undefined);
