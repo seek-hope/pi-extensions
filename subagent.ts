@@ -49,6 +49,10 @@ const COMMIT_FAILED_PREFIX = "Commit failed: ";
 
 /** Remove stale terminal-state agents from the map to prevent unbounded growth */
 function evictTerminalAgents(): void {
+  // Throttle to avoid filesystem I/O on rapid successive calls (e.g., reviewLoop
+  // iterations, subagent_parallel with many small spawns).
+  if (Date.now() - _lastEvictTime < EVICT_THROTTLE_MS) return;
+  _lastEvictTime = Date.now();
   const now = Date.now();
   for (const [id, ag] of subAgents) {
     if (["done", "error", "merged", "rejected", "cancelled"].includes(ag.status) && ag.endTime && (now - ag.endTime) > EVICTION_AGE_MS) {
@@ -177,11 +181,7 @@ async function reviewLoop(
     const tb = getTodoBridge();
     if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
 
-    // Throttle evictTerminalAgents to avoid filesystem I/O on every loop iteration
-    if (Date.now() - _lastEvictTime >= EVICT_THROTTLE_MS) {
-      evictTerminalAgents();
-      _lastEvictTime = Date.now();
-    }
+    evictTerminalAgents();
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
     let r;
@@ -426,7 +426,7 @@ async function handleImproveMode(
     existing.status = "improving";
   }
 
-  let _loopResult: LoopResult = { iterations: 0, clean: false, summary: "Unexpected error in review loop" };
+  let _loopResult: LoopResult;
   try {
     _loopResult = await reviewLoop(
       workCwd,
@@ -468,6 +468,9 @@ async function handleImproveMode(
       signal,
       todoMatchKey
     );
+  } catch (e: any) {
+    _loopResult = { iterations: 0, clean: false, summary: `Unexpected error in review loop: ${(e.message || e).substring(0, 200)}` };
+    throw e;
   } finally {
     // Restore original status after loop completes so evictTerminalAgents
     // can resume normal eviction for this agent.
@@ -998,11 +1001,15 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       }
     };
     const closeHandler = (code: number | null) => {
-      // Trust the real exit code whenever we have one, regardless of timeout timeline.
+      // Trust the real exit code whenever we have one, regardless of timeout timeline,
+      // BUT only if the timeout handler hasn't already set timedOut. If timedOut is true,
+      // the process timed out and was killed — ignore any subsequent natural exit code
+      // to avoid masking the timeout signal.
       // When the timeout fires and kills the process, code will be null (SIGTERM/SIGKILL)
       // and exitCode stays -1 (set by the timeout handler), which is the correct sentinel.
-      // When the process exits naturally (non-null) concurrent with the timer, trust the real exit code.
-      if (code !== null) {
+      // When the process exits naturally (non-null) concurrent with the timer and timedOut
+      // hasn't been set yet, trust the real exit code.
+      if (code !== null && !timedOut) {
         exitCode = code;
       }
       // else: timedOut && code===null → keep exitCode=-1 (set by timeout handler)
@@ -1085,7 +1092,7 @@ function resolveGitRoot(cwd: string): string {
       return git(["rev-parse", "--show-toplevel"], cwd).trim();
     }
     // Worktree: strip /.git/worktrees/<name> suffix to get the main repo root
-    return commonDir.replace(/\/\.git(?:\/worktrees\/[^\/]+)?$/, "");
+    return commonDir.replace(/\/\.git(?:\/worktrees\/.+)?$/, "");
   } catch {
     // Fallback: walk up looking for .git
     let dir = cwd;
@@ -1424,7 +1431,8 @@ export default function (pi: ExtensionAPI) {
           // check and the listener.
           if (ag.proc) {
             const { pid } = ag.proc;
-            if (pid !== undefined) {
+            if (pid !== undefined && ag.proc.exitCode === null) {
+              // Process is still alive — attach close listener before killing to avoid TOCTOU race
               const closePromise = new Promise<void>((resolveWait) => {
                 const timeout = setTimeout(() => resolveWait(), 3000);
                 ag.proc!.on("close", () => { clearTimeout(timeout); resolveWait(); });
@@ -1434,6 +1442,7 @@ export default function (pi: ExtensionAPI) {
                 await closePromise;
               } catch { /* already dead */ }
             }
+            // If proc.exitCode !== null, process already existed — skip wait entirely
           }
           cleanupWorktree(projectRoot(ctx.cwd), rest, true);
           subAgents.delete(rest);
@@ -2056,16 +2065,18 @@ export default function (pi: ExtensionAPI) {
       const { proc } = ag;
       if (proc) {
         const { pid } = proc;
-        if (pid !== undefined) {
+        if (pid !== undefined && proc.exitCode === null) {
+          // Process is still alive — attach close listener before killing to avoid TOCTOU race
           const closePromise = new Promise<void>((resolveWait) => {
             const timeout = setTimeout(() => resolveWait(), 3000);
             proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
           });
           try { proc.kill("SIGKILL"); } catch { /* ok */ }
-          try { process.kill(pid, 0); /* check if alive — wait for close */
+          try { process.kill(pid, 0);
             await closePromise;
           } catch { /* already dead */ }
         }
+        // If proc.exitCode !== null, process already existed — skip wait entirely
       }
       cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
       subAgents.delete(params.id);
@@ -2296,10 +2307,37 @@ export default function (pi: ExtensionAPI) {
             // branch deletion failed. Otherwise the sentinel blocks future session_start
             // cleanup attempts indefinitely.
             if (!existsSync(wtDir)) {
-              try { unlinkSync(sentinel); } catch { /* best effort */ }
-              try { git(["branch", "-D", branch], root); } catch {
-                console.warn(`[subagent] Could not delete stale branch ${branch} after worktree cleanup — manual cleanup may be needed.`);
+              // Before force-deleting the branch, check if it has unmerged commits to prevent data loss.
+              // This mirrors the merge-base check in the main try block above.
+              let branchExists = false;
+              try {
+                git(["rev-parse", "--verify", branch], root);
+                branchExists = true;
+              } catch { /* branch already deleted — nothing to preserve */ }
+              if (branchExists) {
+                try {
+                  const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
+                  const branchTip = git(["rev-parse", branch], root).trim();
+                  if (mergeBase !== branchTip) {
+                    const recoveredBranch = `recovered/subagent/${entry}`;
+                    git(["branch", "-m", branch, recoveredBranch], root);
+                    console.warn(`[subagent] Stale sentinel for ${entry}: worktree missing; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
+                  } else {
+                    git(["branch", "-D", branch], root);
+                  }
+                } catch {
+                  // merge-base or rev-parse failed — rename to recovered/ to preserve
+                  // unmerged commits rather than force-delete (which could lose data).
+                  try {
+                    const recoveredBranch = `recovered/subagent/${entry}`;
+                    git(["branch", "-m", branch, recoveredBranch], root);
+                    console.warn(`[subagent] Stale sentinel for ${entry}: worktree missing, merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
+                  } catch {
+                    git(["branch", "-D", branch], root);
+                  }
+                }
               }
+              try { unlinkSync(sentinel); } catch { /* best effort */ }
             }
             // If the worktree directory still exists, leave the sentinel so the next
             // session_start attempt retries the full cleanup.
