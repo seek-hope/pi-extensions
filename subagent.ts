@@ -211,7 +211,8 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, maxIt: number): P
  */
 async function handleImproveMode(
   targetAgentId: string | null, ctxCwd: string,
-  criteria: string | undefined, maxIt: number
+  criteria: string | undefined, maxIt: number,
+  task?: string
 ): Promise<LoopResult> {
   const existing = targetAgentId ? subAgents.get(targetAgentId) : null;
   if (existing && existing.status === "running") {
@@ -255,7 +256,14 @@ async function handleImproveMode(
         ? getDiff(ctxCwd, targetAgentId)
         : gitQuiet(["diff", "HEAD"], ctxCwd) || gitQuiet(["diff", "--cached"], ctxCwd);
       const parts = [`Review criteria: ${reviewCriteria}`];
-      if (diffContent) parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
+      if (diffContent) {
+        parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
+      } else if (task) {
+        // No diff + no worktree → tell reviewer exactly what to review
+        parts.push(`No git diff available. Read the code directly based on the task description.`);
+        parts.push(`TASK: ${task}`);
+      }
+      if (task && !targetAgentId) parts.push(`TASK: ${task}`);
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
       return parts.join("\n");
     },
@@ -901,7 +909,7 @@ export default function (pi: ExtensionAPI) {
         // If no subagentId, improve the current codebase directly (no worktree)
         // This avoids cross-repo mismatch when extensions live in a different git repo
         if (!params.subagentId) {
-          const result = await handleImproveMode(null, ctx.cwd, params.criteria, maxIt);
+          const result = await handleImproveMode(null, ctx.cwd, params.criteria, maxIt, params.task);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
