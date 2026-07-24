@@ -265,6 +265,11 @@ async function handleImproveMode(
       // If merge fails, report it — reviewLoop will detect the error and abort
       let mergeSucceeded = false;
       try {
+        // Commit any uncommitted changes in the target worktree before merging
+      try { git(["add", "-A"], workCwd); git(["commit", "-m", `pre-merge checkpoint`, "--allow-empty"], workCwd); } catch { /* ok */ }
+      // Merge fixer's changes back into the target worktree
+      let mergeSucceeded = false;
+      try {
         git(["merge", "--no-edit", branchName(fixerId)], workCwd);
         mergeSucceeded = true;
       } catch {
