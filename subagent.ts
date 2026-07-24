@@ -485,7 +485,10 @@ async function handleImproveMode(
   } finally {
     // Restore original status after loop completes so evictTerminalAgents
     // can resume normal eviction for this agent.
-    if (existing && originalStatus) {
+    // Only restore status if it hasn't been externally changed (e.g., by
+    // cancelSubAgent setting it to "cancelled"). Silently undoing a cancellation
+    // would allow evictTerminalAgents to delete a branch with committed work.
+    if (existing && originalStatus && existing.status === "improving") {
       existing.status = originalStatus;
     }
   }
@@ -498,7 +501,7 @@ async function handleImproveMode(
  */
 function autoMergeBranch(
   ctxCwd: string, execId: string, description: string
-): { retainForManualReview: boolean } {
+): { retainForManualReview: boolean; error?: string; hasConflicts?: boolean } {
   const result = mergeBranch(ctxCwd, execId, {
     stashPolicy: "auto",
     onCommitFailure: "keep-merge",
@@ -511,7 +514,11 @@ function autoMergeBranch(
       console.error(`  ⚠ Auto-merge of ${execId} failed: ${result.error.substring(0, 80)}`);
     }
   }
-  return { retainForManualReview: result.retainForManualReview };
+  return {
+    retainForManualReview: result.retainForManualReview,
+    error: (!result.success && result.error && result.error !== "Branch not found") ? result.error : undefined,
+    hasConflicts: result.hasConflicts || undefined,
+  };
 }
 
 /**
@@ -543,7 +550,10 @@ async function handleExecuteMode(
           allClean = false;
           // Preserve worktree and branch for commit failures so the user can inspect
           // and manually commit the changes (the error message tells them to check the worktree).
-          const isCommitFailure = ag.commitFailed === true;
+          // Preserve worktree and branch for committed work even if cancelled.
+          // commitHash is set when the closeHandler saw exit code 0 before SIGKILL.
+          const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "" && ag.commitHash !== "no-changes";
+          const isCommitFailure = ag.commitFailed === true || hasCommittedWork;
           cleanupWorktree(root, execId, !isCommitFailure);
           subAgents.delete(execId);
         } else {
@@ -925,6 +935,9 @@ function safeStashPop(ctxCwd: string, execId: string, context: string): void {
 async function cancelSubAgent(id: string, projectRootArg: string): Promise<void> {
   const ag = subAgents.get(id);
   if (!ag) return;
+  // Guard against cancelling terminal-state agents. If the agent already completed
+  // with committed work, destroying the branch would cause data loss.
+  if (ag.status !== "running") return;
   ag.status = "cancelled";
   // Wait for process to fully exit before cleaning up worktree to avoid
   // file handle races (e.g., rmSync on locked files after SIGKILL).
@@ -1071,15 +1084,21 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     if (model) args.push("--model", model);
     if (tools) args.push("--tools", tools);
     args.push("\n" + task);
-    const proc = spawn(resolvePiBin(), args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PI_SUBAGENT_DEPTH: String(depth + 1),
-        PI_SUBAGENT_ROOT: projectRoot(cwd),
-      },
-    });
+    let proc: ChildProcess;
+    try {
+      proc = spawn(resolvePiBin(), args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PI_SUBAGENT_DEPTH: String(depth + 1),
+          PI_SUBAGENT_ROOT: projectRoot(cwd),
+        },
+      });
+    } catch (err: any) {
+      resolve({ stdout: "", stderr: `[spawn error] ${err.message}`, exitCode: -2 });
+      return;
+    }
     let stdout = "";
     let stderr = "";
     let resolved = false;
@@ -1087,6 +1106,9 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     let timedOut = false;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
+      resolve({ stdout: "", stderr: `[spawn error] ${err.message}`, exitCode: -2 });
+      return;
+    }
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
@@ -1132,8 +1154,14 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     // Wire up AbortSignal for mid-flight cancellation BEFORE early check to prevent race
     if (signal) {
       abortHandler = () => {
-        // If the process already exited (proc.exitCode set) before close event,
-        // let the closeHandler report the real exit code instead of overwriting it.
+        // If the process already timed out, preserve the timeout sentinel
+        // instead of overwriting it with a cancellation sentinel.
+        if (timedOut) {
+          // timeout handler already set exitCode = -1 and stderr = timeout message.
+          // Just kill the process and let the close/fire timers resolve naturally.
+          try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+          return;
+        }
         if (proc.exitCode !== null) return;
         try { proc.kill("SIGKILL"); } catch { /* already dead */ }
         exitCode = -3;
@@ -1147,7 +1175,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       // If the process already exited, let closeHandler handle it
       if (proc.exitCode !== null) { done(); return; }
       try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-      stderr = "[cancelled]";
+      stderr = "[cancelled by user]";
       exitCode = -3;
       done(); // Call done() to clean up timers and listeners, not raw resolve()
       return;
