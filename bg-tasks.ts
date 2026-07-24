@@ -216,7 +216,7 @@ function pollCompletion(id: string): void {
           return;
         }
         updateTaskWidget();
-        setTimeout(check, 5000);
+        setTimeout(check, 2000);
         return;
       }
       // session doesn't exist — proceed to finalize
@@ -225,7 +225,7 @@ function pollCompletion(id: string): void {
     if (sessionExists) {
       // Still running
       updateTaskWidget();
-      setTimeout(check, 5000);
+      setTimeout(check, 2000);
       return;
     }
 
@@ -264,7 +264,7 @@ function pollCompletion(id: string): void {
       }
     } catch { /* ignore */ }
   };
-  setTimeout(check, 5000);
+  setTimeout(check, 2000);
 }
 
 // ── extension ───────────────────────────────────────────────────────────────
@@ -282,11 +282,15 @@ export default function (pi: ExtensionAPI) {
         sessionExists = true;
       } catch (e: any) {
         // exit code 1 = session does not exist (task completed while we were away)
-        // any other exit code = tmux error — skip this task, don't guess
-        if (e.status !== 1) continue;
+        // any other error (tmux missing, signal, etc.) — fall through to log file recovery
+        // instead of leaving the task stuck in "running" state forever.
+        if (e.status !== 1) {
+          console.debug("syncTasks: tmux error for", id, e.message || e.status);
+        }
       }
       if (sessionExists) {
         // Still running — resume polling
+        notifyUser(`🔄 Resumed polling for background task ${id}`, "info");
         pollCompletion(id);
       } else {
         // Session gone — check log for exit code

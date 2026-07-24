@@ -79,25 +79,42 @@ function clearDetailWidget(ctx?: any): void {
 function restoreFromBranch(ctx?: any): void {
   todo = { items: [], updatedAt: 0 };
   try {
-    const branch = ctx?.sessionManager?.getBranch?.();
-    if (Array.isArray(branch)) {
-      // Iterate in reverse so the most recent todo_write wins
-      for (let i = branch.length - 1; i >= 0; i--) {
-        const entry = branch[i];
-        if (entry?.type !== "message") continue;
-        const details = entry?.message?.details as { items?: TodoItem[] } | undefined;
-        // Array.isArray catches both populated and empty lists so that a
-        // todo_write that cleared everything is honoured on restore.
-        if (Array.isArray(details?.items)) {
-          // Normalize restored items so stale/corrupted status values don't
-          // break widget rendering (STATUS_ICONS lookup).
-          const safe = details.items.map(i => ({
-            content: String(i.content ?? ""),
-            status: normalizeStatus(i.status),
-          }));
-          todo = { items: safe, updatedAt: Date.now() };
-          break;
+    // Validate that required APIs exist before attempting to access them,
+    // preventing silent failures if internal pi data structures change upstream.
+    if (!ctx || typeof ctx !== 'object') return;
+    if (!ctx.sessionManager || typeof ctx.sessionManager.getBranch !== 'function') {
+      console.debug("restoreFromBranch: sessionManager.getBranch not available (format may have changed)");
+      return;
+    }
+    const branch = ctx.sessionManager.getBranch();
+    if (!Array.isArray(branch)) {
+      console.debug("restoreFromBranch: branch is not an array (format may have changed)");
+      return;
+    }
+    // Iterate in reverse so the most recent todo_write wins
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i];
+      // Validate each entry's structure before accessing nested properties
+      if (!entry || typeof entry !== 'object') continue;
+      if (entry?.type !== "message") continue;
+      const msg = entry?.message;
+      if (!msg || typeof msg !== 'object') continue;
+      const details = msg?.details as { items?: TodoItem[] } | undefined;
+      if (!details || typeof details !== 'object') continue;
+      // Array.isArray catches both populated and empty lists so that a
+      // todo_write that cleared everything is honoured on restore.
+      if (Array.isArray(details?.items)) {
+        // Validate each item individually to skip corrupted entries
+        const safe: TodoItem[] = [];
+        for (const item of details.items) {
+          if (!item || typeof item !== 'object') continue;
+          safe.push({
+            content: String(item.content ?? ""),
+            status: normalizeStatus(item.status),
+          });
         }
+        todo = { items: safe, updatedAt: Date.now() };
+        break;
       }
     }
   } catch (e) {
@@ -200,8 +217,11 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        const needsTruncation = content.length > 200;
-        return { content: content.substring(0, 200) + (needsTruncation ? "…" : ""), status };
+        // Sanitize BEFORE truncation to avoid splitting ANSI escape sequences mid-sequence,
+        // which would leave garbled escape artifacts in the widget.
+        const sanitized = sanitizeContent(content);
+        const needsTruncation = sanitized.length > 200;
+        return { content: sanitized.substring(0, 200) + (needsTruncation ? "…" : ""), status };
       });
 
       // Enforce: only one in_progress

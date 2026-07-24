@@ -126,7 +126,21 @@ function pollRemoteTask(conn: Connection, logPath: string, cmd: string, host: st
     }).catch(() => {
       errors++;
       if (errors < MAX_ERRORS && !stopped) { setTimeout(check, 5000); }
-      else { cleanup(); }
+      else {
+        if (!stopped) {
+          stopped = true;
+          try {
+            if (_sshPi) {
+              _sshPi.sendUserMessage([
+                { type: "text", text: `[SSH background task polling failed on ${host}]` },
+                { type: "text", text: `Command: ${cmd.substring(0, 200)}` },
+                { type: "text", text: `Log on remote: ${logPath}` },
+              ], { deliverAs: "followUp" });
+            }
+          } catch { /* ok */ }
+        }
+        cleanup();
+      }
     });
   }
 
@@ -593,7 +607,8 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: "sshpass blocked. Use ssh_exec or scp_to_remote/scp_from_remote." };
     }
     const words = cmd.split(/\s+/);
-    const idx = words.findIndex(w => /^(?:ssh|sshpass|scp|sftp|rsync)$/.test(w));
+    // Match any command that ENDS with one of the blocked tools (catches /usr/bin/ssh, ./ssh, etc.)
+    const idx = words.findIndex(w => /(?:^|\/)(ssh|sshpass|scp|sftp|rsync)$/.test(w));
     if (idx >= 0 && /\S+@\S+/.test(words.slice(idx, idx + 12).join(" "))) {
       return { block: true, reason: "Remote ssh/scp/rsync blocked. Use ssh_exec (commands) or scp_to_remote/scp_from_remote (files)." };
     }
@@ -668,7 +683,9 @@ export default function (pi: ExtensionAPI) {
           const m = (params.timeout as string).match(/^(\d+(?:\.\d+)?)\s*(s|m|h|ms)?$/i);
           if (m) {
             const val = parseFloat(m[1]);
-            const unit = (m[2] || "ms").toLowerCase();
+            // Default to seconds when no unit given — models are far more likely
+            // to write "300" meaning 300s than 300ms.
+            const unit = (m[2] || "s").toLowerCase();
             const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
             effectiveTimeout = Math.round(val * (multipliers[unit] || 1000));
           }

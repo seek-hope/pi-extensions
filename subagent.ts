@@ -152,8 +152,7 @@ async function reviewLoop(
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
     }
-    if (fixerOutput.startsWith("[Sub-agent error") || fixerOutput.startsWith("[Sub-agent spawn error") || 
-        fixerOutput.startsWith("[Sub-agent denied") || fixerOutput.startsWith("[Sub-agent timeout")) {
+    if (/^\[Sub-agent (error|spawn error|denied|timeout)/.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} issue(s)`);
@@ -339,7 +338,7 @@ async function handleExecuteMode(
                 // Pop stash back (merge was aborted, so working tree is clean)
                 if (stashed) gitQuiet(["stash", "pop"], ctxCwd);
               }
-            } catch { /* merge subsystem failed */ }
+            } catch (e: any) { console.debug("handleExecuteMode: merge subsystem failed", e?.message || e); }
             // Clean up worktree + branch + map entry after merge attempt
             // (skip if conflicts — branch is intentionally retained for manual review)
             if (!mergeHadConflicts) {
@@ -508,11 +507,11 @@ function getDiff(projectRoot: string, id: string): string {
   }
 }
 
-/** Commit changes in the actual project repo derived from the worktree path. */
-function commitWorktree(_worktreePath: string, id: string, task: string): string {
+/** Commit changes in the worktree directly (run git from the worktree path, not the main repo). */
+function commitWorktree(worktreePath: string, id: string, task: string): string {
   const msg = `pi: ${id} — ${task.substring(0, 80)}`;
   let lastHash = "";
-  const repo = projectRoot(_worktreePath);
+  const repo = worktreePath;
   if (repo && existsSync(join(repo, ".git"))) {
     try {
       if (gitQuiet(["status", "--porcelain"], repo).trim()) {
@@ -544,7 +543,8 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const killTimeout = Math.max(timeoutMs || 1_200_000, 1_200_000);
+  // Sub-processes (reviewers, fixers) should use a shorter timeout — 30s floor, 2min default, 20min ceiling
+  const killTimeout = Math.max(Math.min(timeoutMs || 120_000, 1_200_000), 30_000);
   const depth = currentDepth();
   return new Promise((resolve) => {
     const args: string[] = ["-p"];
@@ -735,12 +735,9 @@ function spawnSubAgent(
 
     proc.on("close", (code) => {
       if (settled) return;
-      // Guard: if entry was removed from global map, settle anyway to prevent hanging promises.
-      // Skip auto-commit since the worktree may already be cleaned up.
-      if (!subAgents.has(id)) {
-        settle(id + " externally cleaned up", "cancelled");
-        return;
-      }
+      // Note: agent may have been removed from subAgents map externally (TOCTOU race).
+      // Always settle with the actual process output rather than checking the map,
+      // which could race with external cleanup code.
       // Cancellation handled: settle so the promise resolves instead of hanging
       if (agent.status === "cancelled") {
         settle("[Sub-agent cancelled]", "cancelled");
