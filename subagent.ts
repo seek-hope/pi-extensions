@@ -163,7 +163,7 @@ interface LoopResult {
 async function reviewLoop(
   workCwd: string,
   buildReviewTask: (i: number) => string,
-  runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
+  runAction: (issuesCount: number, reviewerOutput: string, i: number, remainingTimeoutMs?: number) => Promise<string>,
   commitPrefix = "loop",
   signal?: AbortSignal,
   todoMatchKey?: string, // unique key for todo bridge updates (avoids substring collisions)
@@ -189,7 +189,7 @@ async function reviewLoop(
     // only handles the edge case where resolvePiBin() throws synchronously
     // inside the Promise constructor (e.g., missing binary).
     try {
-      r = await runSubProcess(reviewTask, workCwd, model ?? _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+      r = await runSubProcess(reviewTask, workCwd, model ?? _defaultModel, "read,bash,serena_search_pattern,serena_overview", Math.max(60_000, MAX_LOOP_DURATION_MS - (Date.now() - loopStartTime)), signal);
     } catch (e: any) {
       return { iterations: i, clean: false, summary: `❌ Reviewer failed to start at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
@@ -238,7 +238,7 @@ async function reviewLoop(
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
     let fixerOutput: string;
     try {
-      fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i);
+      fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i, Math.max(60_000, MAX_LOOP_DURATION_MS - (Date.now() - loopStartTime)));
     } catch (e: any) {
       if (e?.name === "AbortError" || signal?.aborted) {
         return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
@@ -327,7 +327,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       `- <issue>`,
       `If CLEAN: true, just write "CLEAN: true".`,
     ].join("\n"),
-    async (_c, reviewerOutput, _i) => {
+    async (_c, reviewerOutput, _i, remainingTimeoutMs) => {
       // Check for cancellation before running the fixer to avoid wasted work
       if (signal?.aborted) {
         return "[cancelled by user]";
@@ -338,7 +338,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
         ctxCwd,
         model ?? _defaultModel,
         "read,bash,serena_search_pattern,serena_overview",
-        undefined,
+        remainingTimeoutMs,
         signal
       );
       // Check if the fixer was cancelled/aborted mid-execution before trusting its output
@@ -377,8 +377,8 @@ async function handleImproveMode(
   }
 
   const existing = targetAgentId ? subAgents.get(targetAgentId) : null;
-  if (existing && existing.status === "running") {
-    return { iterations: 0, clean: false, summary: "Sub-agent still running." };
+  if (existing && (existing.status === "running" || existing.status === "improving")) {
+    return { iterations: 0, clean: false, summary: existing.status === "running" ? "Sub-agent still running." : "Sub-agent is already being improved." };
   }
 
   // If targetAgentId given but agent not in map, try to reconstruct worktree path
@@ -442,7 +442,7 @@ async function handleImproveMode(
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
       return parts.join("\n");
       },
-      async (issuesCount, reviewerOutput, _i) => {
+      async (issuesCount, reviewerOutput, _i, remainingTimeoutMs) => {
         // Check for cancellation before running the fixer to avoid wasted work
         if (signal?.aborted) {
           return "[cancelled by user]";
@@ -452,7 +452,7 @@ async function handleImproveMode(
         // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
         // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
         const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, signal);
+        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", remainingTimeoutMs, signal);
         const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
         // Check if the fixer was cancelled/aborted mid-execution before trusting its output
         if (signal?.aborted || r.exitCode === -3) {
@@ -469,8 +469,7 @@ async function handleImproveMode(
       todoMatchKey
     );
   } catch (e: any) {
-    _loopResult = { iterations: 0, clean: false, summary: `Unexpected error in review loop: ${(e.message || e).substring(0, 200)}` };
-    throw e;
+    return { iterations: 0, clean: false, summary: `Unexpected error in review loop: ${(e.message || e).substring(0, 200)}` };
   } finally {
     // Restore original status after loop completes so evictTerminalAgents
     // can resume normal eviction for this agent.
@@ -561,12 +560,18 @@ async function handleExecuteMode(
         let branchExists = true;
         let hasUnmergedCommits = false;
         try {
-          const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
-          const branchTip = git(["rev-parse", branch], root).trim();
-          hasUnmergedCommits = mergeBase !== branchTip;
+          git(["rev-parse", "--verify", branch], root);
         } catch {
-          // git merge-base or rev-parse threw — branch was already deleted (merged and cleaned up)
           branchExists = false;
+        }
+        if (branchExists) {
+          try {
+            const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
+            const branchTip = git(["rev-parse", branch], root).trim();
+            hasUnmergedCommits = mergeBase !== branchTip;
+          } catch {
+            hasUnmergedCommits = true;
+          }
         }
         if (branchExists && hasUnmergedCommits) {
           results.push(`${i + 1}. ${item.description}: ⚠ evicted but had committed work (branch preserved)`);
@@ -816,7 +821,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
       return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
     } catch {
       const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
-      if (fullHash) return fullHash.substring(0, 7);
+      if (/^[a-f0-9]{40}$/.test(fullHash)) return fullHash.substring(0, 7);
       console.warn(`commitWorktree: commit succeeded but rev-parse HEAD failed in ${worktreePath}; hash unknown.`);
       return "committed-no-hash";
     }
@@ -1538,7 +1543,7 @@ export default function (pi: ExtensionAPI) {
         // If no subagentId, improve the current codebase directly (no worktree)
         // This avoids cross-repo mismatch when extensions live in a different git repo
         // Treat undefined, null, empty, or whitespace-only as "no subagentId"
-        if (params.subagentId === undefined || params.subagentId === null || params.subagentId.trim() === "") {
+        if (params.subagentId === undefined || params.subagentId === null || typeof params.subagentId !== "string" || params.subagentId.trim() === "") {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey, params.model);
           if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
@@ -1969,16 +1974,15 @@ export default function (pi: ExtensionAPI) {
         // spawn() throws synchronously inside the Promise executor (e.g., missing
         // pi binary), the promise can reject. Wrap in try/catch to prevent
         // crashing the entire parallel tool on a single spawn failure.
-        let batchResults: { task: string; id: string; result: string; status: string; elapsed: number; commitHash?: string }[];
-        try {
-          batchResults = await Promise.all(batchPromises);
-        } catch (e: any) {
-          batchResults = batchPromises.map((_, i) => {
-            const task = batch[i];
-            const id = batchIds[i];
-            return { task, id, result: `[Sub-agent spawn error] ${e.message || String(e)}`, status: "error", elapsed: 0 };
-          });
-        }
+        const settledResults = await Promise.allSettled(batchPromises);
+        const batchResults: { task: string; id: string; result: string; status: string; elapsed: number; commitHash?: string }[] = settledResults.map((sr, i) => {
+          if (sr.status === "fulfilled") {
+            return sr.value;
+          }
+          const task = batch[i];
+          const id = batchIds[i];
+          return { task, id, result: `[Sub-agent spawn error] ${sr.reason?.message || String(sr.reason)}`, status: "error", elapsed: 0 };
+        });
         results.push(...batchResults);
         // If cancelled mid-batch, clean up any sub-agents that are still tracked as running
         if (_signal?.aborted) {
