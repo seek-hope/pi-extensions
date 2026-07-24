@@ -118,7 +118,10 @@ async function reviewLoop(
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
   for (let i = 1; i <= MAX_ROUNDS; i++) {
-    console.error(`[improve] Round ${i}/${MAX_ROUNDS}: reviewing...`);
+    // Update todo progress if bridge available
+    const tb = (globalThis as any).__pi_todo;
+    if (tb) tb.updateItemByContent("improve:", "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
+
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
@@ -153,6 +156,7 @@ async function reviewLoop(
 
     if (isClean) {
       console.error(`[improve] ✅ CLEAN after ${i} rounds`);
+      if (tb) tb.updateItemByContent("improve:", "completed", `✅ improve: clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -160,7 +164,7 @@ async function reviewLoop(
     }
 
     const fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i);
-    console.error(`[improve] Round ${i}: fixer done (${fixerOutput.length} chars)`);
+    if (tb) tb.updateItemByContent("improve:", "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} issue(s)`);
     // Detect fixer failure — empty output or spawn errors
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
@@ -941,10 +945,15 @@ export default function (pi: ExtensionAPI) {
 
       // ── IMPROVE mode ────────────────────────────────────────────────
       if (params.mode === "improve") {
+        // Add a todo item so progress is visible in the todo flow widget
+        const tb = (globalThis as any).__pi_todo;
+        if (tb) tb.addItem(`🔍 improve: ${params.task.substring(0, 50)}`);
+
         // If no subagentId, improve the current codebase directly (no worktree)
         // This avoids cross-repo mismatch when extensions live in a different git repo
         if (!params.subagentId) {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task);
+          if (tb) tb.updateItemByContent("improve:", "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 

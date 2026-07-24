@@ -32,6 +32,29 @@ const STATUS_ICONS: Record<TodoStatus, string> = {
 
 let _pi: ExtensionAPI | null = null;
 let todo: TodoList = { items: [], updatedAt: 0 };
+
+// ── global bridge: allow other extensions (e.g. subagent) to push/update items ──
+(globalThis as any).__pi_todo = {
+  addItem(content: string, status: TodoStatus = "in_progress"): string {
+    const id = `auto-${Date.now().toString(36)}`;
+    todo.items.push({ content, status });
+    todo.updatedAt = Date.now();
+    return id;
+  },
+  updateItemByContent(partialContent: string, newStatus: TodoStatus, newContent?: string) {
+    const item = todo.items.find(i => i.content.includes(partialContent));
+    if (item) {
+      item.status = newStatus;
+      if (newContent) item.content = newContent;
+      todo.updatedAt = Date.now();
+    }
+  },
+  removeItemByContent(partialContent: string) {
+    const idx = todo.items.findIndex(i => i.content.includes(partialContent));
+    if (idx >= 0) { todo.items.splice(idx, 1); todo.updatedAt = Date.now(); }
+  },
+  getItems() { return todo.items; },
+};
 let detailWidgetActive = false;
 
 /** Narrow a string to a valid TodoStatus after user input or session restore. */
@@ -255,6 +278,19 @@ export default function (pi: ExtensionAPI) {
 
       todo = { items, updatedAt: Date.now() };
       renderWidget(ctx);
+
+      // Auto-clear when all done: show full completed list as notification, then clear widget
+      const allDone = items.length > 0 && items.every(i => i.status === "completed" || i.status === "cancelled");
+      if (allDone) {
+        const doneList = items.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
+        const notify = _pi?.ui?.notify || ctx?.ui?.notify?.bind(ctx?.ui);
+        if (notify) (notify as any)(`All tasks complete:\n${doneList}`, "info");
+        // Clear widget after brief display
+        setTimeout(() => {
+          todo = { items: [], updatedAt: Date.now() };
+          renderWidget(ctx);
+        }, 3000);
+      }
 
       // Count by status for response
       const counts: Record<string, number> = {};
