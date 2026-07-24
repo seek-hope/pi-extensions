@@ -662,34 +662,30 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
   // The extensions dir is a different git repo — do NOT commit unrelated changes there.
   if (!gitQuiet(["status", "--porcelain"], worktreePath).trim()) return "";
 
-  let preCommitHash = "";
   try {
-    // Capture the pre-commit HEAD hash so we can undo the commit on rev-parse failure.
-    // This prevents duplicate commits if the caller retries after a false "failed" return.
-    preCommitHash = git(["rev-parse", "HEAD"], worktreePath).trim();
     // Use git add -A to stage all changes including new files the sub-agent may
     // have created via the write tool. The .gitignore file still excludes build
     // artifacts, binaries, logs, and secrets; -A is safe because the worktree
     // is dedicated to this sub-agent's task and should reflect the full diff.
     git(["add", "-A"], worktreePath);
     git(["commit", "-m", msg], worktreePath);
-    const hash = git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
-    return hash;
-  } catch (e: any) {
-    // If commit succeeded but rev-parse failed, undo the commit to prevent duplicate commits
-    // on caller retry. Only attempt undo if we have a valid pre-commit hash and commit likely
-    // went through (add succeeded).
+    // git commit succeeded. Attempt hash retrieval — if rev-parse fails we still
+    // return a success indicator rather than undoing the commit (which would
+    // create a false negative for the caller).
     try {
-      const head = git(["rev-parse", "HEAD"], worktreePath).trim();
-      if (head !== preCommitHash) {
-        git(["reset", "--soft", "HEAD~1"], worktreePath);
-      }
-    } catch { /* best effort undo */ }
-    // Reset the index to HEAD to prevent dirty staging area from leaking into the next
-    // iteration. If `git add -u` succeeded but `git commit` failed, the index holds staged
-    // changes. Without a reset, the next call's `git add -u` re-stages everything (no-op
-    // for already-staged files), and a successful commit would bundle changes from *both*
-    // iterations under a single message, losing the per-iteration audit trail.
+      return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
+    } catch {
+      const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
+      if (fullHash) return fullHash.substring(0, 7);
+      return "committed";
+    }
+  } catch (e: any) {
+    // git add or git commit failed. Reset the index to prevent dirty staging area
+    // from leaking into the next iteration. If `git add -A` succeeded but
+    // `git commit` failed, the index holds staged changes. Without a reset, the
+    // next call's `git add -A` re-stages everything (no-op for already-staged
+    // files), and a successful commit would bundle changes from *both* iterations
+    // under a single message, losing the per-iteration audit trail.
     try { git(["reset", "HEAD"], worktreePath); } catch { /* best effort */ }
     console.error(`commitWorktree failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
     return "";
