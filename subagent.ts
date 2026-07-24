@@ -118,11 +118,13 @@ async function reviewLoop(
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
   for (let i = 1; i <= MAX_ROUNDS; i++) {
+    console.error(`[improve] Round ${i}/${MAX_ROUNDS}: reviewing...`);
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
     const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash,serena_search_pattern,serena_overview");
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
+    console.error(`[improve] Round ${i}: reviewer done (exit ${r.exitCode}, ${reviewerOutput.length} chars)`);
 
     // Abort if reviewer crashed or produced no output
     if (r.exitCode !== 0 && (!reviewerOutput || reviewerOutput.trim().length === 0)) {
@@ -147,8 +149,10 @@ async function reviewLoop(
     const actualIssuesCountForIter = isClean ? 0 : actualIssuesCount;
 
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
+    console.error(`[improve] Round ${i}: ${isClean ? "CLEAN" : `${actualIssuesCount} issue(s) → fixing`}`);
 
     if (isClean) {
+      console.error(`[improve] ✅ CLEAN after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} issue(s) → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -156,6 +160,7 @@ async function reviewLoop(
     }
 
     const fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i);
+    console.error(`[improve] Round ${i}: fixer done (${fixerOutput.length} chars)`);
     // Detect fixer failure — empty output or spawn errors
     if (!fixerOutput || fixerOutput.trim().length === 0) {
       return { iterations: i, clean: false, summary: `❌ Fixer produced no output at round ${i}. Aborting.` };
