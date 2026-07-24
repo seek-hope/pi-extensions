@@ -157,7 +157,12 @@ async function reviewLoop(
     evictTerminalAgents(); // periodic cleanup of stale agent records
     const reviewTask = buildReviewTask(i);
     // Reviewer runs directly (no worktree) — it only reads and reports
-    const r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+    let r;
+    try {
+      r = await runSubProcess(reviewTask, workCwd, _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+    } catch (e: any) {
+      return { iterations: i, clean: false, summary: `❌ Reviewer failed to start at round ${i}: ${(e.message || e).substring(0, 200)}` };
+    }
     const reviewerOutput = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
 
     // Abort if reviewer was killed by signal — output may be partial/garbled
@@ -227,7 +232,13 @@ async function reviewLoop(
     if (/^\[Sub-agent (?:error|spawn error|denied|timeout)[^\]]*\]/.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
-    if (commitPrefix !== "") commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+    if (commitPrefix !== "") {
+      const hash = commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+      if (!hash) {
+        console.error(`reviewLoop: commitWorktree failed at iteration ${i} in ${workCwd}`);
+        return { iterations: i, clean: false, summary: `❌ Fix committed but git commit failed at round ${i}. Aborting to avoid stale state.` };
+      }
+    }
   }
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
@@ -248,7 +259,12 @@ async function reviewLoop(
 async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSignal, todoMatchKey?: string): Promise<LoopResult> {
   // Phase 1: initial exploration with cheap model (use sub-process, not worktree)
   const initTask = `Explore and analyze: ${task}\n\nBe thorough. DO NOT modify any files. Produce a comprehensive analysis.`;
-  const initR = await runSubProcess(initTask, ctxCwd, _cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+  let initR;
+  try {
+    initR = await runSubProcess(initTask, ctxCwd, _cheapModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
+  } catch (e: any) {
+    return { iterations: 0, clean: false, summary: `❌ Initial exploration failed to start: ${(e.message || e).substring(0, 200)}` };
+  }
   let analysis = initR.stdout + (initR.stderr ? "\n" + initR.stderr : "");
 
   // Bail early if initial exploration failed
@@ -651,7 +667,12 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     // Capture the pre-commit HEAD hash so we can undo the commit on rev-parse failure.
     // This prevents duplicate commits if the caller retries after a false "failed" return.
     preCommitHash = git(["rev-parse", "HEAD"], worktreePath).trim();
-    git(["add", "-A"], worktreePath);
+    // Use git add -u (tracked files only) to avoid accidentally committing build
+    // artifacts, large binaries, core dumps, logs, or secrets that the sub-agent
+    // may have created. In a git worktree, the sub-agent should only modify
+    // existing tracked files; new untracked files are intentionally excluded
+    // from auto-commit as a security precaution.
+    git(["add", "-u"], worktreePath);
     git(["commit", "-m", msg], worktreePath);
     const hash = git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
     return hash;
@@ -882,31 +903,29 @@ function currentDepth(): number {
 
 /** Resolve the nearest git repo root from a starting directory. */
 function resolveGitRoot(cwd: string): string {
+  // Always check --git-common-dir first to detect worktree contexts.
+  // In a regular repo it returns ".git" (relative); in a worktree it returns an
+  // absolute path like /path/to/main/.git/worktrees/sa-xxx. Using this first ensures
+  // we always resolve the main repo root, not a worktree root.
   try {
-    return git(["rev-parse", "--show-toplevel"], cwd).trim();
-  } catch {
-    // Check if we're inside a git worktree (git rev-parse fails in subdirs of a worktree sometimes)
-    try {
-      const commonDir = git(["rev-parse", "--git-common-dir"], cwd).trim();
-      // --git-common-dir returns ".git" (relative) in a regular repo
-      // or an absolute path like /path/to/main/.git/worktrees/sa-xxx in a worktree
-      if (commonDir === ".git") {
-        // Fall through to walk-up logic below — don't return cwd which may be a subdirectory
-        throw new Error("relative .git — need to walk up");
-      }
-      // Strip /.git or /.git/worktrees/<name> suffix to get the repo root
-      return commonDir.replace(/\/\.git(?:\/worktrees\/[^\/]+)?$/, "");
-    } catch {
-      // Last resort: walk up looking for .git
-      let dir = cwd;
-      for (let i = 0; i < 32; i++) {
-        if (existsSync(join(dir, ".git"))) return dir;
-        const parent = join(dir, "..");
-        if (parent === dir) break;
-        dir = parent;
-      }
-      return cwd; // absolute fallback
+    const commonDir = git(["rev-parse", "--git-common-dir"], cwd).trim();
+    if (commonDir === ".git") {
+      // Regular repo (not a worktree). Use --show-toplevel to get the root.
+      // This handles the common case and resolves symlinks correctly.
+      return git(["rev-parse", "--show-toplevel"], cwd).trim();
     }
+    // Worktree: strip /.git/worktrees/<name> suffix to get the main repo root
+    return commonDir.replace(/\/\.git(?:\/worktrees\/[^\/]+)?$/, "");
+  } catch {
+    // Fallback: walk up looking for .git
+    let dir = cwd;
+    for (let i = 0; i < 32; i++) {
+      if (existsSync(join(dir, ".git"))) return dir;
+      const parent = join(dir, "..");
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return cwd; // absolute fallback
   }
 }
 
@@ -1091,7 +1110,9 @@ function spawnSubAgent(
           agent.error = stderr.trim() || "killed by signal";
         }
         cleanupWorktree(root, id, true);
-        settle(`[Sub-agent killed by signal] ${agent.error}\n\nOutput:\n${stdout.trim().substring(0, 3000)}`, "error");
+        // Differentiate timeout (agent.error starts with "timeout") from signal kills
+        const prefix = agent.error.startsWith("timeout") ? "[Sub-agent timeout]" : "[Sub-agent killed by signal]";
+        settle(`${prefix} ${agent.error}\n\nOutput:\n${stdout.trim().substring(0, 3000)}`, "error");
       } else {
         agent.error = stderr.trim() || `exit code ${code}`;
         cleanupWorktree(root, id, true);
@@ -1821,11 +1842,18 @@ export default function (pi: ExtensionAPI) {
     // Only remove worktrees that still have a sentinel file — these are agents that
     // were interrupted (crashed/killed) before reaching a terminal state.
     // Completed-but-unmerged agents do NOT have sentinel files and are preserved.
-    const root = process.env.PI_SUBAGENT_ROOT;
+    let root = process.env.PI_SUBAGENT_ROOT;
     if (!root) {
-      // At session start, process.cwd() may not be the project directory.
-      // Without PI_SUBAGENT_ROOT we can't safely determine where worktrees live.
-      return;
+      // Fallback: resolve the git root from the current working directory.
+      // This handles the common case where session_start runs in a pi session
+      // that was started from a project directory (no PI_SUBAGENT_ROOT set).
+      try {
+        root = resolveGitRoot(process.cwd());
+      } catch {
+        // Can't determine project root — without PI_SUBAGENT_ROOT or a valid git
+        // repository, we can't safely determine where worktrees live. Skip cleanup.
+        return;
+      }
     }
     const subDir = join(root, ".pi", "subagent");
     if (existsSync(subDir)) {
