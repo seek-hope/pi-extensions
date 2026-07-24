@@ -104,6 +104,7 @@ async function moveToVerified(x: number, y: number, bound: { width: number; heig
   const { x: cx, y: cy } = clamp(x, y, bound);
   let lastPos: { x: number; y: number } | null = null;
   let readSucceeded = false;
+  let lastErr: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     sudoSh(`ydotool mousemove -x ${cx} -y ${cy}`, 3_000);
     await sleep(50);
@@ -113,7 +114,8 @@ async function moveToVerified(x: number, y: number, bound: { width: number; heig
       lastPos = pos;
       // Accept if within 5px tolerance
       if (Math.abs(pos.x - cx) <= 5 && Math.abs(pos.y - cy) <= 5) return;
-    } catch {
+    } catch (e) {
+      lastErr = e;
       // getCursorPos failed — may be transient; retry
     }
   }
@@ -124,9 +126,11 @@ async function moveToVerified(x: number, y: number, bound: { width: number; heig
       `The mouse may not have moved correctly.`
     );
   } else {
+    const detail = lastErr instanceof Error ? lastErr.message : String(lastErr ?? "unknown");
     throw new Error(
       `Failed to move mouse to (${cx}, ${cy}) after 3 attempts. ` +
       `Could not read cursor position (getCursorPos failed each time). ` +
+      `Last error: ${detail}. ` +
       `The mouse may not have moved correctly.`
     );
   }

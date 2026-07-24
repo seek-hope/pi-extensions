@@ -48,6 +48,7 @@ function saveTasks(tasks: Map<string, Task>): void {
 
 const tasks = loadTasks();
 const pollingTasks = new Set<string>(); // tracks which task IDs are currently being polled
+const spawningLocks = new Set<string>(); // guards spawnTask dedup against TOCTOU races
 let _pi: ExtensionAPI | null = null;
 
 function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): void {
@@ -57,6 +58,7 @@ function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): v
 // ── spawn background task ──────────────────────────────────────────────────
 
 function spawnTask(description: string, cwd: string, timeout: number): Task {
+  const lockKey = `${description}||${cwd}`;
   // Deduplicate: if identical task (same description and cwd) already running, return existing.
   // Verify the tmux session is actually still alive before deduplicating.
   for (const [, t] of tasks) {
@@ -73,58 +75,78 @@ function spawnTask(description: string, cwd: string, timeout: number): Task {
       }
     }
   }
-  const id = `task-${Date.now().toString(36)}`;
-  const logFile = join(TASK_DIR, `${id}.log`);
-  mkdirSync(TASK_DIR, { recursive: true });
-
-  const startTime = Date.now();
-
-  // Write the task command to a standalone script file — avoids shell escaping
-  // and heredoc-marker collision issues entirely.
-  const taskScript = join(TASK_DIR, `${id}.sh`);
-  const wrapperScript = [
-    `cd '${cwd.replace(/'/g, "'\\''")}'`,
-    `bash '${taskScript.replace(/'/g, "'\\''")}' > "${logFile.replace(/'/g, "'\\''")}" 2>&1`,
-    `echo "EXIT_CODE=$?" >> "${logFile.replace(/'/g, "'\\''")}"`,
-  ].join("\n");
-  writeFileSync(taskScript, description);
-  const wrapperFile = join(TASK_DIR, `${id}_wrapper.sh`);
-  writeFileSync(wrapperFile, wrapperScript);
-
+  // Guard against TOCTOU: if another concurrent spawn for the same (desc, cwd) is in
+  // progress, wait for it to finish and return its task.
+  if (spawningLocks.has(lockKey)) {
+    // Busy-wait with backoff until the lock is released or a task matching our criteria appears.
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const existing = [...tasks.values()].find(
+        t => t.status === "running" && t.description === description && t.cwd === cwd
+      );
+      if (existing) return existing;
+      if (!spawningLocks.has(lockKey)) break;
+      // Brief yield to let the other call proceed
+      execSync("sleep 0.1", { stdio: "ignore", timeout: 5_000 });
+    }
+  }
+  spawningLocks.add(lockKey);
   try {
-    execSync(`tmux new-session -d -s "${id}" "bash '${wrapperFile.replace(/'/g, "'\\''")}' ; rm -f '${wrapperFile.replace(/'/g, "'\\''")}' '${taskScript.replace(/'/g, "'\\''")}'" 2>/dev/null`, { timeout: 10_000 });
-  } catch {
-    // tmux spawn failed — clean up and throw
-    try { unlinkSync(taskScript); } catch { /* ok */ }
-    try { unlinkSync(wrapperFile); } catch { /* ok */ }
-    throw new Error(`Failed to start tmux session for task ${id}`);
+    const id = `task-${Date.now().toString(36)}`;
+    const logFile = join(TASK_DIR, `${id}.log`);
+    mkdirSync(TASK_DIR, { recursive: true });
+
+    const startTime = Date.now();
+
+    // Write the task command to a standalone script file — avoids shell escaping
+    // and heredoc-marker collision issues entirely.
+    const taskScript = join(TASK_DIR, `${id}.sh`);
+    const wrapperScript = [
+      `cd '${cwd.replace(/'/g, "'\\''")}'`,
+      `bash '${taskScript.replace(/'/g, "'\\''")}' > "${logFile.replace(/'/g, "'\\''")}" 2>&1`,
+      `echo "EXIT_CODE=$?" >> "${logFile.replace(/'/g, "'\\''")}"`,
+    ].join("\n");
+    writeFileSync(taskScript, description);
+    const wrapperFile = join(TASK_DIR, `${id}_wrapper.sh`);
+    writeFileSync(wrapperFile, wrapperScript);
+
+    try {
+      execSync(`tmux new-session -d -s "${id}" "bash '${wrapperFile.replace(/'/g, "'\\''")}' ; rm -f '${wrapperFile.replace(/'/g, "'\\''")}' '${taskScript.replace(/'/g, "'\\''")}'" 2>/dev/null`, { timeout: 10_000 });
+    } catch {
+      // tmux spawn failed — clean up and throw
+      try { unlinkSync(taskScript); } catch { /* ok */ }
+      try { unlinkSync(wrapperFile); } catch { /* ok */ }
+      throw new Error(`Failed to start tmux session for task ${id}`);
+    }
+
+    const task: Task = { id, description, cwd, status: "running", startTime, logFile };
+    tasks.set(id, task);
+    saveTasks(tasks);
+
+    // Poll for completion and notify
+    pollCompletion(id);
+
+    if (timeout > 0) {
+      setTimeout(() => {
+        const t = tasks.get(id);
+        if (t && t.status === "running") {
+          try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
+          t.status = "killed";
+          t.endTime = Date.now();
+          pollingTasks.delete(id);
+          // Clean up script files that the tmux session would have removed on normal exit
+          try { unlinkSync(wrapperFile); } catch { /* ok */ }
+          try { unlinkSync(taskScript); } catch { /* ok */ }
+          saveTasks(tasks);
+          updateTaskWidget();
+        }
+      }, timeout);
+    }
+
+    return task;
+  } finally {
+    spawningLocks.delete(lockKey);
   }
-
-  const task: Task = { id, description, cwd, status: "running", startTime, logFile };
-  tasks.set(id, task);
-  saveTasks(tasks);
-
-  // Poll for completion and notify
-  pollCompletion(id);
-
-  if (timeout > 0) {
-    setTimeout(() => {
-      const t = tasks.get(id);
-      if (t && t.status === "running") {
-        try { execSync(`tmux kill-session -t "${id}" 2>/dev/null`, { timeout: 5_000 }); } catch { /* ok */ }
-        t.status = "killed";
-        t.endTime = Date.now();
-        pollingTasks.delete(id);
-        // Clean up script files that the tmux session would have removed on normal exit
-        try { unlinkSync(wrapperFile); } catch { /* ok */ }
-        try { unlinkSync(taskScript); } catch { /* ok */ }
-        saveTasks(tasks);
-        updateTaskWidget();
-      }
-    }, timeout);
-  }
-
-  return task;
 }
 
 function getTaskOutput(task: Task): string {

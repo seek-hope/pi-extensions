@@ -534,18 +534,21 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
 }
 
 /** Clean up worktree and optionally the branch */
-function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean): void {
+function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean): { branchDeleted: boolean; worktreeRemoved: boolean } {
   const safe = safeId(id);
-  if (!safe) return; // invalid id, nothing to clean up
+  if (!safe) return { branchDeleted: false, worktreeRemoved: false }; // invalid id, nothing to clean up
   const wtDir = join(projectRoot, ".pi", "subagent", safe);
   const branch = branchName(safe);
+  let worktreeRemoved = false;
+  let branchDeleted = false;
   // Remove git worktree metadata first
-  try { git(["worktree", "remove", "--force", wtDir], projectRoot); } catch { /* ok */ }
+  try { git(["worktree", "remove", "--force", wtDir], projectRoot); worktreeRemoved = true; } catch { /* ok */ }
   // Always try to remove the directory — git worktree remove may leave stale dirs behind
-  try { rmSync(wtDir, { recursive: true, force: true }); } catch { /* ok */ }
+  try { rmSync(wtDir, { recursive: true, force: true }); worktreeRemoved = true; } catch { /* ok */ }
   if (deleteBranch) {
-    try { git(["branch", "-d", branch], projectRoot); } catch { /* ok */ }
+    try { git(["branch", "-d", branch], projectRoot); branchDeleted = true; } catch { /* ok */ }
   }
+  return { branchDeleted, worktreeRemoved };
 }
 
 // ── sub-process runner ───────────────────────────────────────────────────────
@@ -913,7 +916,14 @@ export default function (pi: ExtensionAPI) {
         try {
           const ag = subAgents.get(params.subagentId);
           if (ag && ag.status !== "running") {
+            // Stash any dirty state before merging to avoid merge failures
+            let stashed = false;
+            if (gitQuiet(["status", "--porcelain"], ctx.cwd).trim()) {
+              gitQuiet(["stash", "push", "-m", `pi: auto-stash before merge ${params.subagentId}`], ctx.cwd);
+              stashed = true;
+            }
             try { git(["merge", "--no-edit", branchName(params.subagentId)], ctx.cwd); } catch { /* merge can fail */ }
+            if (stashed) gitQuiet(["stash", "pop"], ctx.cwd);
             cleanupWorktree(projectRoot(ctx.cwd), params.subagentId, true);
             subAgents.delete(params.subagentId);
           }
@@ -1177,22 +1187,29 @@ export default function (pi: ExtensionAPI) {
       if (ag) {
         if (ag.status === "running") {
           if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
-          ag.status = "cancelled";
         }
         ag.status = "rejected";
       }
 
-      cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
+      const result = cleanupWorktree(projectRoot(ctx.cwd), params.id, true);
       if (ag) subAgents.delete(params.id);
+
+      const msgs = [`🗑 Sub-agent ${params.id} rejected.`];
+      if (result.branchDeleted) {
+        msgs.push(`Branch ${branchName(params.id)} deleted.`);
+      } else {
+        msgs.push(`Branch ${branchName(params.id)} not found or could not be deleted.`);
+      }
+      if (result.worktreeRemoved) {
+        msgs.push(`Worktree removed.`);
+      } else {
+        msgs.push(`Worktree not found or could not be removed.`);
+      }
 
       return {
         content: [{
           type: "text",
-          text: [
-            `🗑 Sub-agent ${params.id} rejected.`,
-            `Branch ${branchName(params.id)} deleted.`,
-            `Worktree removed.`,
-          ].join("\n"),
+          text: msgs.join("\n"),
         }],
         details: { rejected: true },
       };

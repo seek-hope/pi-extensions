@@ -680,7 +680,7 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         // Block timeouts >300s — model must explicitly use background mode for long tasks
-        let effectiveTimeout: number | undefined = typeof params.timeout === "number" ? params.timeout : undefined;
+        let effectiveTimeout: number | undefined = typeof params.timeout === "number" && params.timeout > 0 ? params.timeout : undefined;
         // Handle string timeouts like "10000s" or "10m" that models sometimes pass
         if (effectiveTimeout === undefined && typeof params.timeout === "string") {
           const m = (params.timeout as string).match(/^(\d+(?:\.\d+)?)\s*(s|m|h|ms)?$/i);
@@ -688,7 +688,7 @@ export default function (pi: ExtensionAPI) {
             const val = parseFloat(m[1]);
             // Default to seconds when no unit given — models are far more likely
             // to write "300" meaning 300s than 300ms.
-            const unit = (m[2] || "s").toLowerCase();
+            const unit = (m[2] || "ms").toLowerCase();
             const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
             effectiveTimeout = Math.round(val * (multipliers[unit] || 1000));
           }
