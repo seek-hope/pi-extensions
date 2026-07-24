@@ -126,7 +126,8 @@ function renderWidget(ctx?: any): void {
   const ui = ctx?.ui ?? _pi?.ui;
   if (!ui) return;
 
-  if (todo.items.length === 0) {
+  const active = todo.items.filter(i => i.status === "pending" || i.status === "in_progress");
+  if (active.length === 0) {
     ui.setWidget("todo", undefined);
     return;
   }
@@ -134,32 +135,29 @@ function renderWidget(ctx?: any): void {
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
   const total = todo.items.length;
 
-  // Flow view: all items in order, connected by lines
-  const MAX_VISIBLE = 8;
-  const showAll = todo.items.length <= MAX_VISIBLE;
-  const visible = showAll ? todo.items : todo.items.slice(0, MAX_VISIBLE);
+  // Flow view: active items only (completed hidden to save widget space)
+  const MAX_VISIBLE = 5;
+  const showAll = active.length <= MAX_VISIBLE;
+  const visible = showAll ? active : active.slice(0, MAX_VISIBLE);
 
   const lines: string[] = [];
-  lines.push(`┌─ Todo Flow (${done}/${total}) ──────────`);
-  lines.push("│");
+  lines.push(`┌─ Todo (${done}/${total}) ──────────`);
 
   for (let i = 0; i < visible.length; i++) {
     const item = visible[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    const safe = sanitizeContent(item.content).substring(0, 50);
-    const isLast = i === visible.length - 1;
-    const connector = isLast ? "  " : "│ ";
+    const safe = sanitizeContent(item.content).substring(0, 40);
+    const connector = i < visible.length - 1 ? "│" : " ";
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
-    lines.push(`│  ${bold}${icon}  ${safe}${reset}`);
-    if (!isLast) lines.push(`│  ${connector}`);
+    lines.push(`│  ${bold}${icon}${reset} ${bold}${safe}${reset}`);
+    if (i < visible.length - 1) lines.push(`│  ${connector}`);
   }
 
-  lines.push("│");
   if (!showAll) {
-    lines.push(`│  ... ${total - MAX_VISIBLE} more, /todo for full`);
+    lines.push(`│  ... ${active.length - MAX_VISIBLE} more`);
   }
-  lines.push(`└─ /todo for details`);
+  lines.push(`└─ /todo for all ${total} items`);
 
   ui.setWidget("todo", lines);
 }
