@@ -31,6 +31,8 @@ interface SubAgent {
   model?: string;
   tools?: string[];
   commitHash?: string;
+  /** Set to true when git commit fails in the close handler (structured alternative to string matching) */
+  commitFailed?: boolean;
 }
 
 const subAgents = new Map<string, SubAgent>();
@@ -41,6 +43,9 @@ const EVICTION_AGE_MS = 10 * 60 * 1000; // 10 minutes
 /** Throttle eviction calls to avoid excessive filesystem I/O */
 let _lastEvictTime = 0;
 const EVICT_THROTTLE_MS = 10_000;
+
+/** Shared prefix for commit-failure errors in mergeBranch — kept as a constant so consumers can strip it reliably */
+const COMMIT_FAILED_PREFIX = "Commit failed: ";
 
 /** Remove stale terminal-state agents from the map to prevent unbounded growth */
 function evictTerminalAgents(): void {
@@ -524,7 +529,7 @@ async function handleExecuteMode(
           allClean = false;
           // Preserve worktree and branch for commit failures so the user can inspect
           // and manually commit the changes (the error message tells them to check the worktree).
-          const isCommitFailure = ag.error?.includes("git commit failed") || execResult.startsWith("[Sub-agent commit failed]");
+          const isCommitFailure = ag.commitFailed === true;
           cleanupWorktree(root, execId, !isCommitFailure);
           subAgents.delete(execId);
         } else {
@@ -810,7 +815,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
       const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
       if (fullHash) return fullHash.substring(0, 7);
       console.warn(`commitWorktree: commit succeeded but rev-parse HEAD failed in ${worktreePath}; hash unknown.`);
-      return "no-changes";
+      return "committed-no-hash";
     }
   } catch (e: any) {
     // git add or git commit failed. Reset the index to prevent dirty staging area
@@ -932,7 +937,7 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
     if (options.onCommitFailure === "abort-merge") {
       gitQuiet(["merge", "--abort"], ctxCwd);
       if (stashed) { try { git(["stash", "pop"], ctxCwd); } catch { console.warn(`  \u26a0 git stash pop failed after abort-merge \u2014 stashed changes remain in stash for ${execId}. Use "git stash pop" manually.`); } }
-      return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `Commit failed: ${(commitErr.message || "").substring(0, 200)}` };
+      return { success: false, retainForManualReview: false, hasConflicts: false, conflictFiles: "", error: `${COMMIT_FAILED_PREFIX}${(commitErr.message || "").substring(0, 200)}` };
     } else {
       // keep-merge: merge applied but commit failed — retain branch for manual review
       console.error(`  \u26a0 Merge of ${execId} applied but commit failed (${(commitErr.message || "").substring(0, 80)}). Branch retained for manual review.`);
@@ -1275,7 +1280,7 @@ function spawnSubAgent(
         // and without this commit the sub-agent's completed work would be silently lost.
         if (code === 0) {
           const ch = commitWorktree(worktreePath, id, task);
-          if (ch && ch !== "no-changes") agent.commitHash = ch;
+          if (ch && ch !== "no-changes") agent.commitHash = ch === "committed-no-hash" ? "(hash unknown)" : ch;
         }
         cleanupWorktree(root, id, code !== 0);
         settle("[Sub-agent cancelled]", "cancelled");
@@ -1287,11 +1292,12 @@ function spawnSubAgent(
         // Auto-commit changes made by the sub-agent
         const ch = commitWorktree(worktreePath, id, task);
         if (ch === "") {
+          agent.commitFailed = true;
           agent.error = "Sub-agent completed but git commit failed. Check worktree for uncommitted work.";
           settle(`[Sub-agent commit failed]\n${stdout.trim()}\n\nSub-agent completed but could not commit changes to git. The worktree at ${worktreePath} may contain uncommitted work.`, "error");
           return;
         }
-        agent.commitHash = ch === "no-changes" ? "" : ch;
+        agent.commitHash = ch === "no-changes" ? "" : ch === "committed-no-hash" ? "(hash unknown)" : ch;
         settle(stdout.trim(), "done");
         return;
       }
@@ -1792,7 +1798,7 @@ export default function (pi: ExtensionAPI) {
               text: [
                 `Merge of sub-agent ${params.id} failed during commit.`,
                 `The merge has been aborted and working tree is clean.`,
-                `Commit error: ${result.error.substring("Commit failed: ".length)}`,
+                `Commit error: ${result.error.substring(COMMIT_FAILED_PREFIX.length)}`,
                 ``,
                 `To retry: subagent_merge id="${params.id}"`,
               ].join("\n"),
@@ -2272,8 +2278,15 @@ export default function (pi: ExtensionAPI) {
                   git(["branch", "-D", branch], root);
                 }
               } catch {
-                // merge-base or rev-parse failed — force delete
-                git(["branch", "-D", branch], root);
+                // merge-base or rev-parse failed — rename to recovered/ to preserve
+                // unmerged commits rather than force-delete (which could lose data).
+                try {
+                  const recoveredBranch = `recovered/subagent/${entry}`;
+                  git(["branch", "-m", branch, recoveredBranch], root);
+                  console.warn(`[subagent] Stale sentinel for ${entry}: merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
+                } catch {
+                  git(["branch", "-D", branch], root);
+                }
               }
             }
             unlinkSync(sentinel);
