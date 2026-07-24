@@ -476,21 +476,27 @@ async function handleExecuteMode(
       // Kill the sub-agent process before cleaning up
       const ag = subAgents.get(execId);
       if (ag) {
-        if (ag.status === "running") {
-          // Set status to "cancelled" FIRST (before kill) so the closeHandler
-          // sees the intended state and handles worktree cleanup via its
-          // cancelled branch. This eliminates the TOCTOU race where the
-          // closeHandler's commitWorktree (code===0) runs after we delete.
-          ag.status = "cancelled";
+        // Save the pre-cancellation status BEFORE overwriting it, so closeHandler
+        // sees our intended state and we can decide branch preservation below.
+        // Setting status FIRST closes the TOCTOU window where closeHandler could
+        // commitWorktree (code===0) between our running-check and the kill.
+        const prevStatus = ag.status;
+        ag.status = "cancelled";
+
+        if (prevStatus === "running") {
           try { ag.proc?.kill("SIGKILL"); } catch { /* ok */ }
-          // Worktree cleanup is handled by the closeHandler's cancelled branch
-          // when the close event fires. Do NOT cleanup here to avoid racing
-          // with commitWorktree in the code===0 branch.
-        } else {
-          // Agent is in a terminal state ("done", "error", "merged", etc.).
-          // The closeHandler already ran and won't fire again. Clean up
-          // the worktree and remove from map here to prevent leaks.
+          // closeHandler will fire (or already fired). If it saw "cancelled" (because
+          // we set it before kill), it will call cleanupWorktree with (code !== 0)
+          // and settle. If it fired in the narrow window before our status write, it
+          // would have committed the work. cleanupWorktree is idempotent, so calling
+          // it here is safe regardless — double-cleanup is a no-op.
           cleanupWorktree(root, execId, true);
+          subAgents.delete(execId);
+        } else {
+          // Agent was already in a terminal state ("done", "error", "merged", etc.).
+          // Preserve the git branch if the work was already committed.
+          const deleteBranch = prevStatus !== "done" && prevStatus !== "merged";
+          cleanupWorktree(root, execId, deleteBranch);
           subAgents.delete(execId);
         }
       }
@@ -1005,7 +1011,7 @@ function spawnSubAgent(
   // agent reaches a terminal state.
   const sentinel = sentinelPath(root, id);
   if (sentinel) {
-    try { writeFileSync(sentinel, String(process.pid), "utf-8"); } catch (e) {
+    try { writeFileSync(sentinel, `${process.pid}\n${Date.now()}`, "utf-8"); } catch (e) {
       // Sentinel creation failure means orphaned worktrees won't be auto-cleaned on
       // next session_start. Log a warning so operators can detect and handle this.
       console.warn(`[subagent] failed to create sentinel ${sentinel}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1848,6 +1854,12 @@ export default function (pi: ExtensionAPI) {
       // that was started from a project directory (no PI_SUBAGENT_ROOT set).
       try {
         root = resolveGitRoot(process.cwd());
+        // When resolveGitRoot can't find a parent .git, it returns cwd itself.
+        // Detect this by checking for a .git directory in the returned root.
+        if (!existsSync(join(root, ".git"))) {
+          console.warn(`[subagent] PI_SUBAGENT_ROOT is not set and no git repository found from ${process.cwd()}. Stale sub-agent worktrees cannot be cleaned up. Set PI_SUBAGENT_ROOT or run pi from inside a git repository.`);
+          return;
+        }
       } catch {
         // Can't determine project root — without PI_SUBAGENT_ROOT or a valid git
         // repository, we can't safely determine where worktrees live. Skip cleanup.
@@ -1867,26 +1879,60 @@ export default function (pi: ExtensionAPI) {
           const sentinel = join(subDir, `.${entry}.sentinel`);
           // Only clean up if sentinel file still exists (agent was interrupted)
           if (!existsSync(sentinel)) continue;
-          // Read PID from sentinel to avoid nuking worktrees of a still-running pi session.
-          // If the PID is still alive, this sentinel belongs to a live process — skip it.
+          // Read PID + creation timestamp from sentinel to avoid nuking worktrees
+          // of a still-running pi session. Format: first line = PID, second line =
+          // Date.now() timestamp when the sentinel was created.
+          // If the PID is still alive AND belongs to a pi process, skip cleanup.
+          // On platforms without /proc, fall back to ps(1) or timestamp-heuristic.
           try {
-            const pidStr = readFileSync(sentinel, "utf-8").trim();
-            const pid = parseInt(pidStr, 10);
+            const lines = readFileSync(sentinel, "utf-8").trim().split("\n");
+            const pid = parseInt(lines[0], 10);
+            const creationTime = parseInt(lines[1], 10) || 0;
             if (!isNaN(pid)) {
               try {
                 process.kill(pid, 0);
-                // PID is alive — verify it's actually a pi agent process, not a recycled PID
-                // that happened to be reused by an unrelated process (PID-reuse TOCTOU).
-                let isPiProcess = true;
+                // PID is alive — verify it's actually a pi agent process, not a
+                // recycled PID reused by an unrelated process (PID-reuse TOCTOU).
+                let isPiProcess = false;
+                let procVerifiable = false;
+
+                // --- Linux: /proc/<pid>/cmdline ---
                 try {
                   const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
                   isPiProcess = cmdline.includes("pi");
+                  procVerifiable = true;
                 } catch {
-                  // Can't read /proc/<pid>/cmdline (e.g., not on Linux, permissions error).
-                  // Fall through and trust the kill check — the race window is small.
+                  // Not on Linux, or permission denied — try next method
                 }
-                if (isPiProcess) continue;
-                // Not a pi process — sentinel is stale, proceed with cleanup
+
+                // --- macOS / BSD: ps -p <pid> -o comm= ---
+                if (!procVerifiable) {
+                  try {
+                    const psOut = spawnSync("ps", ["-p", String(pid), "-o", "comm="], { timeout: 3000, encoding: "utf-8" });
+                    if (psOut.status === 0) {
+                      isPiProcess = psOut.stdout.trim().toLowerCase().includes("pi");
+                      procVerifiable = true;
+                    }
+                  } catch {
+                    // ps not available — fall through
+                  }
+                }
+
+                if (procVerifiable) {
+                  if (isPiProcess) continue;     // verified as a running pi process → skip
+                  // verified as NOT pi (recycled PID) → proceed with cleanup
+                } else {
+                  // No OS-specific verification available (e.g., Windows without WSL).
+                  // Use timestamp heuristic: if the sentinel is older than 1 hour,
+                  // assume the PID has been recycled and the worktree is stale.
+                  // If recent, conservatively keep the worktree to avoid corrupting
+                  // a still-running (but unverifiable) pi session.
+                  if (Date.now() - creationTime > 3_600_000) {
+                    // Sentinel is >1h old → likely stale, proceed with cleanup
+                  } else {
+                    continue; // recent → conservatively skip
+                  }
+                }
               } catch { /* dead, proceed with cleanup */ }
             }
           } catch { /* can't read sentinel, treat as stale and clean up */ }
