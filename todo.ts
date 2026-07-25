@@ -361,9 +361,8 @@ function checkAndAutoClear(ctx?: any): void {
   if (doneKey !== _lastAutoClearNotifyKey) {
     _lastAutoClearNotifyKey = doneKey;
     const doneList = items.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
-    const truncatedList = doneList.length > 500 ? truncate(doneList, 500) + "\n  … and more" : doneList;
     const ui = resolveUi(ctx);
-    ui?.notify?.(`All tasks complete:\n${truncatedList}`, "info");
+    ui?.notify?.(`All tasks complete:\n${doneList}`, "info");
     // Seed the session_tree done-dedup as well: if tree navigation lands inside
     // the 3s auto-clear window, the session_tree handler cancels the timer and
     // restores this same all-done snapshot — without these entries its
@@ -492,7 +491,7 @@ function renderWidget(ctx?: any): void {
   const total = todo.items.length;
 
   // Flow view: active items only (completed hidden to save widget space)
-  const MAX_VISIBLE = 5;
+  const MAX_VISIBLE = 3;
   const showAll = active.length <= MAX_VISIBLE;
   const visible = showAll ? active : active.slice(0, MAX_VISIBLE);
   if (!showAll) {
@@ -861,7 +860,6 @@ export default function (pi: ExtensionAPI) {
       const newlyDone = removable.filter(i => !_autoCleanedContents.has(i.content));
       if (newlyDone.length > 0) {
         const doneList = newlyDone.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
-        const truncatedList = doneList.length > 500 ? truncate(doneList, 500) + "\n  … and more" : doneList;
         const completedCt = newlyDone.filter(i => i.status === "completed").length;
         const cancelledCt = newlyDone.filter(i => i.status === "cancelled").length;
         const parts: string[] = [];
@@ -869,7 +867,7 @@ export default function (pi: ExtensionAPI) {
         if (cancelledCt > 0) parts.push(`✗ ${cancelledCt} cancelled`);
         const label = parts.join(", ");
         const ui = resolveUi(ctx);
-        ui?.notify?.(`${label}:\n${truncatedList}`, "info");
+        ui?.notify?.(`${label}:\n${doneList}`, "info");
       }
       // Remember cleaned contents so this notification doesn't repeat on the next
       // tree event (restore re-surfaces the same done items every time)
