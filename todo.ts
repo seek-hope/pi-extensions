@@ -44,6 +44,8 @@ const _progressItems = new Map<string, { status: string; content: string }>();
 let detailWidgetActive = false;
 let _autoClearTimer: ReturnType<typeof setTimeout> | null = null;
 let _itemIdCounter = 0;
+/** Per-session nonce prefixed to every minted id, so ids from different sessions (and therefore different branches) never collide in _bridgeRemovedIds or _bridgeMutations. Reset on session_start. */
+let _sessionNonce = Date.now().toString(36);
 /** Key of the done-list last notified by checkAndAutoClear — dedups repeat "All tasks complete" notifications. */
 let _lastAutoClearNotifyKey: string | null = null;
 
@@ -88,29 +90,36 @@ function applyBridgeUpdate(idx: number, newStatus: TodoStatus, newContent: strin
   if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
   const item = todo.items[idx];
   const oldContent = item.content;
-  item.status = newStatus;
+
+  // Validate newContent before applying any mutation, so status and content
+  // are updated atomically — a rejected content rename no longer leaves a
+  // partial status change in place (the caller sees true only when the full
+  // update succeeded).
   if (newContent !== undefined) {
     const nc = sanitizeContent(newContent.trim());
-    if (nc) {
-      const renamed = truncate(nc, 200);
-      if (todo.items.some((it, j) => j !== idx && it.content === renamed)) {
-        console.warn(`todo-bridge: ${callerLabel} — newContent "${renamed}" duplicates an existing item; content unchanged`);
-      } else {
-        item.content = renamed;
-        if (renamed !== oldContent) {
-          _autoCleanedContents.delete(oldContent);
-        }
-      }
-    } else {
-      console.warn(`todo-bridge: ${callerLabel} — newContent sanitized to empty; content unchanged`);
+    if (!nc) {
+      console.warn(`todo-bridge: ${callerLabel} — newContent sanitized to empty; update rejected`);
+      return false;
+    }
+    const renamed = truncate(nc, 200);
+    if (todo.items.some((it, j) => j !== idx && it.content === renamed)) {
+      console.warn(`todo-bridge: ${callerLabel} — newContent "${renamed}" duplicates an existing item; update rejected`);
+      return false;
+    }
+    item.content = renamed;
+    if (renamed !== oldContent) {
+      _autoCleanedContents.delete(oldContent);
     }
   }
+
+  item.status = newStatus;
   if (newStatus === "pending" || newStatus === "in_progress") {
     // Re-opened — allow a future completion of this content to notify again.
     _autoCleanedContents.delete(oldContent);
     _autoCleanedContents.delete(item.content);
   }
   if (newStatus === "in_progress") { enforceOneInProgress(idx); _bridgeInProgressId = item.id ?? null; }
+  else if (item.id !== undefined && _bridgeInProgressId === item.id) { _bridgeInProgressId = null; }
   recordBridgeMutation(item);
   syncBridgeMutations(); // enforceOneInProgress may have demoted another tracked item
   renderWidget();
@@ -119,20 +128,45 @@ function applyBridgeUpdate(idx: number, newStatus: TodoStatus, newContent: strin
   return true;
 }
 
+/** Queued notifications that arrived before the UI surface was ready — replayed when resolveUi first sees a ctx.ui. */
+const _pendingNotifications: Array<{ message: string; level: string }> = [];
+
 /** Resolve the UI surface: prefer an explicit ctx, and cache it so ctx-less bridge calls can still reach the UI. */
 function resolveUi(ctx?: any): any {
   if (ctx?.ui) {
+    const prevHadUi = !!_ui;
     _ui = ctx.ui;
     _uiDropWarned = false;
+    // Replay any notifications queued before the UI surface was available
+    if (!prevHadUi && _pendingNotifications.length > 0) {
+      for (const n of _pendingNotifications) {
+        ctx.ui.notify?.(n.message, n.level);
+      }
+      _pendingNotifications.length = 0;
+    }
+    // Re-render widget when UI surface transitions from null→available.
+    // Bridge calls (addItem/updateItemById/etc.) that happened before the
+    // first ctx-bearing event were silently dropped by the stub's no-op
+    // setWidget — re-render now so they become visible.
+    if (!prevHadUi) {
+      renderWidget(ctx);
+    }
     return ctx.ui;
   }
-  if (!_ui && !_uiDropWarned) {
-    // Bridge calls (addItem/updateItemById/…, checkAndAutoClear, renderWidget) carry no
-    // ctx; before the first ctx-bearing tool/event caches ctx.ui, notifications and
-    // widget updates would vanish silently. State stays correct and the widget
-    // re-renders on the next ctx-bearing event — log once so the drop isn't silent.
-    _uiDropWarned = true;
-    console.debug("todo: no UI context available yet — bridge-initiated notifications/widget updates are dropped until the first ctx-bearing tool/event runs");
+  if (!_ui) {
+    if (!_uiDropWarned) {
+      _uiDropWarned = true;
+      console.debug("todo: no UI context available yet — notifications are queued until the first ctx-bearing tool/event runs");
+    }
+    // Return a stub that queues notifications so they are not lost
+    return {
+      notify(message: string, level: string) {
+        if (_pendingNotifications.length < 200) {
+          _pendingNotifications.push({ message, level });
+        }
+      },
+      setWidget() { /* silently drop — widget re-renders on next ctx-bearing event */ },
+    };
   }
   return _ui;
 }
@@ -147,18 +181,57 @@ function resolveUi(ctx?: any): any {
     const sanitized = sanitizeContent(trimmed);
     if (!sanitized) { console.warn("todo-bridge: addItem — content empty after sanitization"); return null; }
     const truncated = truncate(sanitized, 200);
-    const s = String(status).trim().toLowerCase();
+    const s = String(status ?? "pending").trim().toLowerCase();
     if (!isValidTodoStatus(s)) {
       console.warn(`todo-bridge: addItem — invalid status "${String(status)}"; item not added`);
       return null;
     }
-    // Return existing ID if duplicate — caller still gets a valid ID to use
+    // Return existing ID if duplicate — caller still gets a valid ID to use.
+    // Also purge any stale auto-clean entry so a future completion of this
+    // re-opened item will notify again.
     const existing = todo.items.find(i => i.content === truncated);
-    if (existing) return existing.id ?? null;
+    if (existing) {
+      // Protect the returned id so it survives auto-clean — the bridge contract
+      // promises that ids returned by addItem are treated as programmatic.
+      if (existing.id !== undefined) {
+        _programmaticIds.add(existing.id);
+        _bridgeMutations.delete(existing.id);  // was model-owned, now programmatic
+      }
+      // Honor the requested status on the existing item — the caller gets back
+      // a valid id and reasonably assumes the status was applied.
+      // Cancel any pending all-done auto-clear (common to both status-changed
+      // and status-unchanged paths — extracted to avoid ~80% duplicated logic).
+      if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+
+      if (existing.status !== s) {
+        existing.status = s;
+        recordBridgeMutation(existing);
+      }
+
+      if (s === "in_progress") {
+        enforceOneInProgress(todo.items.indexOf(existing));
+        _bridgeInProgressId = existing.id ?? null;
+      } else if (existing.id !== undefined && _bridgeInProgressId === existing.id) {
+        _bridgeInProgressId = null;
+      }
+
+      // Re-opened — allow a future completion of this content to notify again.
+      if (s === "pending" || s === "in_progress") {
+        _autoCleanedContents.delete(existing.content);
+      }
+
+      syncBridgeMutations();
+      renderWidget();
+      checkAndAutoClear();
+      clearDetailWidget();
+      return existing.id ?? null;
+    }
     // Cancel any pending all-done auto-clear only now that validation passed —
     // a failed call must not silently cancel a scheduled clear.
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    const id = String(++_itemIdCounter);
+    // Purge stale auto-clean entry so a future completion of this content notifies again
+    _autoCleanedContents.delete(truncated);
+    const id = `${_sessionNonce}_${++_itemIdCounter}`;
     todo.items.push({ id, content: truncated, status: s });
     _programmaticIds.add(id);
     if (s === "in_progress") { enforceOneInProgress(todo.items.length - 1); _bridgeInProgressId = id; }
@@ -174,7 +247,7 @@ function resolveUi(ctx?: any): any {
     const sanitized = sanitizeContent(trimmed);
     if (!sanitized) return false;
     const truncated = truncate(sanitized, 200);
-    const s = String(newStatus).trim().toLowerCase();
+    const s = String(newStatus ?? "pending").trim().toLowerCase();
     if (!isValidTodoStatus(s)) {
       console.warn(`todo-bridge: updateItemByContent — invalid status "${String(newStatus)}"; item unchanged`);
       return false;
@@ -197,11 +270,18 @@ function resolveUi(ctx?: any): any {
     const sanitized = sanitizeContent(trimmed);
     if (!sanitized) return false;
     const truncated = truncate(sanitized, 200);
-    const idx = todo.items.findIndex(i => i.content === truncated);
+    let idx = todo.items.findIndex(i => i.content === truncated);
+    if (idx === -1) {
+      const prefixMatches = todo.items.filter(item => item.content.startsWith(truncated));
+      if (prefixMatches.length === 1) idx = todo.items.indexOf(prefixMatches[0]);
+    }
     if (idx !== -1) {
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
       const [removed] = todo.items.splice(idx, 1);
       _autoCleanedContents.delete(removed.content);
+      if (removed?.id !== undefined && _bridgeInProgressId === removed.id) {
+        _bridgeInProgressId = null;
+      }
       if (removed?.id !== undefined) {
         const wasProgrammatic = _programmaticIds.has(removed.id);
         _programmaticIds.delete(removed.id);
@@ -221,7 +301,11 @@ function resolveUi(ctx?: any): any {
     return false;
   },
   updateItemById(id: string, newStatus: TodoStatus, newContent?: string): boolean {
-    const s = String(newStatus).trim().toLowerCase();
+    if (id == null || String(id).trim() === "") {
+      console.warn(`todo-bridge: updateItemById — invalid id "${String(id)}"; item unchanged`);
+      return false;
+    }
+    const s = String(newStatus ?? "pending").trim().toLowerCase();
     if (!isValidTodoStatus(s)) {
       console.warn(`todo-bridge: updateItemById — invalid status "${String(newStatus)}"; item unchanged`);
       return false;
@@ -236,6 +320,10 @@ function resolveUi(ctx?: any): any {
     return false;
   },
   removeItemById(id: string): boolean {
+    if (id == null || String(id).trim() === "") {
+      console.warn(`todo-bridge: removeItemById — invalid id "${String(id)}"; nothing removed`);
+      return false;
+    }
     // Coerce to string — JS callers may pass a numeric id (3 vs "3")
     const key = String(id);
     const idx = todo.items.findIndex(item => item.id === key);
@@ -243,6 +331,9 @@ function resolveUi(ctx?: any): any {
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
       const [removed] = todo.items.splice(idx, 1);
       _autoCleanedContents.delete(removed.content);
+      if (_bridgeInProgressId === key) {
+        _bridgeInProgressId = null;
+      }
       const wasProgrammatic = removed?.id !== undefined && _programmaticIds.has(removed.id);
       _programmaticIds.delete(key);
       // Model-owned removal — remember it so session_tree restore (which re-reads
@@ -266,12 +357,20 @@ function resolveUi(ctx?: any): any {
 
   // ── progress items: survive session_tree restores ──
   setProgress(key: string, status: string, text: string) {
-    _progressItems.set(key, { status, content: text });
+    const safeKey = truncate(sanitizeContent(String(key ?? "")), 100);
+    if (!safeKey) { console.warn("todo-bridge: setProgress — key cannot be empty after sanitization"); return; }
+    const safeStatus = truncate(sanitizeContent(String(status ?? "")), 50);
+    const safeContent = truncate(sanitizeContent(String(text ?? "")), 200);
+    _progressItems.set(safeKey, { status: safeStatus, content: safeContent });
     renderWidget();
+    clearDetailWidget();
   },
   clearProgress(key: string) {
-    _progressItems.delete(key);
+    const safeKey = truncate(sanitizeContent(String(key ?? "")), 100);
+    if (!safeKey) { console.warn("todo-bridge: clearProgress — key cannot be empty after sanitization"); return; }
+    _progressItems.delete(safeKey);
     renderWidget();
+    clearDetailWidget();
   },
 };
 
@@ -285,7 +384,11 @@ function isValidTodoStatus(s: string): s is TodoStatus {
 function normalizeStatus(raw: string | undefined): TodoStatus {
   if (!raw) return "pending";
   const s = String(raw).trim().toLowerCase();
-  return isValidTodoStatus(s) ? s : "pending";
+  if (!isValidTodoStatus(s)) {
+    console.warn(`todo: normalizeStatus — invalid status "${String(raw)}"; defaulting to "pending"`);
+    return "pending";
+  }
+  return s;
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -298,11 +401,12 @@ function normalizeStatus(raw: string | undefined): TodoStatus {
 function sanitizeContent(raw: string): string {
   return raw
     .replace(/\x1b\[[0-9;?>=<:]*[\x20-\x2F]*[@-~]/g, "")   // CSI sequences (include ? > = < : params, intermediate bytes)
+    .replace(/\x1b\[[^\x1b]*/g, "")                     // Unterminated/malformed CSI (no final byte before ESC or EOS)
     .replace(/\x1b\].*?(?:\x07|\x1b\\)/g, "")   // OSC sequences (with BEL or ST terminator)
     .replace(/\x1b\][^\x1b]*/g, "")               // Unterminated OSC (truncated input — no ST/BEL)
     .replace(/\x1b[PX^_].*?(?:\x07|\x1b\\)/g, "")        // DCS, SOS, PM, APC (with ST or BEL terminator)
     .replace(/\x1b[PX^_][^\x1b]*/g, "")         // Unterminated DCS/SOS/PM/APC (no ST terminator — truncated input edge case)
-    .replace(/\x1b[\x20-\x2F]*[\x30-\x7E]/g, "") // Remaining ESC sequences (single-byte like ESC c, ESC 7, etc.)
+    .replace(/\x1b[\x20-\x2F]*[\x30-\x5A\x5C-\x7E]/g, "") // Remaining ESC sequences (exclude 0x5B '[' — CSI introducer)
     .replace(/[\x00-\x08\x0B-\x1F\x7F\x80-\x9F]/g, "") // remaining C0 + C1 controls (bare ESC, CR, CSI, etc.)
     .replace(/\t/g, " ")
     .replace(/\n/g, " ")
@@ -345,10 +449,24 @@ function enforceOneInProgress(preferredIdx?: number): void {
   }
 }
 
+/** Prune _autoCleanedContents entries whose content no longer appears in any live todo item.
+ *  Prevents unbounded growth in long sessions with many one-shot tasks. */
+function pruneAutoCleanedContents(): void {
+  const liveContents = new Set(todo.items.map(i => i.content));
+  for (const content of _autoCleanedContents) {
+    if (!liveContents.has(content)) {
+      _autoCleanedContents.delete(content);
+    }
+  }
+}
+
 /** Check if all items are done and schedule auto-clear if so. */
 function checkAndAutoClear(ctx?: any): void {
   const items = todo.items;
-  const allDone = items.length > 0 && items.every(i => i.status === "completed" || i.status === "cancelled");
+  // Gate on model-owned items only: perpetually-pending programmatic items
+  // must not block the "all done" auto-clear UX.
+  const modelItems = items.filter(i => !isProgrammaticItem(i));
+  const allDone = modelItems.length > 0 && modelItems.every(i => i.status === "completed" || i.status === "cancelled");
   if (!allDone) {
     // New activity — reset the notification dedup so the next all-done state notifies
     _lastAutoClearNotifyKey = null;
@@ -357,10 +475,12 @@ function checkAndAutoClear(ctx?: any): void {
   }
   // Dedup: repeated calls while the same all-done list stands (e.g. bridge status
   // updates) must not spam duplicate "All tasks complete" notifications.
-  const doneKey = items.map(i => `${i.status}:${i.content}`).sort().join("\n");
+  // Use modelItems (not items) so programmatic-item status/content changes don't
+  // cause spurious notifications or incorrectly suppress a legitimate one.
+  const doneKey = modelItems.map(i => `${i.status}:${i.content}`).sort().join("\n");
   if (doneKey !== _lastAutoClearNotifyKey) {
     _lastAutoClearNotifyKey = doneKey;
-    const doneList = items.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
+    const doneList = modelItems.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
     const ui = resolveUi(ctx);
     ui?.notify?.(`All tasks complete:\n${doneList}`, "info");
     // Seed the session_tree done-dedup as well: if tree navigation lands inside
@@ -371,7 +491,7 @@ function checkAndAutoClear(ctx?: any): void {
       if (!isProgrammaticItem(i)) _autoCleanedContents.add(i.content);
     }
   }
-  clearDetailWidget(ctx);
+  if (detailWidgetActive) clearDetailWidget(ctx);
   if (_autoClearTimer !== null) clearTimeout(_autoClearTimer);
   _autoClearTimer = setTimeout(() => {
     _autoClearTimer = null;
@@ -384,14 +504,20 @@ function checkAndAutoClear(ctx?: any): void {
     _lastAutoClearNotifyKey = remaining.length > 0 && remaining.every(i => i.status === "completed" || i.status === "cancelled")
       ? remaining.map(i => `${i.status}:${i.content}`).sort().join("\n")
       : null;
+    // Prune _autoCleanedContents entries that no longer correspond to any live item
+    pruneAutoCleanedContents();
     // Remember the wiped done items (don't clear the set): a later session_tree
     // restore re-surfaces the same done items from the last todo_write details,
     // and without these entries the "task(s) done" notification would repeat.
     for (const i of wiped) _autoCleanedContents.add(i.content);
     // A /todo detail widget opened during the 3s window would show wiped items —
     // clear it explicitly and keep detailWidgetActive in sync.
-    clearDetailWidget();
-    renderWidget();
+    // Guard against the stub UI: if _ui is still null (no ctx-bearing event has
+    // run yet), skip the render — the widget will refresh on the next event.
+    if (_ui) {
+      clearDetailWidget();
+      renderWidget();
+    }
   }, 3000);
 }
 
@@ -406,7 +532,6 @@ function clearDetailWidget(ctx?: any): void {
  * restore `todo` from it.
  */
 function restoreFromBranch(ctx?: any): void {
-  todo = { items: [] };
   try {
     // Validate that required APIs exist before attempting to access them,
     // preventing silent failures if internal pi data structures change upstream.
@@ -440,8 +565,11 @@ function restoreFromBranch(ctx?: any): void {
         // items with ids, some without) — updateItemById/removeItemById would
         // hit the wrong twin.
         for (const item of details.items) {
-          if (item && typeof item === 'object' && item.id) {
-            const n = Number(String(item.id)); _itemIdCounter = Math.max(_itemIdCounter, isNaN(n) ? 0 : n);
+          if (item && typeof item === 'object' && item.id != null) {
+            // Handle both nonce-prefixed ids ("lxq3k_5") and plain numeric ids
+            const idStr = String(item.id);
+            const n = idStr.includes('_') ? Number(idStr.split('_').pop()) : Number(idStr);
+            _itemIdCounter = Math.max(Number.isFinite(_itemIdCounter) ? _itemIdCounter : 0, isNaN(n) ? 0 : n);
           }
         }
         // Validate each item individually to skip corrupted entries
@@ -450,7 +578,7 @@ function restoreFromBranch(ctx?: any): void {
           if (!item || typeof item !== 'object') continue;
           const sanitized = sanitizeContent(String(item.content ?? ""));
           if (!sanitized) continue;
-          const id = item.id ? String(item.id) : String(++_itemIdCounter);
+          const id = item.id != null ? String(item.id) : `${_sessionNonce}_${++_itemIdCounter}`;
           safe.push({
             id,
             content: truncate(sanitized, 200),
@@ -471,15 +599,14 @@ function restoreFromBranch(ctx?: any): void {
       }
     }
   } catch (e) {
-    console.debug("restoreFromBranch: failed to restore todo from branch", e);
+    console.warn("restoreFromBranch: failed to restore todo from branch", e);
   }
 }
 
 function renderWidget(ctx?: any): void {
   const ui = resolveUi(ctx);
-  if (!ui) return;
 
-  if (todo.items.length === 0) {
+  if (todo.items.length === 0 && _progressItems.size === 0) {
     ui.setWidget?.("todo", undefined);
     ui.setWidget?.("todo-detail", undefined);
     return;
@@ -490,21 +617,25 @@ function renderWidget(ctx?: any): void {
 
   // Show ALL items in order, like Claude Code
   const lines: string[] = [];
-  lines.push(`Todo (${done}/${total})`);
+  if (todo.items.length > 0) {
+    lines.push(`Todo (${done}/${total})`);
+  }
 
   for (const item of todo.items) {
-    const icon = item.status === "in_progress" ? "●"
-      : item.status === "pending" ? "○"
-      : item.status === "completed" ? "✓"
-      : "✗";
+    const icon = STATUS_ICONS[item.status] || "○";
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
-    let content = item.content;
-    // Split on newlines, add continuation indent
-    const subLines = content.split(/\n/);
-    for (let j = 0; j < subLines.length; j++) {
-      const prefix = j === 0 ? `${icon} ` : "   ";
-      lines.push(`${bold}${prefix}${subLines[j]}${reset}`);
+    lines.push(`${bold}${icon} ${truncate(item.content, 60)}${reset}`);
+  }
+
+  // Render progress items (set via bridge setProgress/clearProgress)
+  if (_progressItems.size > 0) {
+    if (todo.items.length > 0) {
+      lines.push(""); // blank separator between todo and progress sections
+    }
+    lines.push("Progress");
+    for (const [key, prog] of _progressItems) {
+      lines.push(`  ⏳ [${truncate(key, 20)}] ${truncate(prog.status, 20)}: ${truncate(prog.content, 60)}`);
     }
   }
 
@@ -571,7 +702,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        return { id: String(++_itemIdCounter), content: truncate(sanitized, 200), status };
+        return { id: `${_sessionNonce}_${++_itemIdCounter}`, content: truncate(sanitized, 200), status };
       });
 
       // Remove duplicate items, keeping only the first occurrence of each unique content.
@@ -604,9 +735,46 @@ export default function (pi: ExtensionAPI) {
         warnings.push(`Auto-fixed: demoted ${demoted} extra in_progress item(s) → pending (only one allowed).`);
       }
 
+      // Preserve programmatic items (added via bridge) — they survive model todo_write.
+      // Bridge callers holding ids from addItem expect them to remain valid.
+      const programmaticItems = todo.items.filter(isProgrammaticItem);
+
       todo = { items };
-      // The model rewrote the whole list — bridge-tracked and auto-clean state is now stale
-      _programmaticIds.clear();
+
+      // Re-add programmatic items that the model didn't include.
+      // When a programmatic item's content matches a model-owned item,
+      // replace the model-owned twin with the programmatic one so the
+      // programmatic id survives the stale-id GC below (otherwise the
+      // bridge permanently loses ownership of that content).
+      for (const prog of programmaticItems) {
+        const twinIdx = todo.items.findIndex(i => i.content === prog.content);
+        if (twinIdx === -1) {
+          todo.items.push(prog);
+        } else {
+          todo.items[twinIdx] = prog;
+        }
+      }
+
+      // Re-enforce after re-adding programmatic items to prevent two in_progress items.
+      // Honor the bridge's explicit in_progress choice so programmatic items re-added
+      // at lower indices (via content-twin replacement) are not silently demoted.
+      const bridgePrefIdx = _bridgeInProgressId !== null
+        ? todo.items.findIndex(i => i.id === _bridgeInProgressId)
+        : -1;
+      enforceOneInProgress(bridgePrefIdx >= 0 ? bridgePrefIdx : undefined);
+
+      // Clean up stale programmatic ids (items no longer present in the merged list)
+      const liveIds = new Set(todo.items.map(i => i.id).filter(Boolean) as string[]);
+      const staleProgIds: string[] = [];
+      for (const id of _programmaticIds) {
+        if (!liveIds.has(id)) staleProgIds.push(id);
+      }
+      for (const id of staleProgIds) {
+        _programmaticIds.delete(id);
+      }
+
+      // The model rewrote model-owned items — bridge-tracked mutations/removals for
+      // model-owned items are now stale (the model's list is authoritative).
       _bridgeMutations.clear();
       _bridgeRemovedIds.clear();
       _bridgeInProgressId = null;
@@ -644,8 +812,9 @@ export default function (pi: ExtensionAPI) {
       // updateItemById/removeItemById remain valid across session_start/session_tree.
       // Bridge-side mutations to model-owned items are tracked in
       // _bridgeMutations/_bridgeRemovedIds and re-applied over this (stale) snapshot
-      // on session_tree; on session_start they are dropped since ids may collide
-      // across sessions (see the session_start handler).
+      // on session_tree; on session_start they are dropped since a fresh session
+      // rotates _sessionNonce (ids are now nonce-prefixed, preventing cross-session
+      // collisions).
       return { content: [{ type: "text", text: summary.join("\n") }], details: { count: items.length, counts, items: items.map(i => ({ id: i.id, content: i.content, status: i.status })) } };
     },
   });
@@ -722,6 +891,10 @@ export default function (pi: ExtensionAPI) {
     // Clear any stale auto-clear timer from a previous session
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     _lastAutoClearNotifyKey = null;
+    // Rotate the session nonce so ids minted in this session cannot collide
+    // with ids from previous sessions (and therefore previous branches).
+    _sessionNonce = Date.now().toString(36);
+    _itemIdCounter = 0;
     // Contents cleaned in a prior session must not suppress done-notifications
     // for coincidentally matching items in the resumed session.
     _autoCleanedContents.clear();
@@ -745,6 +918,7 @@ export default function (pi: ExtensionAPI) {
     // them for the same cross-session id-collision reason.
     _bridgeMutations.clear();
     _bridgeRemovedIds.clear();
+    _progressItems.clear();
     _bridgeInProgressId = null;
     // A corrupted snapshot could contain multiple in_progress items — enforce
     // the invariant defensively (mirrors session_tree's call after reconcile).
@@ -762,10 +936,30 @@ export default function (pi: ExtensionAPI) {
     // and false-positive on user items containing magic substrings.
     const programmaticItems = todo.items.filter(isProgrammaticItem);
     restoreFromBranch(ctx);
+    // Capture ids present in the restored snapshot before filtering, so we can
+    // garbage-collect stale _bridgeRemovedIds entries below.
+    let restoredIds = new Set(todo.items.map(i => i.id).filter(Boolean) as string[]);
     // Re-apply bridge removals of model-owned items — the persisted snapshot is
     // stale (todo_write hasn't run since), so restore would resurrect them.
     if (_bridgeRemovedIds.size > 0) {
       todo.items = todo.items.filter(i => i.id === undefined || !_bridgeRemovedIds.has(i.id));
+      // Clean up stale entries: ids that are no longer in the restored snapshot
+      // were already removed by a todo_write on this branch, so tracking them is
+      // unnecessary. This bounds _bridgeRemovedIds growth between todo_write calls.
+      // Two-pass to avoid Set.delete() during for...of iteration (spec-leaves
+      // mutation-during-iteration behaviour implementation-defined).
+      const staleRemovedIds: string[] = [];
+      for (const id of _bridgeRemovedIds) {
+        if (!restoredIds.has(id)) {
+          staleRemovedIds.push(id);
+        }
+      }
+      for (const id of staleRemovedIds) {
+        _bridgeRemovedIds.delete(id);
+      }
+      // Re-compute restoredIds after filtering so the _bridgeMutations GC below
+      // only considers ids that survived _bridgeRemovedIds filtering.
+      restoredIds = new Set(todo.items.map(i => i.id).filter(Boolean) as string[]);
     }
     // Re-apply bridge mutations to model-owned items — restore would otherwise
     // silently revert bridge-side status/content changes (e.g. an item completed
@@ -773,12 +967,33 @@ export default function (pi: ExtensionAPI) {
     for (const [id, mutation] of _bridgeMutations) {
       const idx = todo.items.findIndex(i => i.id === id);
       if (idx === -1) continue; // a snapshot from another branch never had this id
-      todo.items[idx].status = mutation.status;
+      const item = todo.items[idx];
+      item.status = mutation.status;
       // Apply the content change only when it cannot collide — dropping a
       // coincidental content-twin from another branch would lose a task.
       if (!todo.items.some((it, j) => j !== idx && it.content === mutation.content)) {
-        todo.items[idx].content = mutation.content;
+        item.content = mutation.content;
       }
+      // Keep _bridgeInProgressId in sync (mirrors applyBridgeUpdate logic).
+      if (mutation.status === "in_progress") {
+        _bridgeInProgressId = item.id ?? null;
+      } else if (item.id !== undefined && _bridgeInProgressId === item.id) {
+        _bridgeInProgressId = null;
+      }
+    }
+    // Garbage-collect stale _bridgeMutations entries for ids that have vanished
+    // from all branch snapshots, so the map doesn't grow without bound across
+    // many tree navigations between todo_write calls.
+    // Two-pass to avoid Map.delete() during iteration (same spec concern as the
+    // _bridgeRemovedIds cleanup above).
+    const staleMutationIds: string[] = [];
+    for (const id of _bridgeMutations.keys()) {
+      if (!restoredIds.has(id)) {
+        staleMutationIds.push(id);
+      }
+    }
+    for (const id of staleMutationIds) {
+      _bridgeMutations.delete(id);
     }
     // Re-add items that were wiped by restore. Match by id only: a restored item
     // with identical content but a different id must not cause the programmatic
@@ -822,7 +1037,8 @@ export default function (pi: ExtensionAPI) {
     // updateItemById, removeItemById, isProgrammaticItem, and _bridgeMutations).
     for (const item of programmaticItems) {
       if (item.id !== undefined) {
-        const n = Number(item.id);
+        const idStr = String(item.id);
+        const n = idStr.includes('_') ? Number(idStr.split('_').pop()) : Number(idStr);
         if (!isNaN(n)) _itemIdCounter = Math.max(_itemIdCounter, n);
       }
     }
@@ -833,6 +1049,7 @@ export default function (pi: ExtensionAPI) {
       ? todo.items.findIndex(i => i.id === _bridgeInProgressId)
       : -1;
     enforceOneInProgress(bridgePreferredIdx >= 0 ? bridgePreferredIdx : undefined);
+    syncBridgeMutations();
     clearDetailWidget(ctx);
 
     // Auto-clean: remove completed/cancelled items, but never protected
@@ -855,12 +1072,30 @@ export default function (pi: ExtensionAPI) {
         const ui = resolveUi(ctx);
         ui?.notify?.(`${label}:\n${doneList}`, "info");
       }
+      // Prune stale entries no longer relevant to the live list
+      pruneAutoCleanedContents();
       // Remember cleaned contents so this notification doesn't repeat on the next
       // tree event (restore re-surfaces the same done items every time)
       for (const i of removable) _autoCleanedContents.add(i.content);
       // Remove completed items at turn end, notify user
       todo.items = todo.items.filter(i =>
         (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
+      // Prevent perpetual restore-remove loop: items removed here would be
+      // resurrected by restoreFromBranch on the next session_tree (the
+      // persisted todo_write snapshot is stale).  Add their ids to
+      // _bridgeRemovedIds so the restore filter drops them, and clear any
+      // _bridgeMutations entries so they become eligible for GC.
+      for (const item of removable) {
+        if (item.id !== undefined) {
+          _bridgeRemovedIds.add(item.id);
+          _bridgeMutations.delete(item.id);
+        }
+      }
+    }
+    // Clear stale bridge progress id when the referenced item is absent from the
+    // restored branch, even when no items were removable (all pending).
+    if (_bridgeInProgressId !== null && !todo.items.some(i => i.id === _bridgeInProgressId)) {
+      _bridgeInProgressId = null;
     }
 
     // Keep the all-done notify dedup in sync with the post-restore list: a stale
@@ -872,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
       ? remaining.map(i => `${i.status}:${i.content}`).sort().join("\n")
       : null;
 
+    checkAndAutoClear(ctx);
     renderWidget(ctx);
   });
 
