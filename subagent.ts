@@ -163,7 +163,7 @@ interface LoopResult {
 async function reviewLoop(
   workCwd: string,
   buildReviewTask: (i: number) => string,
-  runAction: (issuesCount: number, reviewerOutput: string, i: number, remainingTimeoutMs?: number) => Promise<string>,
+  runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
   commitPrefix = "loop",
   signal?: AbortSignal,
   todoMatchKey?: string, // unique key for todo bridge updates (avoids substring collisions)
@@ -171,12 +171,8 @@ async function reviewLoop(
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
 
-  const loopStartTime = Date.now();
   for (let i = 1; i <= MAX_ROUNDS; i++) {
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
-    if (Date.now() - loopStartTime > MAX_LOOP_DURATION_MS) {
-      return { iterations: i - 1, clean: false, summary: `❌ Overall review loop deadline (${(MAX_LOOP_DURATION_MS / 1000).toFixed(0)}s) exceeded at round ${i}.` };
-    }
     // Update todo progress if bridge available
     const tb = getTodoBridge();
     if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
@@ -189,7 +185,7 @@ async function reviewLoop(
     // only handles the edge case where resolvePiBin() throws synchronously
     // inside the Promise constructor (e.g., missing binary).
     try {
-      r = await runSubProcess(reviewTask, workCwd, model ?? _defaultModel, "read,bash,serena_search_pattern,serena_overview", Math.max(60_000, MAX_LOOP_DURATION_MS - (Date.now() - loopStartTime)), signal);
+      r = await runSubProcess(reviewTask, workCwd, model ?? _defaultModel, "read,bash,serena_search_pattern,serena_overview", undefined, signal);
     } catch (e: any) {
       return { iterations: i, clean: false, summary: `❌ Reviewer failed to start at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
@@ -238,7 +234,7 @@ async function reviewLoop(
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
     let fixerOutput: string;
     try {
-      fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i, Math.max(60_000, MAX_LOOP_DURATION_MS - (Date.now() - loopStartTime)));
+      fixerOutput = await runAction(actualIssuesCount, reviewerOutput, i);
     } catch (e: any) {
       if (e?.name === "AbortError" || signal?.aborted) {
         return { iterations: i, clean: false, summary: `❌ Cancelled by user at round ${i}.` };
@@ -329,7 +325,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       `- <issue>`,
       `If CLEAN: true, just write "CLEAN: true".`,
     ].join("\n"),
-    async (_c, reviewerOutput, _i, remainingTimeoutMs) => {
+    async (_c, reviewerOutput, _i) => {
       // Check for cancellation before running the fixer to avoid wasted work
       if (signal?.aborted) {
         return "[cancelled by user]";
@@ -340,7 +336,7 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
         ctxCwd,
         model ?? _defaultModel,
         "read,bash,serena_search_pattern,serena_overview",
-        remainingTimeoutMs,
+        undefined,
         signal
       );
       // Check if the fixer was cancelled/aborted mid-execution before trusting its output
@@ -450,7 +446,7 @@ async function handleImproveMode(
       parts.push(`FOUND: <number>`, `CLEAN: <true|false>`, `ISSUES:`, `- <issue with file+line>`);
       return parts.join("\n");
       },
-      async (issuesCount, reviewerOutput, _i, remainingTimeoutMs) => {
+      async (issuesCount, reviewerOutput, _i) => {
         // Check for cancellation before running the fixer to avoid wasted work
         if (signal?.aborted) {
           return "[cancelled by user]";
@@ -460,7 +456,7 @@ async function handleImproveMode(
         // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
         // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
         const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", remainingTimeoutMs, signal);
+        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, signal);
         const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
         // Check if the fixer was cancelled/aborted mid-execution before trusting its output
         if (signal?.aborted || r.exitCode === -3) {
@@ -1206,7 +1202,6 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
 
 const MAX_DEPTH = 5;
 const MAX_ROUNDS = 20;
-const MAX_LOOP_DURATION_MS = 3_600_000; // 60 min total for the entire review loop
 
 function currentDepth(): number {
   const d = parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10);
