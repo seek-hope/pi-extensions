@@ -494,11 +494,15 @@ function renderWidget(ctx?: any): void {
 
   for (let i = 0; i < active.length; i++) {
     const item = active[i];
-    const icon = STATUS_ICONS[item.status] || "○";
-    const safe = item.content;
+    const tag = item.status === "in_progress" ? "▸" : item.status === "pending" ? "·" : item.status === "completed" ? "✓" : "✗";
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
-    lines.push(`${bold}${icon}${reset} ${bold}${safe}${reset}`);
+    // Split on embedded newlines first, then add each line
+    const parts = item.content.split(/\n/);
+    for (const p of parts) {
+      if (!p.trim()) continue;
+      lines.push(`${bold}${tag}${reset} ${bold}${p}${reset}`);
+    }
   }
 
   const more = total - active.length - done;

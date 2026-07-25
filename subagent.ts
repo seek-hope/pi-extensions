@@ -1871,7 +1871,7 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
-        _currentTaskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
+        _currentTaskLabel = `${params.task.substring(0, 40).replace(/\n/g, " ")}`;
         _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
         if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
@@ -1884,7 +1884,7 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
-        _currentTaskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
+        _currentTaskLabel = `${params.task.substring(0, 40).replace(/\n/g, " ")}`;
         _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
 
         // If no subagentId, improve the current codebase directly (no worktree)
