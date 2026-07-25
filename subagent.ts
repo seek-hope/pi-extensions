@@ -59,7 +59,9 @@ function evictTerminalAgents(): void {
   _lastEvictTime = Date.now();
   const now = Date.now();
   for (const [id, ag] of subAgents) {
-    if (["done", "error", "merged", "rejected", "cancelled"].includes(ag.status) && ag.endTime && (now - ag.endTime) > EVICTION_AGE_MS) {
+    // Skip agents whose commit failed: their worktree holds uncommitted work that the
+    // error message explicitly tells the user to inspect — eviction would destroy it.
+    if (["done", "error", "merged", "rejected", "cancelled"].includes(ag.status) && !ag.commitFailed && ag.endTime && (now - ag.endTime) > EVICTION_AGE_MS) {
       // Clean up worktree on disk before removing from map.
       // Preserve git branches for "done" (completed but unmerged) and "merged" agents
       // since they contain committed work that may be valuable.
@@ -377,11 +379,13 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
         return `[Sub-agent killed by signal] Fixer killed by signal: ${improved.substring(0, 200)}`;
       }
       const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
-      if (improved.trim().length > 0) analysis = improved; // update for next review round
       // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
       if (r.exitCode !== 0) {
         return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${improved.substring(0, 200)}`;
       }
+      // Only adopt the improved analysis from a cleanly-exited process — a crashed
+      // fixer's partial stdout must not replace the previous good analysis.
+      if (improved.trim().length > 0) analysis = improved; // update for next review round
       return improved;
     },
     "",
@@ -628,14 +632,22 @@ async function handleExecuteMode(
         if (ag.status === "error" || ag.status === "cancelled" || /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(execResult)) {
           results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
           allClean = false;
-          // Preserve worktree and branch for commit failures so the user can inspect
+          // Preserve worktree AND branch for commit failures so the user can inspect
           // and manually commit the changes (the error message tells them to check the worktree).
-          // Preserve worktree and branch for committed work even if cancelled.
-          // commitHash is set when the closeHandler saw exit code 0 before SIGKILL.
-          const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "" && ag.commitHash !== "no-changes";
-          const isCommitFailure = ag.commitFailed === true || hasCommittedWork;
-          cleanupWorktree(root, execId, !isCommitFailure);
-          subAgents.delete(execId);
+          // cleanupWorktree ALWAYS removes the worktree, so a genuine commit failure
+          // (uncommitted work exists only in the worktree) must skip cleanup entirely —
+          // otherwise the very work the error message directs the user to is destroyed.
+          // The agent stays in the map (status "error", commitFailed=true) so subagent_list
+          // shows it and subagent_reject can clean it up; evictTerminalAgents skips it.
+          if (ag.commitFailed) {
+            // worktree + branch intentionally preserved; nothing to clean
+          } else {
+            // Preserve the branch for committed work even if cancelled.
+            // commitHash is set when the closeHandler saw exit code 0 before SIGKILL.
+            const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "" && ag.commitHash !== "no-changes";
+            cleanupWorktree(root, execId, !hasCommittedWork);
+            subAgents.delete(execId);
+          }
         } else {
           // Use a unique todoMatchKey for this execute item so progress is visible
           // Include a hash prefix to avoid collisions between items sharing the same first 50 chars.
@@ -1049,6 +1061,15 @@ function safeStashPop(ctxCwd: string, execId: string, context: string): void {
  * Cancel a sub-agent: set status, kill process, clean up worktree.
  * Shared between /subagent cancel command and subagent_cancel tool.
  */
+/** Read an agent's status without control-flow narrowing — spawnSubAgent's close
+ *  handler may asynchronously flip it to "done" (auto-commit on exit 0) while we
+ *  await process close. A direct `ag.status` read after `ag.status = "cancelled"`
+ *  is narrowed by tsc to "cancelled", making `!== "done"` a TS2367 error under
+ *  --strict even though the mutation is real. The function boundary re-widens it. */
+function liveStatus(ag: SubAgent): SubAgent["status"] {
+  return ag.status;
+}
+
 async function cancelSubAgent(id: string, projectRootArg: string): Promise<void> {
   const ag = subAgents.get(id);
   if (!ag) return;
@@ -1101,7 +1122,7 @@ async function cancelSubAgent(id: string, projectRootArg: string): Promise<void>
   }
   // If the close handler committed work (code===0 before SIGKILL landed),
   // agent status was changed to "done" — preserve the branch to avoid data loss.
-  cleanupWorktree(projectRootArg, id, ag.status !== "done" && !hasCommittedWork);
+  cleanupWorktree(projectRootArg, id, liveStatus(ag) !== "done" && !hasCommittedWork);
   subAgents.delete(id);
 }
 
@@ -2202,8 +2223,13 @@ export default function (pi: ExtensionAPI) {
       // Attempt cleanup even if agent is not in the map (e.g., after subagent_parallel)
       // by checking if the worktree/branch exists
       if (ag) {
-        if (ag.status === "running") {
-          if (ag.proc) { try { ag.proc.kill("SIGKILL"); } catch { /* ok */ } }
+        if (ag.status === "running" || ag.status === "improving") {
+          // Kill AND wait for the process to close before removing the worktree
+          // (mirrors subagent_cancel). Without the wait, cleanupWorktree races the
+          // dying process, and spawnSubAgent's close handler only treats "cancelled"
+          // specially — a process exiting 0 in the kill window would commit into a
+          // half-deleted worktree. For "improving", this also aborts the improve loop.
+          await cancelSubAgent(params.id, projectRoot(ctx.cwd));
         }
         ag.status = "rejected";
       }
@@ -2294,7 +2320,7 @@ export default function (pi: ExtensionAPI) {
           const { id, promise } = spawnSubAgent(task, ctx.cwd, {
             model: params.model,
             timeoutMs: params.timeoutMs,
-            tools: params.tools ? params.tools.split(",") : undefined,
+            tools: params.tools ? params.tools.split(",").map((t: string) => t.trim()).filter(Boolean) : undefined,
             systemPrompt: params.systemPrompt,
             signal: _signal,
           });
@@ -2578,7 +2604,16 @@ export default function (pi: ExtensionAPI) {
                   console.warn(`[subagent] Cannot verify whether PID ${pid} (sentinel ${sentinel}) is a pi process — skipping cleanup to avoid deleting an active worktree.`);
                   continue;
                 }
-              } catch { /* dead, proceed with cleanup */ }
+              } catch (killErr: any) {
+                // EPERM means the process EXISTS but is owned by another user — it is
+                // alive, not dead. Treating it as dead would delete an active worktree
+                // belonging to another user's pi session. Skip cleanup to be safe.
+                if (killErr?.code === "EPERM") {
+                  console.warn(`[subagent] PID ${pid} (sentinel ${sentinel}) exists but is owned by another user — skipping cleanup to avoid deleting an active worktree.`);
+                  continue;
+                }
+                /* ESRCH: dead, proceed with cleanup */
+              }
             } else {
               // Sentinel file has an unreadable or missing PID (empty file, partial write, corruption).
               // Do NOT treat this as proof of staleness — it means "cannot determine".
