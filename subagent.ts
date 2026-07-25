@@ -51,6 +51,10 @@ const EVICT_THROTTLE_MS = 10_000;
 /** Shared prefix for commit-failure errors in mergeBranch — kept as a constant so consumers can strip it reliably */
 const COMMIT_FAILED_PREFIX = "Commit failed: ";
 
+/** Error sentinel regex — matches sub-agent error/spawn error/denied/timeout/commit failed/killed-by-signal output.
+ *  Used in multiple places to detect early failures before agents are inserted into the map. */
+const ERROR_SENTINEL_RE = /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/;
+
 /** Remove stale terminal-state agents from the map to prevent unbounded growth */
 function evictTerminalAgents(): void {
   // Throttle to avoid filesystem I/O on rapid successive calls (e.g., reviewLoop
@@ -242,7 +246,7 @@ async function reviewLoop(
         // Only match bullet lines in the ISSUES section to avoid false positives
         // from unrelated markdown lists, code comments, or section numbering.
         const issuesSection = reviewerOutput.split(/^ISSUES:/im)[1] || "";
-        const issueLines = issuesSection.split(/\n/).filter((l: string) => /^\s*(?:[-*•]|\d+[.)])\s/.test(l));
+        const issueLines = issuesSection.split(/\n/).filter((l: string) => /^\s*(?:[-*•]|\d+[.)])\s*/.test(l));
     const issues = issueLines.map((l: string) => l.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").substring(0, 80));
     const issueSummary = issues.length > 0
       ? `\n${issues.map((s: string) => `   - ${s}`).join("\n")}`
@@ -322,7 +326,7 @@ async function reviewLoop(
     }
     // Require the full bracketed pattern (including closing `]`) to avoid false positives
     // from legitimate output that happens to start with "[Sub-agent error...".
-    if (/^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(fixerOutput)) {
+    if (ERROR_SENTINEL_RE.test(fixerOutput)) {
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") {
@@ -550,6 +554,10 @@ async function handleImproveMode(
         parts.push(`TASK: ${task}`);
         parts.push(`Read the code files directly — use read, bash, serena tools to inspect the codebase.`);
       } else if (targetAgentId) {
+        // Include the agent's original task so the reviewer understands what the
+        // agent was asked to do — without this context, intentional changes can
+        // be mistakenly flagged as regressions.
+        if (existing?.task) parts.push(`Original task: ${existing.task.substring(0, 2000)}`);
         const diffContent = getDiff(ctxCwd, targetAgentId);
         if (diffContent) parts.push(`--- DIFF ---`, diffContent.substring(0, 24000), `--- END ---`);
       }
@@ -675,7 +683,7 @@ async function handleExecuteMode(
       // worktree failure) resolve with an error sentinel but NEVER insert the agent
       // into subAgents. Detect that here — before the evicted-recovery branch —
       // so denials are reported as failures, not "already merged (evicted)".
-      if (!ag && /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(execResult)) {
+      if (!ag && ERROR_SENTINEL_RE.test(execResult)) {
         results.push(`${i + 1}. ${item.description}: ✗ error (${execResult.substring(0, 100)})`);
         allClean = false;
         // Early denials may have no worktree/branch — cleanupWorktree is a safe no-op then.
@@ -684,7 +692,7 @@ async function handleExecuteMode(
         continue;
       }
       if (ag) {
-        if (ag.status === "error" || ag.status === "cancelled" || /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(execResult)) {
+        if (ag.status === "error" || ag.status === "cancelled" || ERROR_SENTINEL_RE.test(execResult)) {
           results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
           allClean = false;
           // Preserve worktree AND branch for commit failures so the user can inspect
@@ -714,7 +722,7 @@ async function handleExecuteMode(
           // Create the todo item that reviewLoop's progress updates target — without
           // this, every updateItemByContent call inside the loop silently no-ops.
           const tb = getTodoBridge();
-          _currentTaskLabel = `${desc.substring(0, 40).replace(/\n/g, " ")}`;
+          _currentTaskLabel = `${Array.from(desc).slice(0, 40).join('').replace(/\n/g, " ")}`;
           if (tb) _currentTodoId = tb.addItem(`🔍 ${todoMatchKey}`);
           try {
             const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey, execOptions?.model);
@@ -748,8 +756,13 @@ async function handleExecuteMode(
         let hasUnmergedCommits = false;
         try {
           git(["rev-parse", "--verify", branch], root);
-        } catch {
-          branchExists = false;
+        } catch (e: any) {
+          // Exit code 128 from rev-parse means the branch was not found.
+          // Transient errors (index lock, permission denied, NFS hiccup)
+          // should not set branchExists=false.
+          if (e.status === 128) {
+            branchExists = false;
+          }
         }
         if (branchExists) {
           try {
@@ -796,25 +809,33 @@ async function handleExecuteMode(
 
         if (prevStatus === "running") {
           // Wait for process close before cleanup to avoid racing the closeHandler's
-          // commitWorktree (which fires on code===0). Same pattern as cancelSubAgent.
+          // commitWorktree (which fires on code===0). Always await close regardless of
+          // exitCode — exitCode can be set to 0 before the close event fires, and the
+          // closeHandler is what commits work and sets terminal state.
           const proc = ag.proc;
           if (proc) {
             const { pid } = proc;
-            if (pid !== undefined && proc.exitCode === null) {
+            if (pid !== undefined) {
               const closePromise = new Promise<void>((resolveWait) => {
                 const timeout = setTimeout(() => resolveWait(), 3000);
                 proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
               });
-              try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+              if (proc.exitCode === null) {
+                try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+              }
               await closePromise;
             }
           }
           if (ag.commitFailed) {
             // worktree + branch intentionally preserved for manual inspection
+          } else if (ag.status === "done") {
+            // closeHandler committed the work (code===0) — preserve the branch.
+            cleanupWorktree(root, execId, false);
+          } else if (ag.status === "cancelled" || ag.status === "error") {
+            // closeHandler already called cleanupWorktree — nothing to do.
           } else {
-            // closeHandler may have committed work (code===0) before our kill landed.
-            // Check commitHash to guard against TOCTOU: if closeHandler already committed,
-            // preserve the branch so work isn't silently lost.
+            // Fallback for timeout / closeHandler not yet fired: check commitHash
+            // to guard against TOCTOU loss of committed work.
             const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "";
             cleanupWorktree(root, execId, isAbort && !hasCommittedWork);
           }
@@ -1040,7 +1061,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): CommitR
     const segments = [...segmenter.segment(task)].slice(0, 80);
     truncated = segments.map(s => s.segment).join('');
   } catch {
-    truncated = [...task].slice(0, 80).join('');
+    truncated = Array.from(task).slice(0, 80).join('');
   }
   // Guard against empty truncated message (e.g., task consisting entirely of zero-width characters)
   if (!truncated || !truncated.trim()) truncated = "(empty task)";
@@ -1130,15 +1151,17 @@ function cleanupWorktree(projectRoot: string, id: string, deleteBranch: boolean)
 }
 
 /** Pop a stash safely — warns if pop fails but leaves the stash intact (orphaned stashes are recoverable). */
-function safeStashPop(ctxCwd: string, execId: string, context: string): void {
+function safeStashPop(ctxCwd: string, execId: string, context: string): boolean {
   try {
     git(["stash", "pop"], ctxCwd);
+    return true;
   } catch {
     console.warn(
       `  \u26a0\u26a0\u26a0 git stash pop failed ${context} for ${execId}. ` +
       `The stash entry has been LEFT IN PLACE to avoid data loss. ` +
       `You can recover it manually: git stash list`
     );
+    return false;
   }
 }
 
@@ -1186,26 +1209,22 @@ async function cancelSubAgent(id: string, projectRootArg: string): Promise<void>
   ag.status = "cancelled";
   // Wait for process to fully exit before cleaning up worktree to avoid
   // file handle races (e.g., rmSync on locked files after SIGKILL).
-  // Attach the close listener BEFORE killing and checking if the pid is
-  // alive to avoid a TOCTOU race where the process exits between the
-  // check and the listener.
+  // Always await close regardless of exitCode — exitCode can be set to 0
+  // before the close event fires, and the closeHandler is what commits work
+  // and sets terminal state. Skipping the wait loses committed work.
   const proc = ag.proc;
   if (proc) {
     const { pid } = proc;
-    if (pid !== undefined && proc.exitCode === null) {
-      // Process is still alive — attach close listener before killing to avoid TOCTOU race
+    if (pid !== undefined) {
       const closePromise = new Promise<void>((resolveWait) => {
         const timeout = setTimeout(() => resolveWait(), 3000);
         proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
       });
-      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-      // Always await closePromise (which has a 3-second timeout) even if
-      // process.kill(pid, 0) throws ESRCH. Node.js may not have processed
-      // the close event yet, and the close handler may need to commitWorktree
-      // (code === 0) before we proceed to cleanupWorktree below.
+      if (proc.exitCode === null) {
+        try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+      }
       await closePromise;
     }
-    // If proc.exitCode !== null, process already exited — skip wait entirely
   }
   // If the close handler committed work (code===0 before SIGKILL landed),
   // agent status was changed to "done" — preserve the branch to avoid data loss.
@@ -1237,6 +1256,7 @@ interface MergeBranchResult {
   hasConflicts: boolean;
   conflictFiles: string;
   error?: string;
+  stashWarning?: string;
 }
 
 /**
@@ -1285,8 +1305,14 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
   try {
     git(["merge", "--no-commit", "--no-ff", branch], ctxCwd);
   } catch (mergeErr: any) {
-    const unmerged = gitQuiet(["ls-files", "-u"], ctxCwd).trim();
-    const isConflict = unmerged.length > 0 && !unmerged.startsWith("fatal:");
+    let unmerged = "";
+    try {
+      unmerged = git(["ls-files", "-u"], ctxCwd).trim();
+    } catch {
+      // git failed (e.g., index lock, permission error) — cannot determine conflicts;
+      // treat as a merge error rather than a false conflict
+    }
+    const isConflict = unmerged.length > 0;
     // Parse unique filenames from ls-files -u output BEFORE abort (which clears conflict state)
     let conflictFiles = "";
     if (isConflict) {
@@ -1325,7 +1351,18 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
   }
 
   // Success
-  if (stashed) safeStashPop(ctxCwd, execId, "after successful merge");
+  if (stashed && !safeStashPop(ctxCwd, execId, "after successful merge")) {
+    // safeStashPop logs a warning internally; surface it in the result so
+    // callers (and ultimately users) know their uncommitted changes are
+    // trapped in a stash and need manual recovery.
+    return {
+      success: true,
+      retainForManualReview: false,
+      hasConflicts: false,
+      conflictFiles: "",
+      stashWarning: `git stash pop failed after successful merge of ${execId}. Uncommitted changes are in the stash — recover with: git stash list && git stash pop`,
+    };
+  }
   return { success: true, retainForManualReview: false, hasConflicts: false, conflictFiles: "" };
 }
 
@@ -1443,14 +1480,10 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       exitCode = -2;
       done();
     };
-    proc.on("close", closeHandler);
-    proc.on("error", errorHandler);
-
-    // Create the kill timeout BEFORE the early-abort check below. done() calls
-    // clearTimeoutEscalation, so the timeout must be initialized before any code
-    // path can invoke done() — previously a pre-aborted signal hit the temporal
-    // dead zone and threw a ReferenceError inside the Promise executor, rejecting
-    // a promise that callers (reviewLoop/analyze) rely on always resolving.
+    // Create the kill timeout BEFORE registering process event handlers.
+    // done() calls clearTimeoutEscalation, so the timeout must be initialized before
+    // any code path can invoke done() — previously a pre-aborted signal or synchronous
+    // event emission hit the temporal dead zone and threw a ReferenceError.
     const { killTimer: procKillTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
       proc,
       killTimeout,
@@ -1473,6 +1506,9 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     // `timer` was never assigned, leaving a 20-minute timer pending (retaining the
     // proc handle and stdout/stderr buffers) for every completed sub-process.
     timer = procKillTimer;
+
+    proc.on("close", closeHandler);
+    proc.on("error", errorHandler);
 
     // Wire up AbortSignal for mid-flight cancellation BEFORE early check to prevent race
     if (signal) {
@@ -1804,18 +1840,14 @@ function spawnSubAgent(
       cleanupWorktree(root, id, true);
     };
 
-    proc.on("close", closeHandler);
-    proc.on("error", errorHandler);
-
     // Track safety-net timers so settle() can clear them on normal close.
     let abortSafetyTimer: NodeJS.Timeout | null = null;
     let earlyAbortSafetyTimer: NodeJS.Timeout | null = null;
 
-    // Create the kill timeout BEFORE the early-abort check below. settle() calls
-    // clearTimeoutEscalation, so the timeout must be initialized before any code
-    // path can invoke settle() — previously a pre-aborted signal hit the temporal
-    // dead zone and threw a ReferenceError inside the Promise executor, rejecting
-    // a promise that callers rely on always resolving.
+    // Create the kill timeout BEFORE registering process event handlers.
+    // settle() calls clearTimeoutEscalation, so the timeout must be initialized before
+    // any code path can invoke settle() — previously a pre-aborted signal or synchronous
+    // event emission hit the temporal dead zone and threw a ReferenceError.
     const { killTimer: agentKillTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
       proc,
       killTimeout,
@@ -1844,6 +1876,9 @@ function spawnSubAgent(
     // `killTimer` was never assigned, so every completed agent left a 20-minute
     // timer pending (firing SIGTERM/SIGKILL at a dead process before self-cleaning).
     killTimer = agentKillTimer;
+
+    proc.on("close", closeHandler);
+    proc.on("error", errorHandler);
 
     // Wire up external AbortSignal for mid-flight cancellation
     if (extSignal) {
@@ -1995,7 +2030,7 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
-        _currentTaskLabel = `${params.task.substring(0, 40).replace(/\n/g, " ")}`;
+        _currentTaskLabel = `${Array.from(params.task).slice(0, 40).join('').replace(/\n/g, " ")}`;
         _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
         if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
@@ -2010,7 +2045,7 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
-        _currentTaskLabel = `${params.task.substring(0, 40).replace(/\n/g, " ")}`;
+        _currentTaskLabel = `${Array.from(params.task).slice(0, 40).join('').replace(/\n/g, " ")}`;
         _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
 
         // If no subagentId, improve the current codebase directly (no worktree)
@@ -2218,7 +2253,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Invalid sub-agent ID: "${String(params.id).substring(0, 40)}". IDs must be alphanumeric with optional dashes/underscores.` }], details: {}, isError: true };
       }
       const ag = subAgents.get(params.id);
-      if (ag && ag.status === "running") {
+      if (ag && (ag.status === "running" || ag.status === "improving")) {
         return {
           content: [{ type: "text", text: `Sub-agent ${params.id} still running. Wait for completion first.` }],
           details: {},
@@ -2264,7 +2299,7 @@ export default function (pi: ExtensionAPI) {
       }
       const branch = branchName(params.id);
       const ag = subAgents.get(params.id);
-      if (ag && ag.status === "running") return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
+      if (ag && (ag.status === "running" || ag.status === "improving")) return { content: [{ type: "text", text: `Sub-agent ${params.id} is still running. Wait for completion or cancel first.` }], details: {}, isError: true };
 
       // Use shared merge helper with policy: reject dirty tree, abort on commit failure
       const result = mergeBranch(ctx.cwd, params.id, {
@@ -2448,7 +2483,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: "No tasks provided." }], details: {}, isError: true };
       }
 
-      const maxCon = Math.max(Math.floor(params.maxConcurrency || 5), 1);
+      const maxCon = Math.max(Math.floor(params.maxConcurrency ?? 5), 1);
       const results: { task: string; id: string; result: string; status: string; elapsed: number; commitHash?: string }[] = [];
 
       for (let i = 0; i < tasks.length; i += maxCon) {
@@ -2472,7 +2507,7 @@ export default function (pi: ExtensionAPI) {
               result,
               // Derive status from the result sentinel when the agent is absent from
               // the map (early denials/errors never insert it) — don't default to "done".
-              status: ag?.status ?? (/^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(result) ? "error" : "done"),
+              status: ag?.status ?? (ERROR_SENTINEL_RE.test(result) ? "error" : "done"),
               elapsed: ((ag?.endTime || Date.now()) - (ag?.startTime || Date.now())) / 1000,
               commitHash: ag?.commitHash,
             };
@@ -2499,16 +2534,20 @@ export default function (pi: ExtensionAPI) {
             if (ag && ag.status === "running") {
               ag.status = "cancelled";
               // Wait for process close before cleanup to avoid racing the closeHandler's
-              // commitWorktree (which fires on code===0). Same pattern as cancelSubAgent.
+              // commitWorktree (which fires on code===0). Always await close regardless of
+              // exitCode — exitCode can be set to 0 before the close event fires, and the
+              // closeHandler is what commits work and sets terminal state.
               const proc = ag.proc;
               if (proc) {
                 const { pid } = proc;
-                if (pid !== undefined && proc.exitCode === null) {
+                if (pid !== undefined) {
                   const closePromise = new Promise<void>((resolveWait) => {
                     const timeout = setTimeout(() => resolveWait(), 3000);
                     proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
                   });
-                  try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+                  if (proc.exitCode === null) {
+                    try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+                  }
                   await closePromise;
                 }
               }
@@ -2516,7 +2555,7 @@ export default function (pi: ExtensionAPI) {
                 // worktree + branch intentionally preserved for manual inspection
               } else {
                 const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "";
-                cleanupWorktree(projectRoot(ctx.cwd), id, !(hasCommittedWork || ag.status === "done"));
+                cleanupWorktree(projectRoot(ctx.cwd), id, !hasCommittedWork);
               }
               subAgents.delete(id);
             }
@@ -2611,6 +2650,50 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── cleanup on shutdown ────────────────────────────────────────────────
+  // ── helpers ───────────────────────────────────────────────────────
+
+  /** Preserve or delete a sub-agent branch based on whether it has unmerged commits.
+   *  Returns true if the branch was preserved (renamed to recovered/). */
+  function preserveOrDeleteBranch(
+    branch: string,
+    entry: string,
+    recoverySuffix: string,
+    root: string,
+    context: string,
+  ): boolean {
+    let branchExists = false;
+    try {
+      git(["rev-parse", "--verify", branch], root);
+      branchExists = true;
+    } catch { /* branch already deleted — nothing to preserve */ }
+    if (!branchExists) return false;
+    try {
+      const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
+      const branchTip = git(["rev-parse", branch], root).trim();
+      if (mergeBase !== branchTip) {
+        const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
+        git(["branch", "-m", branch, recoveredBranch], root);
+        console.warn(`[subagent] Stale sentinel for ${entry}: ${context}; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
+        return true;
+      } else {
+        git(["branch", "-D", branch], root);
+        return false;
+      }
+    } catch {
+      // merge-base or rev-parse failed — rename to recovered/ to preserve
+      // unmerged commits rather than force-delete (which could lose data).
+      try {
+        const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
+        git(["branch", "-m", branch, recoveredBranch], root);
+        console.warn(`[subagent] Stale sentinel for ${entry}: ${context}, merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
+        return true;
+      } catch {
+        git(["branch", "-D", branch], root);
+        return false;
+      }
+    }
+  }
+
   // ── session_start: recover from interrupted sessions ───────────────
   pi.on("session_start", async () => {
     // Clean up stale worktrees from previous interrupted sessions.
@@ -2791,35 +2874,7 @@ export default function (pi: ExtensionAPI) {
             // If the sentinel persisted (unlinkSync failed in settle()), a subsequent session_start
             // would delete the branch and destroy committed work. Preserve unmerged commits by
             // moving the branch to the recovered/ namespace.
-            // First, check if the branch actually exists before attempting merge-base.
-            let branchExists = false;
-            try {
-              git(["rev-parse", "--verify", branch], root);
-              branchExists = true;
-            } catch { /* branch already deleted — nothing to preserve */ }
-            if (branchExists) {
-              try {
-                const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
-                const branchTip = git(["rev-parse", branch], root).trim();
-                if (mergeBase !== branchTip) {
-                  const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
-                  git(["branch", "-m", branch, recoveredBranch], root);
-                  console.warn(`[subagent] Stale sentinel for ${entry}: worktree removed; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
-                } else {
-                  git(["branch", "-D", branch], root);
-                }
-              } catch {
-                // merge-base or rev-parse failed — rename to recovered/ to preserve
-                // unmerged commits rather than force-delete (which could lose data).
-                try {
-                  const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
-                  git(["branch", "-m", branch, recoveredBranch], root);
-                  console.warn(`[subagent] Stale sentinel for ${entry}: merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
-                } catch {
-                  git(["branch", "-D", branch], root);
-                }
-              }
-            }
+            preserveOrDeleteBranch(branch, entry, recoverySuffix, root, "worktree removed");
             unlinkSync(sentinel);
           } catch {
             // If the worktree directory no longer exists on disk (successfully removed or
@@ -2829,34 +2884,7 @@ export default function (pi: ExtensionAPI) {
             if (!existsSync(wtDir)) {
               // Before force-deleting the branch, check if it has unmerged commits to prevent data loss.
               // This mirrors the merge-base check in the main try block above.
-              let branchExists = false;
-              try {
-                git(["rev-parse", "--verify", branch], root);
-                branchExists = true;
-              } catch { /* branch already deleted — nothing to preserve */ }
-              if (branchExists) {
-                try {
-                  const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
-                  const branchTip = git(["rev-parse", branch], root).trim();
-                  if (mergeBase !== branchTip) {
-                    const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
-                    git(["branch", "-m", branch, recoveredBranch], root);
-                    console.warn(`[subagent] Stale sentinel for ${entry}: worktree missing; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
-                  } else {
-                    git(["branch", "-D", branch], root);
-                  }
-                } catch {
-                  // merge-base or rev-parse failed — rename to recovered/ to preserve
-                  // unmerged commits rather than force-delete (which could lose data).
-                  try {
-                    const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
-                    git(["branch", "-m", branch, recoveredBranch], root);
-                    console.warn(`[subagent] Stale sentinel for ${entry}: worktree missing, merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
-                  } catch {
-                    git(["branch", "-D", branch], root);
-                  }
-                }
-              }
+              preserveOrDeleteBranch(branch, entry, recoverySuffix, root, "worktree missing");
               try { unlinkSync(sentinel); } catch { /* best effort */ }
             }
             // If the worktree directory still exists, leave the sentinel so the next
@@ -2894,7 +2922,12 @@ export default function (pi: ExtensionAPI) {
     // on heavily-loaded systems where 200ms is insufficient.
     const closePromises: Promise<void>[] = [];
     for (const ag of subAgents.values()) {
-      if (ag.proc && ag.proc.exitCode === null) {
+      // Wait for any process that hasn't exited yet, OR any process that exited
+      // (exitCode is set) but whose close event hasn't fired yet. The latter
+      // covers a window between the 'exit' and 'close' events where the close
+      // handler would try to commitWorktree() but the cleanup loop below deletes
+      // the worktree first, silently losing committed work.
+      if (ag.proc && (ag.proc.exitCode === null || ag.status === "cancelled")) {
         closePromises.push(new Promise<void>(resolve => {
           const timeout = setTimeout(() => resolve(), 5000);
           ag.proc!.once("close", () => { clearTimeout(timeout); resolve(); });
