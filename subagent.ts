@@ -118,7 +118,8 @@ function safeId(raw: string): string | null {
 // Read default/cheap model from pi settings
 let _defaultModel: string | undefined;
 let _cheapModel: string | undefined;
-let _currentTaskLabel: string = ""; // for todo progress display
+let _currentTaskLabel: string = "";
+let _currentTodoId: string | null = null;
 
 function refreshModels() {
   try {
@@ -252,11 +253,11 @@ async function reviewLoop(
     const actualIssuesCountForIter = isClean ? 0 : actualIssuesCount;
 
     // Show issues found in todo widget
-    if (tb && todoMatchKey) {
+    if (tb && _currentTodoId) {
       const label = isClean
         ? `${_currentTaskLabel || "improve"} — ✅ clean after ${i} rounds`
         : `${_currentTaskLabel || "improve"} — r${i}/${MAX_ROUNDS}: ${actualIssuesCount} issue(s)${issueSummary}`;
-      tb.updateItemByContent(`🔍 ${todoMatchKey}`, isClean ? "completed" : "in_progress", label);
+      tb.updateItemById(_currentTodoId, isClean ? "completed" : "in_progress", label);
     }
 
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
@@ -278,7 +279,7 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress",
+    if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "in_progress",
       `${_currentTaskLabel || "improve"} — 🔧 r${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
     // Check for cancellation BEFORE empty-output check — a cancelled fixer that is killed
     // before any output is buffered could produce truly empty output rather than the
@@ -313,7 +314,7 @@ async function reviewLoop(
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
   const tb = getTodoBridge();
-  if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${_currentTaskLabel || "improve"} — ⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
+  if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel || "improve"} — ⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
@@ -1870,39 +1871,32 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
-        const taskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
-        _currentTaskLabel = taskLabel;
-        if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
+        _currentTaskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
+        _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
-        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${_currentTaskLabel || "analyze"} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
-        // matches via startsWith(key), so the final update would otherwise no-op.
-        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+        if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
       }
 
       // ── IMPROVE mode ────────────────────────────────────────────────
       if (params.mode === "improve") {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
-        // Add a todo item so progress is visible in the todo flow widget
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
         _currentTaskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
-        const todoItemId = tb ? tb.addItem(`🔍 ${todoMatchKey}`) : null;
-        const updateTodo = (status: string, content: string) => {
-          if (tb && todoItemId) tb.updateItemById(todoItemId, status, content);
-        };
+        _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
 
         // If no subagentId, improve the current codebase directly (no worktree)
         if (params.subagentId === undefined || params.subagentId === null || typeof params.subagentId !== "string" || params.subagentId.trim() === "") {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey, params.model);
-          updateTodo("completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+          if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅ clean (${result.iterations}r)" : "⚠ ${result.iterations} rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
         // If subagentId provided, improve the target sub-agent's worktree
         const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, undefined, _signal, todoMatchKey, params.model);
-        updateTodo("completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+        if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅ clean (${result.iterations}r)" : "⚠ ${result.iterations} rounds"}`);
         // Only auto-merge when the improve loop completed cleanly; failed loops leave the branch for review
         if (result.clean) {
           try {
