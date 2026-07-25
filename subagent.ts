@@ -198,11 +198,7 @@ async function reviewLoop(
 
   for (let i = 1; i <= MAX_ROUNDS; i++) {
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
-    // Update todo progress if bridge available
     const tb = getTodoBridge();
-    // Keep the match key as a PREFIX of newContent — updateItemByContent matches
-    // via startsWith(key); dropping the prefix makes every later update a silent no-op.
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `${_currentTaskLabel || "improve"} — round ${i}/${MAX_ROUNDS}: reviewing...`);
 
     evictTerminalAgents();
     const reviewTask = buildReviewTask(i);
@@ -238,6 +234,13 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Reviewer produced no output at round ${i}` };
     }
 
+    // Extract issue summaries for progress display
+    const issueLines = reviewerOutput.split(/\n/).filter((l: string) => l.trim().startsWith("-"));
+    const issues = issueLines.map((l: string) => l.replace(/^\s*-\s*/, "").substring(0, 80));
+    const issueSummary = issues.length > 0
+      ? `\n${issues.map((s: string) => `   - ${s}`).join("\n")}`
+      : "";
+
     const cleanMatch = reviewerOutput.match(/^CLEAN:\s*(true|false)/im);
     const foundMatch = reviewerOutput.match(/^FOUND:\s*(\d+)/im);
     const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
@@ -248,10 +251,17 @@ async function reviewLoop(
     // When CLEAN: true, mark actualIssuesCount as 0 regardless of FOUND value
     const actualIssuesCountForIter = isClean ? 0 : actualIssuesCount;
 
+    // Show issues found in todo widget
+    if (tb && todoMatchKey) {
+      const label = isClean
+        ? `${_currentTaskLabel || "improve"} — ✅ clean after ${i} rounds`
+        : `${_currentTaskLabel || "improve"} — r${i}/${MAX_ROUNDS}: ${actualIssuesCount} issue(s)${issueSummary}`;
+      tb.updateItemByContent(`🔍 ${todoMatchKey}`, isClean ? "completed" : "in_progress", label);
+    }
+
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
 
     if (isClean) {
-      if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${_currentTaskLabel || "improve"} — ✅ clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -268,7 +278,8 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `${_currentTaskLabel || "improve"} — 🔧 round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress",
+      `${_currentTaskLabel || "improve"} — 🔧 r${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
     // Check for cancellation BEFORE empty-output check — a cancelled fixer that is killed
     // before any output is buffered could produce truly empty output rather than the
     // "[cancelled by user]" sentinel. We must detect cancellation first to avoid
