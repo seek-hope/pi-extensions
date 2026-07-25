@@ -479,38 +479,34 @@ function renderWidget(ctx?: any): void {
   const ui = resolveUi(ctx);
   if (!ui) return;
 
-  const active = todo.items.filter(i => i.status === "pending" || i.status === "in_progress");
-  if (active.length === 0) {
+  if (todo.items.length === 0) {
     ui.setWidget?.("todo", undefined);
     ui.setWidget?.("todo-detail", undefined);
-    detailWidgetActive = false;
     return;
   }
 
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
   const total = todo.items.length;
 
+  // Show ALL items in order, like Claude Code
   const lines: string[] = [];
+  lines.push(`Todo (${done}/${total})`);
 
-  for (let i = 0; i < active.length; i++) {
-    const item = active[i];
-    const tag = item.status === "in_progress" ? "▸" : item.status === "pending" ? "·" : item.status === "completed" ? "✓" : "✗";
+  for (const item of todo.items) {
+    const icon = item.status === "in_progress" ? "●"
+      : item.status === "pending" ? "○"
+      : item.status === "completed" ? "✓"
+      : "✗";
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
-    // Split on embedded newlines first, then add each line
-    const parts = item.content.split(/\n/);
-    for (const p of parts) {
-      if (!p.trim()) continue;
-      lines.push(`${bold}${tag}${reset} ${bold}${p}${reset}`);
+    let content = item.content;
+    // Split on newlines, add continuation indent
+    const subLines = content.split(/\n/);
+    for (let j = 0; j < subLines.length; j++) {
+      const prefix = j === 0 ? `${icon} ` : "   ";
+      lines.push(`${bold}${prefix}${subLines[j]}${reset}`);
     }
   }
-
-  const more = total - active.length - done;
-  const parts: string[] = [];
-  if (done > 0) parts.push(`${done} done`);
-  if (active.length > 0) parts.push(`${active.length} active`);
-  parts.push("/todo for all");
-  lines.push(parts.join(" · "));
 
   ui.setWidget?.("todo", lines);
 }
@@ -862,8 +858,7 @@ export default function (pi: ExtensionAPI) {
       // Remember cleaned contents so this notification doesn't repeat on the next
       // tree event (restore re-surfaces the same done items every time)
       for (const i of removable) _autoCleanedContents.add(i.content);
-      todo.items = todo.items.filter(i =>
-        (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
+      // Completed items stay visible (Claude Code style) — don't filter them out
     }
 
     // Keep the all-done notify dedup in sync with the post-restore list: a stale
