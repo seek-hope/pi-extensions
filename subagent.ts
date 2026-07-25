@@ -241,17 +241,6 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Reviewer produced no output at round ${i}` };
     }
 
-    // Extract issue summaries for progress display.
-    // Match common bullet formats: "-", "*", "•", and numbered lists ("1.", "2)", etc.).
-        // Only match bullet lines in the ISSUES section to avoid false positives
-        // from unrelated markdown lists, code comments, or section numbering.
-        const issuesSection = reviewerOutput.split(/^ISSUES:/im)[1] || "";
-        const issueLines = issuesSection.split(/\n/).filter((l: string) => /^\s*(?:[-*•]|\d+[.)])\s*/.test(l));
-    const issues = issueLines.map((l: string) => l.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").substring(0, 80));
-    const issueSummary = issues.length > 0
-      ? `\n${issues.map((s: string) => `   - ${s}`).join("\n")}`
-      : "";
-
     const cleanMatch = reviewerOutput.match(/^CLEAN:\s*(true|false)/im);
     const foundMatch = reviewerOutput.match(/^FOUND:\s*(\d+)/im);
     const isClean = cleanMatch ? cleanMatch[1].toLowerCase() === "true" : false;
@@ -270,8 +259,7 @@ async function reviewLoop(
     const effectiveTaskLabel = currentTaskLabel ?? _currentTaskLabel;
     if (tb) {
       const label = isClean
-        ? `${effectiveTaskLabel || "improve"} — ✅ clean after ${i} rounds`
-        : `${effectiveTaskLabel || "improve"} — r${i}/${MAX_ROUNDS}: ${actualIssuesCount} issue(s)${issueSummary}`;
+        ? `${effectiveTaskLabel || "improve"} — ✅`
       // Mark as "in_progress" even when CLEAN — the caller (handleExecuteMode,
       // handleAnalyzeMode) controls the final todo status after the loop returns.
       // Setting "completed" here would be premature if the outer auto-merge fails.
@@ -718,16 +706,24 @@ async function handleExecuteMode(
           // handleExecuteMode may also be called from other paths — use a safe fallback.
           const desc = typeof item.description === "string" ? item.description : String(item.description ?? "");
           const executeHash = createHash("sha256").update(desc).digest("hex").substring(0, 8);
-          const todoMatchKey = `execute:${executeHash}:${desc.substring(0, 50)}`;
+          const todoMatchKey = `execute:${executeHash}:${Array.from(desc).slice(0, 50).join('')}`;
           // Create the todo item that reviewLoop's progress updates target — without
           // this, every updateItemByContent call inside the loop silently no-ops.
           const tb = getTodoBridge();
-          _currentTaskLabel = `${Array.from(desc).slice(0, 40).join('').replace(/\n/g, " ")}`;
+          // Grapheme-cluster-aware truncation (avoids splitting ZWJ sequences like 👨‍👩‍👧‍👦)
+          let truncated: string;
+          try {
+            const seg = new Intl.Segmenter("en", { granularity: "grapheme" });
+            truncated = [...seg.segment(desc)].slice(0, 40).map(s => s.segment).join('');
+          } catch {
+            truncated = Array.from(desc).slice(0, 40).join('');
+          }
+          _currentTaskLabel = truncated.replace(/\n/g, " ");
           if (tb) _currentTodoId = tb.addItem(`🔍 ${todoMatchKey}`);
           try {
             const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey, execOptions?.model);
             if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ${ir.clean ? "✅ clean" : "⚠ issues remain"} (${ir.iterations}r)`);
-            results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
+            let resultIcon = ir.clean ? "✅" : "⚠";
             if (!ir.clean) allClean = false;
             // Only auto-merge clean improvements — failed loops leave the branch for manual review
             if (ir.clean) {
@@ -735,8 +731,11 @@ async function handleExecuteMode(
               if (!mergeResult.retainForManualReview) {
                 cleanupWorktree(root, execId, true);
                 subAgents.delete(execId);
+              } else {
+                resultIcon = "⚠️ unmerged";
               }
             }
+            results.push(`${i + 1}. ${item.description}: ${resultIcon} (${ir.iterations}r)`);
           } finally {
             // Reset module-level globals between items to prevent stale state leaking
             // into the next iteration. The finally block guards against `updateItemByContent`
@@ -1299,7 +1298,15 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
     // Already up to date — no merge needed
     if (stashed) safeStashPop(ctxCwd, execId, "after up-to-date merge");
     return { success: true, retainForManualReview: false, hasConflicts: false, conflictFiles: "" };
-  } catch { /* not up to date — proceed with merge */ }
+  } catch (e: any) {
+    // Only proceed if the branch is genuinely not an ancestor (exit code 1).
+    // Any other error (e.g., index lock, permission error, signal) should abort.
+    if (e.status !== 1) {
+      if (stashed) safeStashPop(ctxCwd, execId, "after merge-base failure");
+      return { success: false, retainForManualReview: true, hasConflicts: false, conflictFiles: "", error: `git merge-base failed: ${(e.message || "").substring(0, 80)}` };
+    }
+    /* not up to date — proceed with merge */
+  }
 
   // Attempt merge
   try {
@@ -2032,11 +2039,14 @@ export default function (pi: ExtensionAPI) {
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
         _currentTaskLabel = `${Array.from(params.task).slice(0, 40).join('').replace(/\n/g, " ")}`;
         _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
-        const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
-        if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
-        _currentTodoId = null;
-        _currentTaskLabel = "";
-        return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
+        try {
+          const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
+          if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
+          return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
+        } finally {
+          _currentTodoId = null;
+          _currentTaskLabel = "";
+        }
       }
 
       // ── IMPROVE mode ────────────────────────────────────────────────
@@ -2047,21 +2057,18 @@ export default function (pi: ExtensionAPI) {
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
         _currentTaskLabel = `${Array.from(params.task).slice(0, 40).join('').replace(/\n/g, " ")}`;
         _currentTodoId = tb ? tb.addItem(_currentTaskLabel) : null;
+        try {
 
         // If no subagentId, improve the current codebase directly (no worktree)
         if (params.subagentId === undefined || params.subagentId === null || typeof params.subagentId !== "string" || params.subagentId.trim() === "") {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey, params.model);
           if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? `✅ clean (${result.iterations}r)` : `⚠ ${result.iterations} rounds`}`);
-          _currentTodoId = null;
-          _currentTaskLabel = "";
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
         // If subagentId provided, improve the target sub-agent's worktree
         const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, undefined, _signal, todoMatchKey, params.model);
         if (tb && _currentTodoId) tb.updateItemById(_currentTodoId, "completed", `${_currentTaskLabel} — ${result.clean ? `✅ clean (${result.iterations}r)` : `⚠ ${result.iterations} rounds`}`);
-        _currentTodoId = null;
-        _currentTaskLabel = "";
         // Only auto-merge when the improve loop completed cleanly; failed loops leave the branch for review
         if (result.clean) {
           try {
@@ -2101,6 +2108,10 @@ export default function (pi: ExtensionAPI) {
           } catch { /* best effort cleanup */ }
         }
         return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
+        } finally {
+          _currentTodoId = null;
+          _currentTaskLabel = "";
+        }
       }
 
       // ── EXECUTE mode ────────────────────────────────────────────────
@@ -2529,6 +2540,8 @@ export default function (pi: ExtensionAPI) {
         results.push(...batchResults);
         // If cancelled mid-batch, clean up any sub-agents that are still tracked as running
         if (_signal?.aborted) {
+          const closePromises: Promise<void>[] = [];
+          const toCleanup: { id: string; ag: SubAgent }[] = [];
           for (const id of batchIds) {
             const ag = subAgents.get(id);
             if (ag && ag.status === "running") {
@@ -2545,20 +2558,24 @@ export default function (pi: ExtensionAPI) {
                     const timeout = setTimeout(() => resolveWait(), 3000);
                     proc.on("close", () => { clearTimeout(timeout); resolveWait(); });
                   });
+                  closePromises.push(closePromise);
                   if (proc.exitCode === null) {
                     try { proc.kill("SIGKILL"); } catch { /* already dead */ }
                   }
-                  await closePromise;
                 }
               }
-              if (ag.commitFailed) {
-                // worktree + branch intentionally preserved for manual inspection
-              } else {
-                const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "";
-                cleanupWorktree(projectRoot(ctx.cwd), id, !hasCommittedWork);
-              }
-              subAgents.delete(id);
+              toCleanup.push({ id, ag });
             }
+          }
+          await Promise.all(closePromises);
+          for (const { id, ag } of toCleanup) {
+            if (ag.commitFailed) {
+              // worktree + branch intentionally preserved for manual inspection
+            } else {
+              const hasCommittedWork = ag.commitHash !== undefined && ag.commitHash !== "";
+              cleanupWorktree(projectRoot(ctx.cwd), id, !hasCommittedWork);
+            }
+            subAgents.delete(id);
           }
           break;
         }
@@ -2584,11 +2601,6 @@ export default function (pi: ExtensionAPI) {
       return { content: [{ type: "text", text: summary.join("\n") }], details: { count: results.length } };
     },
   });
-
-
-
-
-
 
   // ── subagent_list / subagent_cancel ────────────────────────────────────
   pi.registerTool({
@@ -2667,14 +2679,34 @@ export default function (pi: ExtensionAPI) {
       branchExists = true;
     } catch { /* branch already deleted — nothing to preserve */ }
     if (!branchExists) return false;
+
+    /** Rename branch to recovered/, retrying with fresh suffixes on collision.
+     *  Returns the final branch name on success, null if all retries exhausted. */
+    const tryRenameBranch = (src: string, e: string, baseSuffix: string, r: string): string | null => {
+      for (let retry = 0; retry < 4; retry++) {
+        const suffix = retry === 0 ? baseSuffix : `${baseSuffix}-${Math.random().toString(36).slice(2, 6)}`;
+        const target = `recovered/subagent/${e}-${suffix}`;
+        try {
+          git(["branch", "-m", src, target], r);
+          return target;
+        } catch {
+          // collision — generate a fresh suffix and retry
+        }
+      }
+      return null;
+    };
+
     try {
       const mergeBase = git(["merge-base", branch, "HEAD"], root).trim();
       const branchTip = git(["rev-parse", branch], root).trim();
       if (mergeBase !== branchTip) {
-        const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
-        git(["branch", "-m", branch, recoveredBranch], root);
-        console.warn(`[subagent] Stale sentinel for ${entry}: ${context}; branch renamed to ${recoveredBranch} to preserve unmerged commits.`);
-        return true;
+        const renamedBranch = tryRenameBranch(branch, entry, recoverySuffix, root);
+        if (renamedBranch) {
+          console.warn(`[subagent] Stale sentinel for ${entry}: ${context}; branch renamed to ${renamedBranch} to preserve unmerged commits.`);
+          return true;
+        }
+        git(["branch", "-D", branch], root);
+        return false;
       } else {
         git(["branch", "-D", branch], root);
         return false;
@@ -2682,15 +2714,13 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // merge-base or rev-parse failed — rename to recovered/ to preserve
       // unmerged commits rather than force-delete (which could lose data).
-      try {
-        const recoveredBranch = `recovered/subagent/${entry}-${recoverySuffix}`;
-        git(["branch", "-m", branch, recoveredBranch], root);
-        console.warn(`[subagent] Stale sentinel for ${entry}: ${context}, merge-base failed; branch preserved as ${recoveredBranch} to avoid data loss.`);
+      const renamedBranch = tryRenameBranch(branch, entry, recoverySuffix, root);
+      if (renamedBranch) {
+        console.warn(`[subagent] Stale sentinel for ${entry}: ${context}, merge-base failed; branch preserved as ${renamedBranch} to avoid data loss.`);
         return true;
-      } catch {
-        git(["branch", "-D", branch], root);
-        return false;
       }
+      git(["branch", "-D", branch], root);
+      return false;
     }
   }
 
@@ -2775,7 +2805,16 @@ export default function (pi: ExtensionAPI) {
                             const statFile = readFileSync("/proc/stat", "utf-8");
                             const btimeMatch = statFile.match(/btime\s+(\d+)/);
                             if (btimeMatch) {
-                              const CLK_TCK = 100;
+                              // Dynamically read sysconf(_SC_CLK_TCK) to support kernels
+                              // configured with CONFIG_HZ=250 or CONFIG_HZ=1000.
+                              let CLK_TCK = 100; // fallback default
+                              try {
+                                const clktckOut = spawnSync("getconf", ["CLK_TCK"], { timeout: 2000, encoding: "utf-8" });
+                                if (clktckOut.status === 0) {
+                                  const parsed = parseInt(clktckOut.stdout.trim(), 10);
+                                  if (!isNaN(parsed) && parsed > 0) CLK_TCK = parsed;
+                                }
+                              } catch { /* keep default */ }
                               const bootTimeMs = parseInt(btimeMatch[1], 10) * 1000;
                               processStartTime = bootTimeMs + (starttimeJiffies / CLK_TCK * 1000);
                             }
