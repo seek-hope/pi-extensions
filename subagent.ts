@@ -1649,23 +1649,23 @@ export default function (pi: ExtensionAPI) {
         if (_signal?.aborted) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
         // Add a todo item so progress is visible in the todo flow widget
         const tb = getTodoBridge();
-        // Use a unique match key incorporating the task text to avoid substring collisions
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
-        if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
+        const todoItemId = tb ? tb.addItem(`🔍 ${todoMatchKey}`) : null;
+        const updateTodo = (status: string, content: string) => {
+          if (tb && todoItemId) tb.updateItemById(todoItemId, status, content);
+        };
 
         // If no subagentId, improve the current codebase directly (no worktree)
-        // This avoids cross-repo mismatch when extensions live in a different git repo
-        // Treat undefined, null, empty, or whitespace-only as "no subagentId"
         if (params.subagentId === undefined || params.subagentId === null || typeof params.subagentId !== "string" || params.subagentId.trim() === "") {
           const result = await handleImproveMode(null, ctx.cwd, params.criteria, params.task, _signal, todoMatchKey, params.model);
-          if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+          updateTodo("completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
           return { content: [{ type: "text", text: result.summary }], details: { mode: "improve", ...result } };
         }
 
         // If subagentId provided, improve the target sub-agent's worktree
         const result = await handleImproveMode(params.subagentId, ctx.cwd, params.criteria, undefined, _signal, todoMatchKey, params.model);
-        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+        updateTodo("completed", `${result.clean ? "✅" : "⚠"} improve: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         // Only auto-merge when the improve loop completed cleanly; failed loops leave the branch for review
         if (result.clean) {
           try {
