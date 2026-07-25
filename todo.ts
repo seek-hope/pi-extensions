@@ -142,7 +142,6 @@ function resolveUi(ctx?: any): any {
 (globalThis as any).__pi_todo = {
   // ── regular todo items ──
   addItem(content: string, status: TodoStatus = "pending"): string | null {
-  addItem(content: string, status: TodoStatus = "pending"): string | null {
     const trimmed = String(content ?? "").trim();
     if (!trimmed) { console.warn("todo-bridge: addItem — content cannot be empty"); return null; }
     const sanitized = sanitizeContent(trimmed);
