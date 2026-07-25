@@ -260,9 +260,8 @@ async function reviewLoop(
     if (tb) {
       const label = isClean
         ? `${effectiveTaskLabel || "improve"} — ✅`
-      // Mark as "in_progress" even when CLEAN — the caller (handleExecuteMode,
-      // handleAnalyzeMode) controls the final todo status after the loop returns.
-      // Setting "completed" here would be premature if the outer auto-merge fails.
+        : `${effectiveTaskLabel || "improve"} (r${i}/${MAX_ROUNDS})`;
+      // Mark as "in_progress" even when CLEAN
       if (effectiveTodoId) {
         tb.updateItemById(effectiveTodoId, "in_progress", label);
       } else if (todoMatchKey) {
@@ -294,7 +293,7 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
     if (tb) {
-      const fixLabel = `${effectiveTaskLabel || "improve"} — 🔧 r${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`;
+      const fixLabel = `${effectiveTaskLabel || "improve"} (r${i}/${MAX_ROUNDS})`;
       if (effectiveTodoId) {
         tb.updateItemById(effectiveTodoId, "in_progress", fixLabel);
       } else if (todoMatchKey) {
