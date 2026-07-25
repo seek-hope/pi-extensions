@@ -152,17 +152,16 @@ function resolveUi(ctx?: any): any {
       console.warn(`todo-bridge: addItem — invalid status "${String(status)}"; item not added`);
       return null;
     }
-    const validStatus = s;
     // Return existing ID if duplicate — caller still gets a valid ID to use
     const existing = todo.items.find(i => i.content === truncated);
-    if (existing) return existing.id;
+    if (existing) return existing.id ?? null;
     // Cancel any pending all-done auto-clear only now that validation passed —
     // a failed call must not silently cancel a scheduled clear.
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     const id = String(++_itemIdCounter);
-    todo.items.push({ id, content: truncated, status: validStatus });
+    todo.items.push({ id, content: truncated, status: s });
     _programmaticIds.add(id);
-    if (validStatus === "in_progress") { enforceOneInProgress(todo.items.length - 1); _bridgeInProgressId = id; }
+    if (s === "in_progress") { enforceOneInProgress(todo.items.length - 1); _bridgeInProgressId = id; }
     syncBridgeMutations(); // the new in_progress item may have demoted a tracked one
     renderWidget();
     checkAndAutoClear();
@@ -180,7 +179,6 @@ function resolveUi(ctx?: any): any {
       console.warn(`todo-bridge: updateItemByContent — invalid status "${String(newStatus)}"; item unchanged`);
       return false;
     }
-    const valid = s;
     // Prefer an exact match; fall back to a prefix match only when unambiguous
     // (a blind prefix match can hit the wrong item when one content prefixes another).
     let idx = todo.items.findIndex(item => item.content === truncated);
@@ -189,14 +187,7 @@ function resolveUi(ctx?: any): any {
       if (prefixMatches.length === 1) idx = todo.items.indexOf(prefixMatches[0]);
     }
     if (idx !== -1) {
-      return applyBridgeUpdate(idx, valid, newContent, `updateItemByContent("${truncated}")`);
-    }
-    // TEMP DEBUG: log full state to diagnose missing items
-    console.error(`[todo] updateItemByContent MISS — key.len=${truncated.length} items=${todo.items.length}`);
-    for (const it of todo.items) {
-      const matchExact = it.content === truncated;
-      const matchPrefix = it.content.startsWith(truncated);
-      console.error(`[todo]   id=${it.id} exact=${matchExact} prefix=${matchPrefix} cnt="${it.content.substring(0, 50)}" st=${it.status}`);
+      return applyBridgeUpdate(idx, s, newContent, `updateItemByContent("${truncated}")`);
     }
     return false;
   },
@@ -235,12 +226,11 @@ function resolveUi(ctx?: any): any {
       console.warn(`todo-bridge: updateItemById — invalid status "${String(newStatus)}"; item unchanged`);
       return false;
     }
-    const valid = s;
     // Coerce to string — JS callers may pass a numeric id (3 vs "3")
     const key = String(id);
     const idx = todo.items.findIndex(item => item.id === key);
     if (idx !== -1) {
-      return applyBridgeUpdate(idx, valid, newContent, `updateItemById("${key}")`);
+      return applyBridgeUpdate(idx, s, newContent, `updateItemById("${key}")`);
     }
     console.debug(`todo-bridge: updateItemById — no item found for id "${String(id)}"`);
     return false;
