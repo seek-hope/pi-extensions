@@ -149,11 +149,9 @@ function resolveUi(ctx?: any): any {
       return null;
     }
     const validStatus = s;
-    // Reject duplicates — return null so callers know the item wasn't added
-    if (todo.items.some(i => i.content === truncated)) {
-      console.warn(`todo-bridge: duplicate item — "${truncated}" already exists`);
-      return null;
-    }
+    // Return existing ID if duplicate — caller still gets a valid ID to use
+    const existing = todo.items.find(i => i.content === truncated);
+    if (existing) return existing.id;
     // Cancel any pending all-done auto-clear only now that validation passed —
     // a failed call must not silently cancel a scheduled clear.
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
@@ -189,7 +187,7 @@ function resolveUi(ctx?: any): any {
     if (idx !== -1) {
       return applyBridgeUpdate(idx, valid, newContent, `updateItemByContent("${truncated}")`);
     }
-    console.debug(`todo-bridge: updateItemByContent — no item found for content "${truncated}"`);
+    // not found (expected during session_tree restore) for content "${truncated}"`);
     return false;
   },
   removeItemByContent(content: string): boolean {

@@ -62,7 +62,7 @@ function saveTasks(tasks: Map<string, Task>): void {
 let spawnCounter = 0;
 const tasks = loadTasks();
 const pollingTasks = new Set<string>(); // tracks which task IDs are currently being polled
-const spawningLocks = new Set<string>(); // guards spawnTask dedup against TOCTOU races
+const spawningLocks = new Map<string, { ts: number; taskId?: string }>(); // lockKey → {ts, taskId}; prevents TOCTOU duplicate spawns
 const spawningScripts = new Set<string>(); // guards task script cleanup against in-flight spawns
 const taskTimers = new Map<string, NodeJS.Timeout>(); // timeout handles per task, cleared on completion
 let _pi: ExtensionAPI | null = null;
@@ -114,8 +114,11 @@ async function readTaskLog(filePath: string): Promise<string> {
   // Read last MAX_LOG_READ bytes (where EXIT_CODE marker and recent output lives)
   const fd = await open(filePath, "r");
   const buf = Buffer.alloc(MAX_LOG_READ);
-  await fd.read(buf, 0, MAX_LOG_READ, stats.size - MAX_LOG_READ);
-  await fd.close();
+  try {
+    await fd.read(buf, 0, MAX_LOG_READ, stats.size - MAX_LOG_READ);
+  } finally {
+    await fd.close();
+  }
   // Skip UTF-8 continuation bytes at the start of the buffer to avoid corrupting
   // multi-byte characters that straddle the read boundary (U+FFFD replacement).
   let start = 0;
@@ -130,11 +133,13 @@ function notifyUser(msg: string, type: "info" | "warning" | "error" = "info"): v
 // ── spawn background task ──────────────────────────────────────────────────
 
 async function spawnTask(description: string, cwd: string, timeout: number): Promise<Task> {
-  const lockKey = createHash("sha256").update(description).update("\0").update(cwd).update("\0").update(String(timeout)).digest("hex").slice(0, 16);
-  // Deduplicate: if identical task (same description, cwd, and timeout) already running, return existing.
+  const lockKey = createHash("sha256").update(description).update("\0").update(cwd).digest("hex").slice(0, 16);
+  // Deduplicate: if identical task (same description, cwd) already running, return existing.
+  // Timeout is intentionally NOT part of the dedup key — two calls with different timeouts
+  // for the same command+cwd must not spawn duplicate tmux sessions.
   // Verify the tmux session is actually still alive before deduplicating.
   for (const [, t] of tasks) {
-    if (t.status === "running" && t.description === description && t.cwd === cwd && t.timeout === timeout) {
+    if (t.status === "running" && t.description === description && t.cwd === cwd) {
       const alive = await tmuxHasSession(t.id);
       if (alive === true) return t; // session confirmed alive — deduplicate
       if (alive === "error") continue; // check failed — can't confirm; don't mark as dead
@@ -147,60 +152,147 @@ async function spawnTask(description: string, cwd: string, timeout: number): Pro
   }
   // Guard against TOCTOU: atomically check-and-acquire the lock (no await between check and add).
   // This prevents two concurrent spawns for the same (desc, cwd) from both passing the gate.
-  const deadline = Date.now() + 10_000;
+  // The task ID is generated immediately after acquiring the lock and stored in spawningLocks
+  // so that lock-stealing callers can verify whether a tmux session was already created.
+  let deadline = Date.now() + 10_000;
+  const maxWait = Date.now() + 60_000; // global maximum: 60s — prevents infinite spin
+  let id: string = ""; // assigned inside the loop before break
+  let adoptedId: string = ""; // populated when adopting an orphaned tmux session after maxWait
   while (true) {
     if (!spawningLocks.has(lockKey)) {
-      spawningLocks.add(lockKey);
+      // Generate the task ID early — before any await — so that lock-stealing callers
+      // can check tmuxHasSession() on it and avoid spawning a duplicate session.
+      if (adoptedId) {
+        id = adoptedId;
+        adoptedId = "";
+      } else {
+        id = `task-${Date.now().toString(36)}-${String(spawnCounter++).padStart(3, '0')}`;
+      }
+      spawningLocks.set(lockKey, { ts: Date.now(), taskId: id });
       // Double-check: another call may have inserted the task just before we acquired the lock
       // (race — the original lock holder finished its spawn after we deemed the lock stale)
       const taskAfterLock = [...tasks.values()].find(
-        t => t.status === "running" && t.description === description && t.cwd === cwd && t.timeout === timeout
+        t => t.status === "running" && t.description === description && t.cwd === cwd
       );
       if (taskAfterLock) {
         spawningLocks.delete(lockKey);
         return taskAfterLock;
       }
+      // Also check if a tmux session was already created for a stored taskId from a
+      // stolen-and-reacquired lock (the original holder may have spawned the session
+      // but not yet called tasks.set()).
+      const lockData = spawningLocks.get(lockKey);
+      if (lockData?.taskId) {
+        const sessionAlive = await tmuxHasSession(lockData.taskId);
+        if (sessionAlive === true) {
+          // Session exists — the original holder succeeded. The task entry may or
+          // may not be in the map yet; if it's not, create a minimal entry for it.
+          const existingTask = tasks.get(lockData.taskId);
+          if (existingTask) {
+            spawningLocks.delete(lockKey);
+            return existingTask;
+          }
+          // tmux session alive but no task entry — the original holder crashed mid-spawn.
+          // Proceed under our lock to create the task entry.
+        }
+      }
+      // Before breaking, guard against lock entry disappearing (TOCTOU with
+      // concurrent lock-stealer that may have deleted the entry). If the lock
+      // data is missing its taskId, re-enter the loop to re-acquire.
+      const ourLockData = spawningLocks.get(lockKey);
+      if (!ourLockData?.taskId) {
+        spawningLocks.delete(lockKey);
+        continue;
+      }
+      id = ourLockData.taskId;
       break;
     }
     // Lock held by another call — wait for its task to appear or lock to release
     const existing = [...tasks.values()].find(
-      t => t.status === "running" && t.description === description && t.cwd === cwd && t.timeout === timeout
+      t => t.status === "running" && t.description === description && t.cwd === cwd
     );
     if (existing) return existing;
+    // Also check if the lock holder's taskId already has a live tmux session
+    const holderData = spawningLocks.get(lockKey);
+    if (holderData?.taskId && tasks.has(holderData.taskId)) {
+      const t = tasks.get(holderData.taskId)!;
+      if (t.status === "running") return t;
+    }
+    // Global maximum wait exceeded — steal lock to prevent infinite spin.
+    // Before stealing, check if the holder already spawned a tmux session.
+    // If yes, adopt it instead of spawning a duplicate (orphan).
+    if (Date.now() > maxWait) {
+      const lockData = spawningLocks.get(lockKey);
+      if (lockData?.taskId) {
+        const alive = await tmuxHasSession(lockData.taskId);
+        if (alive === true) {
+          // Adopt the orphaned session — reuse the holder's taskId
+          adoptedId = lockData.taskId;
+        }
+      }
+      spawningLocks.delete(lockKey);
+      continue;
+    }
     if (Date.now() > deadline) {
       // Deadline reached — lock holder may have crashed. Check if task appeared.
-      const existing = [...tasks.values()].find(
-        t => t.status === "running" && t.description === description && t.cwd === cwd && t.timeout === timeout
+      const existingAfterDeadline = [...tasks.values()].find(
+        t => t.status === "running" && t.description === description && t.cwd === cwd
       );
-      if (existing) return existing;
-      // Stale lock — remove it and retry with backoff
-      spawningLocks.delete(lockKey);
+      if (existingAfterDeadline) return existingAfterDeadline;
+      // Only steal the lock if it's been held for >10s (truly stale).
+      // Before stealing, verify the holder hasn't already created a tmux session.
+      const lockData = spawningLocks.get(lockKey);
+      if (lockData && Date.now() - lockData.ts > 10_000) {
+        // If the holder already spawned a tmux session, don't steal —
+        // the session exists; wait for the task entry to appear.
+        if (lockData.taskId) {
+          const alive = await tmuxHasSession(lockData.taskId);
+          if (alive === true) {
+            // Holder succeeded in spawning the tmux session. The task entry
+            // should appear shortly (holder is between tmux spawn and tasks.set()).
+            // Extend deadline instead of stealing (but bounded by maxWait).
+            deadline = Date.now() + 5_000;
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+          }
+        }
+        spawningLocks.delete(lockKey);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      // Lock is still fresh — extend our deadline and keep waiting
+      deadline = Date.now() + 10_000;
       await new Promise(resolve => setTimeout(resolve, 100));
       continue;
     }
     // Async yield to let the other call proceed without blocking the event loop
     await new Promise(resolve => setTimeout(resolve, 100));
   }
+  const logFile = join(TASK_DIR, `${id}.log`);
+  mkdirSync(TASK_DIR, { recursive: true });
+
+  const startTime = Date.now();
+
+  // Write the task command to a standalone script file — avoids shell escaping
+  // and heredoc-marker collision issues entirely.
+  const taskScript = join(TASK_DIR, `${id}.sh`);
+  const wrapperScript = [
+    `cd '${(cwd ?? process.cwd()).replace(/'/g, "'\\''")}'`,
+    `bash '${taskScript.replace(/'/g, "'\\''")}' > '${logFile.replace(/'/g, "'\\''")}' 2>&1`,
+    `echo "EXIT_CODE=$?" >> '${logFile.replace(/'/g, "'\\''")}'`,
+  ].join("\n");
+  writeFileSync(taskScript, description);
+  const wrapperFile = join(TASK_DIR, `${id}_wrapper.sh`);
+  writeFileSync(wrapperFile, wrapperScript);
+  spawningScripts.add(id);
+
+  // Create the task entry in the map BEFORE the tmux spawn so that any
+  // concurrent caller waiting on the lock can discover it via the tasks map.
+  // If the spawn fails, we remove the entry and clean up.
+  const task: Task = { id, description, cwd, status: "running", startTime, logFile, timeout };
+  tasks.set(id, task);
+
   try {
-    const id = `task-${Date.now().toString(36)}-${String(spawnCounter++).padStart(3, '0')}`;
-    const logFile = join(TASK_DIR, `${id}.log`);
-    mkdirSync(TASK_DIR, { recursive: true });
-
-    const startTime = Date.now();
-
-    // Write the task command to a standalone script file — avoids shell escaping
-    // and heredoc-marker collision issues entirely.
-    const taskScript = join(TASK_DIR, `${id}.sh`);
-    const wrapperScript = [
-      `cd '${cwd.replace(/'/g, "'\\''")}'`,
-      `bash '${taskScript.replace(/'/g, "'\\''")}' > "${logFile.replace(/'/g, "'\\''")}" 2>&1`,
-      `echo "EXIT_CODE=$?" >> "${logFile.replace(/'/g, "'\\''")}"`,
-    ].join("\n");
-    writeFileSync(taskScript, description);
-    const wrapperFile = join(TASK_DIR, `${id}_wrapper.sh`);
-    writeFileSync(wrapperFile, wrapperScript);
-    spawningScripts.add(id);
-
     try {
       await new Promise<void>((resolve, reject) => {
         const child = spawn("tmux", ["new-session", "-d", "-s", id,
@@ -215,17 +307,16 @@ async function spawnTask(description: string, cwd: string, timeout: number): Pro
         child.on("error", (err) => { clearTimeout(timer); reject(err); });
       });
     } catch {
-      // tmux spawn failed — clean up and throw
+      // tmux spawn failed — remove the pre-created task entry and clean up
+      tasks.delete(id);
       spawningScripts.delete(id);
       try { unlinkSync(taskScript); } catch { /* ok */ }
       try { unlinkSync(wrapperFile); } catch { /* ok */ }
       throw new Error(`Failed to start tmux session for task ${id}`);
     }
 
-    const task: Task = { id, description, cwd, status: "running", startTime, logFile, timeout };
-    tasks.set(id, task);
-    spawningScripts.delete(id);
     saveTasks(tasks);
+    spawningScripts.delete(id);
 
     // Poll for completion and notify
     pollCompletion(id);
@@ -245,7 +336,17 @@ async function spawnTask(description: string, cwd: string, timeout: number): Pro
               updateTaskWidget();
               return;
             }
-            try { await tmuxKillSession(id); } catch { /* ok */ }
+            await tmuxKillSession(id);
+            // Verify session is actually dead before marking killed
+            const stillAlive = await tmuxHasSession(id);
+            if (stillAlive === true) {
+              // Session survived — leave status as "running" so it can be retried
+              pollingTasks.delete(id);
+              taskTimers.delete(id);
+              saveTasks(tasks);
+              updateTaskWidget();
+              return;
+            }
             t.status = "killed";
             t.endTime = Date.now();
             pollingTasks.delete(id);
@@ -263,9 +364,12 @@ async function spawnTask(description: string, cwd: string, timeout: number): Pro
           // Unexpected error in timeout handler — kill session to prevent stuck tasks
           const t = tasks.get(id);
           if (t && t.status === "running") {
-            try { await tmuxKillSession(id); } catch { /* ok */ }
-            t.status = "killed";
-            t.endTime = Date.now();
+            await tmuxKillSession(id);
+            const stillAlive = await tmuxHasSession(id);
+            if (stillAlive !== true) {
+              t.status = "killed";
+              t.endTime = Date.now();
+            }
             pollingTasks.delete(id);
             taskTimers.delete(id);
             try { unlinkSync(wrapperFile); } catch { /* ok */ }
@@ -302,6 +406,15 @@ async function finalizeTaskOutput(task: Task): Promise<string> {
       exitMatch = match;
     }
     if (exitMatch && task.status === "running") {
+      // Verify the tmux session is actually dead before trusting EXIT_CODE.
+      // Command output may contain spurious EXIT_CODE= lines (e.g. from
+      // scripts that echo exit codes), which would otherwise cause the task
+      // to be prematurely marked as done while the session is still alive.
+      const sessionAlive = await tmuxHasSession(task.id);
+      if (sessionAlive === true) {
+        // Session still running — don't finalize yet
+        return content;
+      }
       task.exitCode = parseInt(exitMatch[1], 10);
       task.status = task.exitCode === 0 ? "done" : "error";
       task.endTime = Date.now();
@@ -312,6 +425,8 @@ async function finalizeTaskOutput(task: Task): Promise<string> {
 }
 
 async function killTask(id: string): Promise<boolean> {
+  // Validate id against whitelist to prevent path traversal via ../ sequences
+  if (!/^task-[a-z0-9-]+$/.test(id)) return false;
   const task = tasks.get(id);
   if (!task) {
     // Task not in Map — might be in the spawn window (scripts written, tmux running,
@@ -326,6 +441,13 @@ async function killTask(id: string): Promise<boolean> {
     return false;
   }
   await tmuxKillSession(id);
+  // Verify the session is actually dead before marking killed.
+  // tmuxKillSession resolves silently on timeout — the session may have survived.
+  const stillAlive = await tmuxHasSession(id);
+  if (stillAlive === true) {
+    // Session survived the kill attempt — don't mark as killed, don't mislead the user
+    return false;
+  }
   task.status = "killed";
   task.endTime = Date.now();
   pollingTasks.delete(id);
@@ -364,6 +486,68 @@ function pollCompletion(id: string): void {
   // Prevent duplicate polling chains for the same task
   if (pollingTasks.has(id)) return;
   pollingTasks.add(id);
+
+  // Create timeout timer if task has a timeout but no timer yet.
+  // This handles recovered tasks that lost their timer on session restart.
+  const task = tasks.get(id);
+  if (task && task.timeout && task.timeout > 0 && !taskTimers.has(id)) {
+    const wrapperFile = join(TASK_DIR, `${id}_wrapper.sh`);
+    const taskScript = join(TASK_DIR, `${id}.sh`);
+    // Adjust timeout for elapsed time (e.g. task recovered after session restart)
+    const elapsed = Date.now() - task.startTime;
+    const remainingTimeout = Math.max(task.timeout - elapsed, 60_000); // at least 1 min
+    const timer = setTimeout(async () => {
+      try {
+        const t = tasks.get(id);
+        if (t && t.status === "running") {
+          try { await finalizeTaskOutput(t); } catch { /* finalize failed — fall through to kill */ }
+          if (t.status !== "running") {
+            pollingTasks.delete(id);
+            taskTimers.delete(id);
+            saveTasks(tasks);
+            updateTaskWidget();
+            return;
+          }
+          await tmuxKillSession(id);
+          const stillAlive = await tmuxHasSession(id);
+          if (stillAlive === true) {
+            pollingTasks.delete(id);
+            taskTimers.delete(id);
+            saveTasks(tasks);
+            updateTaskWidget();
+            return;
+          }
+          t.status = "killed";
+          t.endTime = Date.now();
+          pollingTasks.delete(id);
+          taskTimers.delete(id);
+          try { unlinkSync(wrapperFile); } catch { /* ok */ }
+          try { unlinkSync(taskScript); } catch { /* ok */ }
+          saveTasks(tasks);
+          updateTaskWidget();
+        } else {
+          taskTimers.delete(id);
+        }
+      } catch {
+        const t = tasks.get(id);
+        if (t && t.status === "running") {
+          await tmuxKillSession(id);
+          const stillAlive = await tmuxHasSession(id);
+          if (stillAlive !== true) {
+            t.status = "killed";
+            t.endTime = Date.now();
+          }
+          pollingTasks.delete(id);
+          taskTimers.delete(id);
+          try { unlinkSync(wrapperFile); } catch { /* ok */ }
+          try { unlinkSync(taskScript); } catch { /* ok */ }
+          saveTasks(tasks);
+          updateTaskWidget();
+        }
+      }
+    }, remainingTimeout);
+    taskTimers.set(id, timer);
+  }
 
   let consecutiveErrors = 0;
 
@@ -480,6 +664,10 @@ export default function (pi: ExtensionAPI) {
   async function syncTasks(): Promise<void> {
     for (const [id, task] of tasks) {
       if (task.status !== "running") continue;
+      // Skip tasks still in the spawn window (task mapped but tmux session not yet confirmed).
+      // Without this guard, syncTasks sees a "running" task with no tmux session,
+      // falls through to the "session gone" branch, and permanently marks it as error.
+      if (spawningScripts.has(id)) continue;
       const sessionExists = await tmuxHasSession(id);
       if (sessionExists === true) {
         // Still running — resume polling

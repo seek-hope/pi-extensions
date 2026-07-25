@@ -8,8 +8,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, readdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync, readdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
 const SOCKET_DIR = join(homedir(), ".ssh", "pi-sockets");
@@ -22,6 +22,7 @@ interface PendingEntry {
   timer: ReturnType<typeof setTimeout> | null;
   onProcExit: (code: number | null) => void;
   onStdinError: (err: Error) => void;
+  onDrain: (() => void) | undefined;
   bufAtWrite: string;
 }
 
@@ -50,6 +51,7 @@ interface RemoteBgTask {
   startTime: number;
 }
 const remoteTasks: RemoteBgTask[] = [];
+const spawningRemoteBg = new Set<string>(); // guards ssh_exec bg dedup against TOCTOU races
 
 function saveRemoteTasks(): void {
   try {
@@ -261,10 +263,15 @@ function pollRemoteTask(logPath: string, cmd: string, host: string, pid: string 
           ], { deliverAs: "followUp" });
         }
       } catch { /* best effort */ }
-    }).catch(() => { /* ignore terminal errors */ });
+    });
   }
 
   setTimeout(check, 3000);
+}
+
+/** Escape a value for safe interpolation inside a double-quoted shell string. */
+function shellEscapeDQ(str: string): string {
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
 }
 
 function connKey(user: string, hostname: string, port: number): string {
@@ -286,7 +293,7 @@ function resolveSshConfig(host: string): { user: string; hostname: string; port:
     const out = (result.stdout || "") + (result.stderr || "");
     const cfg: Record<string, string> = {};
     for (const line of out.split("\n")) { const s = line.indexOf(" "); if (s > 0) cfg[line.substring(0, s)] = line.substring(s + 1); }
-    if (cfg["hostname"] && cfg["hostname"] !== host) {
+    if (cfg["hostname"]) {
       return { user: cfg["user"] || "root", hostname: cfg["hostname"], port: parseInt(cfg["port"] || "22", 10) };
     }
     return null;
@@ -301,7 +308,7 @@ function parseArgs(args: string): { alias: string; user: string; hostname: strin
   while (i < parts.length) {
     const p = parts[i];
     if (p === "-p") {
-      if (i + 1 < parts.length) { const v = parseInt(parts[i + 1]); if (!isNaN(v)) port = v; i += 2; }
+      if (i + 1 < parts.length) { const v = parseInt(parts[i + 1]); if (!isNaN(v)) { port = v; i += 2; } else { return null; } }
       else { return null; } // -p without port value: invalid
     }
     else if (p.startsWith("-")) {
@@ -368,7 +375,7 @@ function ensureShell(conn: Connection): void {
   // Use .destroyed and .writableEnded instead of .writable — .writable is false
   // during backpressure (buffer full, drain pending), which would falsely trigger
   // a shell restart and lose in-flight commands.
-  if (conn.proc && conn.proc.exitCode === null && conn.proc.signalCode === null &&
+  if (conn.proc && conn.proc.exitCode === null && conn.proc.signalCode === null && !conn.proc.killed &&
       conn.proc.stdin && !conn.proc.stdin.destroyed && !conn.proc.stdin.writableEnded) return;
 
   // Clean up dead/dying proc
@@ -379,6 +386,7 @@ function ensureShell(conn: Connection): void {
     // events after replacement, corrupting conn.buf with stale output.
     conn.proc.stdout?.removeAllListeners();
     conn.proc.stderr?.removeAllListeners();
+    conn.proc.stdin?.removeAllListeners();
     conn.proc.removeAllListeners();
     try { conn.proc.kill(); } catch { /* ok */ }
     conn.proc = null;
@@ -403,30 +411,47 @@ function ensureShell(conn: Connection): void {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  conn.proc.stdout!.on("data", (chunk: Buffer) => {
-    conn.buf += chunk.toString();
-    extractResponses(conn);
-  });
+  if (conn.proc.stdout) {
+    conn.proc.stdout.on("data", (chunk: Buffer) => {
+      conn.buf += chunk.toString();
+      extractResponses(conn);
+    });
+  }
 
-  conn.proc.stderr!.on("data", (chunk: Buffer) => {
-    // Include stderr in output — it may contain error messages
-    conn.buf += chunk.toString();
-    extractResponses(conn);
-  });
+  if (conn.proc.stderr) {
+    conn.proc.stderr.on("data", (chunk: Buffer) => {
+      // Include stderr in output — it may contain error messages
+      conn.buf += chunk.toString();
+      extractResponses(conn);
+    });
+  }
 
   conn.proc.on("exit", (code) => {
+    const deadProc = conn.proc;
     conn.proc = null;
     for (const [, p] of conn.pending) {
       if (p.timer) clearTimeout(p.timer);
+      // Remove per-command listeners to prevent leaks (ensureShell exit fires before shellExec's once handlers)
+      if (deadProc) {
+        deadProc.removeListener("exit", p.onProcExit);
+        deadProc.stdin?.removeListener("error", p.onStdinError);
+        if (p.onDrain) deadProc.stdin?.removeListener("drain", p.onDrain);
+      }
       p.reject(new Error(`SSH shell exited (code ${code})`));
     }
     conn.pending.clear();
   });
 
   conn.proc.on("error", (err) => {
+    const deadProc = conn.proc;
     conn.proc = null;
     for (const [, p] of conn.pending) {
       if (p.timer) clearTimeout(p.timer);
+      if (deadProc) {
+        deadProc.removeListener("exit", p.onProcExit);
+        deadProc.stdin?.removeListener("error", p.onStdinError);
+        if (p.onDrain) deadProc.stdin?.removeListener("drain", p.onDrain);
+      }
       p.reject(new Error(`SSH shell error: ${err.message}`));
     }
     conn.pending.clear();
@@ -450,7 +475,7 @@ function extractResponses(conn: Connection): void {
         truncatePos = match.index;
       }
     }
-    if (truncatePos > 0) {
+    if (truncatePos >= 0) {
       // Discard everything before the last valid marker (stale data)
       conn.buf = conn.buf.substring(truncatePos);
     } else {
@@ -473,8 +498,12 @@ function extractResponses(conn: Connection): void {
     const p = conn.pending.get(reqId);
     // Validate the random token to prevent marker injection from command output
     if (p && p.rand === rand) {
-      // Valid marker — resolve with output before it and truncate buffer
-      const output = conn.buf.substring(0, idx);
+      // Valid marker — resolve with output before it and truncate buffer.
+      // Use bufAtWrite to exclude stale output from orphaned/timed-out commands.
+      const startIdx = conn.buf.indexOf(p.bufAtWrite);
+      const output = startIdx >= 0
+        ? conn.buf.substring(startIdx + p.bufAtWrite.length, idx)
+        : conn.buf.substring(0, idx);
       conn.buf = conn.buf.substring(idx + m[0].length);
       conn.pending.delete(reqId);
       if (p.timer) clearTimeout(p.timer);
@@ -482,6 +511,7 @@ function extractResponses(conn: Connection): void {
       if (conn.proc) {
         conn.proc.removeListener("exit", p.onProcExit);
         conn.proc.stdin?.removeListener("error", p.onStdinError);
+        if (p.onDrain) conn.proc.stdin?.removeListener("drain", p.onDrain);
       }
       p.resolve(output);
     } else {
@@ -510,6 +540,7 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
       if (conn.proc) {
         conn.proc.removeListener("exit", onProcExit);
         conn.proc.stdin?.removeListener("error", onStdinError);
+        if (onDrain) conn.proc.stdin?.removeListener("drain", onDrain);
       }
     };
 
@@ -544,17 +575,24 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         cleanupListeners();
         conn.pending.delete(reqId);
         reject(new Error(`SSH shell exited (code ${code}) unexpectedly`));
+        // Remove drain listener to prevent listener leak when process exits
+        // before drain fires (backpressure case). Must be guarded by settled.
+        if (onDrain) conn.proc?.stdin?.removeListener("drain", onDrain);
       });
-      // Remove drain listener to prevent listener leak when process exits
-      // before drain fires (backpressure case).
-      if (onDrain) conn.proc?.stdin?.removeListener("drain", onDrain);
     };
     conn.proc.once("exit", onProcExit);
+    // Re-check: the process may have exited between the initial alive check
+    // above and the listener registration (TOCTOU window). If so, manually
+    // invoke the handler so the promise doesn't hang until timeout.
+    if (conn.proc.exitCode !== null || conn.proc.signalCode !== null) {
+      onProcExit(conn.proc.exitCode);
+      return;
+    }
 
     conn.proc.stdin!.once("error", onStdinError);
 
     const bufAtWrite = conn.buf;
-    conn.pending.set(reqId, { resolve, reject, rand, timer, onProcExit, onStdinError, bufAtWrite });
+    conn.pending.set(reqId, { resolve, reject, rand, timer, onProcExit, onStdinError, onDrain: undefined, bufAtWrite });
 
     // Pass command directly via stdin — the shell reads lines and executes them
     // Don't wrap in quotes (that would treat semicolons literally)
@@ -565,6 +603,8 @@ function shellExec(conn: Connection, cmd: string, timeout: number): Promise<stri
         // Data flushed successfully — response will arrive via extractResponses.
         // Listeners remain active; done() prevents double-settle.
       };
+      // Store onDrain on the pending entry so extractResponses can clean it up
+      if (conn.pending.has(reqId)) conn.pending.get(reqId)!.onDrain = onDrain;
       if (!wrote) {
         // Backpressure: wait for drain, but keep exit/error listeners alive.
         // The done() guard prevents double-settling, and removing listeners
@@ -624,8 +664,12 @@ async function isConnectedAsync(key: string, quick = false): Promise<boolean> {
     const result = await spawnAsync("ssh", ["-o", `ControlPath=${sock}`, "-O", "check", "x"], { timeout });
     if (result.status === 0) return true;
     const combined = result.stdout + result.stderr;
-    return /master running/i.test(combined);
+    if (/master running/i.test(combined)) return true;
+    // Master is definitively dead — clean up stale socket
+    try { rmSync(sock); } catch { /* ok */ }
+    return false;
   } catch {
+    // spawnAsync threw (timeout, ssh not found, etc.) — transient error, don't delete socket
     return false;
   }
 }
@@ -652,21 +696,28 @@ async function connect(alias: string, user: string, hostname: string, port: numb
     const r = spawnSync("which", [t], { stdio: "ignore" });
     return r.status === 0;
   }) || "xterm";
+  // Escape values to prevent shell injection via malicious hostnames/usernames.
+  // displayHost and sock go inside double-quoted strings; sshTarget is word-split
+  // by the shell so each word is single-quoted separately.
+  const safeDisplayHost = shellEscapeDQ(displayHost);
+  const safeSock = shellEscapeDQ(sock);
+  const safeSshTarget = sshTarget.split(' ').map(w => `'${w.replace(/'/g, "'\\''")}'`).join(' ');
+
   const termProc = spawn(termEmu, [
     ...(termEmu === "gnome-terminal" ? ["--", "bash", "-c"] : ["-e", "bash", "-c"]),
-    `echo "Connecting to ${displayHost}..."; ` +
-    `ssh -o ControlPath="${sock}" -o ControlMaster=auto -o ControlPersist=12h ` +
+    `echo "Connecting to ${safeDisplayHost}..."; ` +
+    `ssh -o ControlPath="${safeSock}" -o ControlMaster=auto -o ControlPersist=12h ` +
     `-o ServerAliveInterval=60 -o ServerAliveCountMax=5 ` +
-    `-o StrictHostKeyChecking=accept-new -fN ${sshTarget} && ` +
+    `-o StrictHostKeyChecking=accept-new -fN ${safeSshTarget} && ` +
     `echo "Connected!" || echo "Auth failed."; read -p 'Press Enter...'`
   ], { stdio: "ignore", detached: true });
-  termProc.unref();
   let connectPolling = true;
   termProc.on("error", () => {
     connectPolling = false;
     ctx.ui.setStatus("ssh-" + key, "");
-    ctx.ui.notify("Failed to open terminal (alacritty not found?). Use ssh from an external terminal.", "warning");
+    ctx.ui.notify(`Failed to open terminal (${termEmu} not found?). Use ssh from an external terminal.`, "warning");
   });
+  termProc.unref();
   ctx.ui.setStatus("ssh-" + key, `Waiting...`);
   let tries = 0;
   async function poll() {
@@ -711,7 +762,11 @@ async function syncFromDiskAsync(): Promise<void> {
           }
           const key = keyFromFilename(name);
           if (![...connections.values()].some(c => c.socket === sock)) {
-            const [uh, pt] = key.split(":");
+            // Use lastIndexOf(":") to handle IPv6 addresses (e.g. user@[::1]:22)
+            const lastColon = key.lastIndexOf(":");
+            if (lastColon < 0) return; // skip legacy/malformed keys without colon
+            const uh = key.substring(0, lastColon);
+            const pt = key.substring(lastColon + 1);
             addConn(key, uh, sock, pt && pt !== "22" ? `-p ${pt} ${uh}` : uh);
           }
         } catch (syncErr: any) {
@@ -971,17 +1026,45 @@ export default function (pi: ExtensionAPI) {
         const isBg = params.background === true;
 
         if (isBg) {
-          // Deduplicate: if same command already running on this host, return existing
-          const existing = remoteTasks.find(t => t.host === params.host && t.cmd === params.command);
-          if (existing) {
+          // Deduplicate: use a lock set to prevent TOCTOU races between check and push.
+          // The lock key is host+command to allow unrelated hosts/commands to proceed.
+          const bgLockKey = `${params.host}\x00${params.command}`;
+          // Wait for lock if another call is currently spawning the same (host, command)
+          const lockDeadline = Date.now() + 15_000;
+          while (spawningRemoteBg.has(bgLockKey)) {
+            // Re-check dedup while waiting — the other call may have finished
+            const existing = remoteTasks.find(t => t.host === params.host && t.cmd === params.command);
+            if (existing) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Background task already running on ${conn!.key}.\n` +
+                    `Log: ${existing.logPath}\n` +
+                    `Check progress: ssh_exec("${params.host}", "tail -20 ${existing.logPath}")`,
+                }],
+                details: { logPath: existing.logPath, deduplicated: true },
+              };
+            }
+            if (Date.now() > lockDeadline) {
+              // Lock holder may have crashed — break through
+              spawningRemoteBg.delete(bgLockKey);
+              break;
+            }
+            await new Promise(r => setTimeout(r, 100));
+          }
+          spawningRemoteBg.add(bgLockKey);
+          // Double-check after acquiring the lock
+          const existingAfterLock = remoteTasks.find(t => t.host === params.host && t.cmd === params.command);
+          if (existingAfterLock) {
+            spawningRemoteBg.delete(bgLockKey);
             return {
               content: [{
                 type: "text",
-                text: `Background task already running on ${conn!.key}.\\n` +
-                  `Log: ${existing.logPath}\\n` +
-                  `Check progress: ssh_exec("${params.host}", "tail -20 ${existing.logPath}")`,
+                text: `Background task already running on ${conn!.key}.\n` +
+                  `Log: ${existingAfterLock.logPath}\n` +
+                  `Check progress: ssh_exec("${params.host}", "tail -20 ${existingAfterLock.logPath}")`,
               }],
-              details: { logPath: existing.logPath, deduplicated: true },
+              details: { logPath: existingAfterLock.logPath, deduplicated: true },
             };
           }
 
@@ -990,34 +1073,43 @@ export default function (pi: ExtensionAPI) {
           remoteTasks.push({ host: params.host, logPath, cmd: params.command, pid: null, startTime: Date.now() });
           saveRemoteTasks();
 
-          const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
-          const result = await shellExec(conn, bgCmd, 15000);
-          conn.lastUse = Date.now();
+          try {
+            const bgCmd = `nohup bash -c '${params.command.replace(/'/g, "'\\''")}' > ${logPath} 2>&1 & echo PID=$!`;
+            const result = await shellExec(conn, bgCmd, 15000);
+            conn.lastUse = Date.now();
 
-          // Extract PID from result for liveness checks during polling
-          // Use LAST match of PID= in the result (command output may contain earlier spurious matches)
-          let pidMatch: RegExpExecArray | null = null;
-          let match: RegExpExecArray | null;
-          const pidRe = /PID=(\d+)/g;
-          while ((match = pidRe.exec(result)) !== null) {
-            pidMatch = match;
+            // Extract PID from result for liveness checks during polling
+            // Use LAST match of PID= in the result (command output may contain earlier spurious matches)
+            let pidMatch: RegExpExecArray | null = null;
+            let match: RegExpExecArray | null;
+            const pidRe = /PID=(\d+)/g;
+            while ((match = pidRe.exec(result)) !== null) {
+              pidMatch = match;
+            }
+            const pid = pidMatch ? pidMatch[1] : null;
+
+            // Poll remote log and inject result when done
+            pollRemoteTask(logPath, params.command, params.host, pid);
+
+            return {
+              content: [{
+                type: "text",
+                text: `Background task started on ${conn.key}.\n` +
+                  `${result.trim()}\n` +
+                  `Log: ${logPath}\n` +
+                  `Check progress: ssh_exec("${params.host}", "tail -20 ${logPath}")\n` +
+                  `Read full log: ssh_exec("${params.host}", "cat '${logPath}'")`,
+              }],
+              details: { pid, logPath },
+            };
+          } catch (spawnErr: any) {
+            // shellExec failed — clean up phantom remote task entry
+            const idx = remoteTasks.findIndex(t => t.logPath === logPath);
+            if (idx >= 0) { remoteTasks.splice(idx, 1); saveRemoteTasks(); }
+            throw spawnErr;
+          } finally {
+            spawningRemoteBg.delete(bgLockKey);
           }
-          const pid = pidMatch ? pidMatch[1] : null;
-
-          // Poll remote log and inject result when done
-          pollRemoteTask(logPath, params.command, params.host, pid);
-
-          return {
-            content: [{
-              type: "text",
-              text: `Background task started on ${conn.key}.\n` +
-                `${result.trim()}\n` +
-                `Log: ${logPath}\n` +
-                `Check progress: ssh_exec("${params.host}", "tail -20 ${logPath}")\n` +
-                `Read full log: ssh_exec("${params.host}", "cat '${logPath}'")`,
-            }],
-            details: { pid, logPath },
-          };
         }
         const result = await shellExec(conn, params.command, Math.min(effectiveTimeout, 600_000));
         conn.lastUse = Date.now();
@@ -1043,6 +1135,13 @@ export default function (pi: ExtensionAPI) {
       const conn = await findConnection(params.host);
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!(await isConnectedAsync(conn.key))) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
+      // Validate local path before spawning scp
+      if (!existsSync(params.localPath)) {
+        return { content: [{ type: "text", text: `Local file not found: ${params.localPath}` }], details: {}, isError: true };
+      }
+      if (statSync(params.localPath).isDirectory()) {
+        return { content: [{ type: "text", text: `Local path is a directory, not a file: ${params.localPath}` }], details: {}, isError: true };
+      }
       try {
         // ControlMaster handles the connection — just use alias:path
         const scpArgs = [
@@ -1052,9 +1151,7 @@ export default function (pi: ExtensionAPI) {
           params.localPath,
           `${conn.alias}:${params.remotePath}`,
         ];
-        const result = spawnSync("scp", scpArgs, {
-          encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000, stdio: ["ignore", "pipe", "pipe"]
-        });
+        const result = await spawnAsync("scp", scpArgs, { timeout: 300_000 });
         if (result.status !== 0) throw new Error(result.stderr || `scp exited with code ${result.status}`);
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: `Copied: ${params.localPath} → ${conn.alias}:${params.remotePath}\n${result.stdout || "OK"}` }], details: {} };
@@ -1079,6 +1176,14 @@ export default function (pi: ExtensionAPI) {
       const conn = await findConnection(params.host);
       if (!conn) return { content: [{ type: "text", text: `No connection. Connect: /ssh ${params.host}` }], details: {}, isError: true };
       if (!(await isConnectedAsync(conn.key))) return { content: [{ type: "text", text: "Connection stale. Reconnect." }], details: {}, isError: true };
+      // Validate local destination before spawning scp
+      try {
+        // Use path.dirname for robust directory extraction (handles trailing /, ../, etc.)
+        const destDir = dirname(params.localPath) || ".";
+        if (!existsSync(destDir)) {
+          return { content: [{ type: "text", text: `Local destination directory not found: ${destDir}` }], details: {}, isError: true };
+        }
+      } catch { /* stat may fail for exotic paths — let scp report the error */ }
       try {
         // ControlMaster handles the connection — just use alias:path
         const scpArgs = [
@@ -1088,9 +1193,7 @@ export default function (pi: ExtensionAPI) {
           `${conn.alias}:${params.remotePath}`,
           params.localPath,
         ];
-        const result = spawnSync("scp", scpArgs, {
-          encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 300_000, stdio: ["ignore", "pipe", "pipe"]
-        });
+        const result = await spawnAsync("scp", scpArgs, { timeout: 300_000 });
         if (result.status !== 0) throw new Error(result.stderr || `scp exited with code ${result.status}`);
         conn.lastUse = Date.now();
         return { content: [{ type: "text", text: `Copied: ${conn.alias}:${params.remotePath} → ${params.localPath}\n${result.stdout || "OK"}` }], details: {} };

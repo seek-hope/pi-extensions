@@ -27,18 +27,65 @@ const YDOTOOL_SOCKET = process.env.YDOTOOL_SOCKET
 /** Cache for passwordless sudo availability with time-based invalidation */
 let sudoAvailable: boolean | null = null;
 let sudoCacheTime = 0;
+let sudoCheckPromise: Promise<void> | null = null; // dedup concurrent checks
 const SUDO_CACHE_TTL = 60_000; // recheck every 60 seconds
+
+/** Non-blocking version of execFileSync — returns Buffer, for use inside async tool execute() */
+function execFileAsync(cmd: string, args: string[], options: { timeout?: number; input?: string; } = {}): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: options.input ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB cap to prevent memory exhaustion
+    let size = 0;
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => {
+      size += d.length;
+      if (size > MAX_OUTPUT) { child.kill(); reject(new Error(`Output exceeded ${MAX_OUTPUT / 1024 / 1024}MB limit`)); return; }
+      chunks.push(d);
+    });
+    child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
+    child.stderr.on("data", (d: Buffer) => {
+      size += d.length;
+      if (size > MAX_OUTPUT) { child.kill(); reject(new Error(`Output exceeded ${MAX_OUTPUT / 1024 / 1024}MB limit`)); return; }
+      stderr += d.toString();
+    });
+    child.stderr.on("error", () => {});
+    const ms = options.timeout || 10_000;
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${ms}ms`)); }, ms);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(stderr.trim() || `Command "${cmd}" exited with code ${code}`));
+    });
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    if (options.input) {
+      child.stdin!.on("error", () => {}); // prevent unhandled pipe errors on stdin
+      child.stdin!.end(options.input);
+    }
+  });
+}
+
 async function ensureSudo(): Promise<void> {
   // Use a time-to-live cache: recheck every SUDO_CACHE_TTL ms so that if
   // passwordless sudo is revoked mid-session, subsequent calls detect it.
   if (sudoAvailable === true && Date.now() - sudoCacheTime < SUDO_CACHE_TTL) return;
-  try {
-    await execFileAsync("sudo", ["-n", "true"], { timeout: 5_000 });
-    sudoAvailable = true;
-  } catch {
-    sudoAvailable = false;
+  // Deduplicate concurrent checks: if a check is already in flight, wait for it
+  if (sudoCheckPromise) {
+    await sudoCheckPromise;
+    if (sudoAvailable === true) return;
+    // Previous check failed — fall through to retry
   }
-  sudoCacheTime = Date.now();
+  sudoCheckPromise = (async () => {
+    try {
+      await execFileAsync("sudo", ["-n", "true"], { timeout: 5_000 });
+      sudoAvailable = true;
+    } catch {
+      sudoAvailable = false;
+    }
+    sudoCacheTime = Date.now();
+  })();
+  await sudoCheckPromise;
+  sudoCheckPromise = null;
   if (!sudoAvailable) {
     throw new Error(
       "Passwordless sudo is not configured. ydotool requires root privileges for mouse/keyboard operations. " +
@@ -58,9 +105,19 @@ async function shAsync(cmd: string, timeout = 5_000): Promise<string> {
     const child = spawn("sh", ["-c", cmd], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB cap to prevent memory exhaustion
+    let size = 0;
+    child.stdout.on("data", (d: Buffer) => {
+      size += d.length;
+      if (size > MAX_OUTPUT) { child.kill(); reject(new Error(`Output exceeded ${MAX_OUTPUT / 1024 / 1024}MB limit`)); return; }
+      stdout += d.toString();
+    });
     child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
-    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => {
+      size += d.length;
+      if (size > MAX_OUTPUT) { child.kill(); reject(new Error(`Output exceeded ${MAX_OUTPUT / 1024 / 1024}MB limit`)); return; }
+      stderr += d.toString();
+    });
     child.stderr.on("error", () => {});
     const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${timeout}ms`)); }, timeout);
     child.on("close", (code) => {
@@ -81,9 +138,19 @@ async function sudoShAsync(cmd: string, timeout = 5_000): Promise<string> {
     });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB cap to prevent memory exhaustion
+    let size = 0;
+    child.stdout.on("data", (d: Buffer) => {
+      size += d.length;
+      if (size > MAX_OUTPUT) { child.kill(); reject(new Error(`Output exceeded ${MAX_OUTPUT / 1024 / 1024}MB limit`)); return; }
+      stdout += d.toString();
+    });
     child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
-    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => {
+      size += d.length;
+      if (size > MAX_OUTPUT) { child.kill(); reject(new Error(`Output exceeded ${MAX_OUTPUT / 1024 / 1024}MB limit`)); return; }
+      stderr += d.toString();
+    });
     child.stderr.on("error", () => {});
     const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${timeout}ms`)); }, timeout);
     child.on("close", (code) => {
@@ -95,36 +162,11 @@ async function sudoShAsync(cmd: string, timeout = 5_000): Promise<string> {
   });
 }
 
-/** Non-blocking version of execFileSync — returns Buffer, for use inside async tool execute() */
-function execFileAsync(cmd: string, args: string[], options: { timeout?: number; input?: string; } = {}): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: options.input ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"] });
-    const chunks: Buffer[] = [];
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => chunks.push(d));
-    child.stdout.on("error", () => {}); // prevent unhandled EPIPE crashes
-    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-    child.stderr.on("error", () => {});
-    const ms = options.timeout || 10_000;
-    const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out after ${ms}ms`)); }, ms);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve(Buffer.concat(chunks));
-      else reject(new Error(stderr.trim() || `Command "${cmd}" exited with code ${code}`));
-    });
-    child.on("error", (err) => { clearTimeout(timer); reject(err); });
-    if (options.input) {
-      child.stdin!.on("error", () => {}); // prevent unhandled pipe errors on stdin
-      child.stdin!.end(options.input);
-    }
-  });
-}
-
 /** Async version of getCursorPos — non-blocking */
 async function getCursorPosAsync(): Promise<{ x: number; y: number }> {
   const out = await shAsync("hyprctl cursorpos");
   const m = out.match(/(-?\d+),\s*(-?\d+)/);
-  if (m) return { x: parseInt(m[1]), y: parseInt(m[2]) };
+  if (m) return { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
   throw new Error(`Unable to parse cursor position from hyprctl output: "${out}"`);
 }
 
@@ -135,8 +177,8 @@ function parseScreenBounds(out: string): { width: number; height: number; monito
   const re = /(-?\d+)x(-?\d+)@[\d.]+ at (-?\d+)x(-?\d+)/g;
   let m;
   while ((m = re.exec(out)) !== null) {
-    const w = parseInt(m[1]), h = parseInt(m[2]);
-    const x = parseInt(m[3]), y = parseInt(m[4]);
+    const w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+    const x = parseInt(m[3], 10), y = parseInt(m[4], 10);
     minX = Math.min(minX, x);
     minY = Math.min(minY, y);
     maxX = Math.max(maxX, x + w);
@@ -377,6 +419,11 @@ export default function (pi: ExtensionAPI) {
         if (!Number.isFinite(params.x) || !Number.isFinite(params.y)) {
           throw new Error(`Invalid coordinates: (${params.x}, ${params.y}) — must be finite numbers`);
         }
+        // Validate button BEFORE any side effects (mouse movement)
+        const btn = params.button ?? 1;
+        if (btn < 1 || btn > 3) {
+          return { content: [{ type: "text", text: `Invalid button: ${btn}. Must be 1 (left), 2 (middle), or 3 (right).` }], details: {}, isError: true };
+        }
         const bound = await getScreenBoundsAsync();
         let tx = params.x, ty = params.y;
         if (params.coordSystem && !["absolute", "normalized", "relative"].includes(params.coordSystem)) {
@@ -390,10 +437,6 @@ export default function (pi: ExtensionAPI) {
           ty = pos.y + params.y;
         }
         await moveToVerified(tx, ty, bound);
-        const btn = params.button ?? 1;
-        if (btn < 1 || btn > 3) {
-          return { content: [{ type: "text", text: `Invalid button: ${btn}. Must be 1 (left), 2 (middle), or 3 (right).` }], details: {}, isError: true };
-        }
         await ydotoolRetry(`ydotool click ${btn}`);
         await sleep(80);
         const pos = await getCursorPosAsync();
@@ -432,6 +475,11 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal) {
       try {
+        // Reject overly large text to prevent memory exhaustion
+        const MAX_INPUT = 100 * 1024; // 100 KB
+        if (params.text.length > MAX_INPUT) {
+          return { content: [{ type: "text", text: `Text too large (${params.text.length} bytes, max ${MAX_INPUT / 1024}KB)` }], details: {}, isError: true };
+        }
         // Pass text via stdin (-) to avoid shell escaping issues entirely
         await execFileAsync("wtype", ["-"], { timeout: 10_000, input: params.text });
         return { content: [{ type: "text", text: `Typed: ${params.text.substring(0, 100)}` }], details: { length: params.text.length } };
@@ -509,6 +557,7 @@ export default function (pi: ExtensionAPI) {
         const count = Math.min(Math.ceil(Math.abs(params.amount)), 20); // Round up fractional, cap at 20
         for (let i = 0; i < count; i++) {
           await ydotoolRetry(`ydotool click ${dir}`, 3, 50);
+          if (i < count - 1) await sleep(15); // prevent compositor from dropping rapid clicks
         }
         const pos = await getCursorPosAsync();
         return { content: [{ type: "text", text: `Scrolled ${params.amount > 0 ? "up" : "down"} ${count} at (${pos.x}, ${pos.y})` }], details: { amount: params.amount, ...pos } };
