@@ -490,37 +490,23 @@ function renderWidget(ctx?: any): void {
   const done = todo.items.filter(i => i.status === "completed" || i.status === "cancelled").length;
   const total = todo.items.length;
 
-  // Flow view: active items only (completed hidden to save widget space)
-  const MAX_VISIBLE = 3;
-  const showAll = active.length <= MAX_VISIBLE;
-  const visible = showAll ? active : active.slice(0, MAX_VISIBLE);
-  if (!showAll) {
-    // Guarantee the currently-running task stays visible even if it falls past the window.
-    // The swap displaces one visible item but reveals a previously-hidden one,
-    // so the hidden count is unchanged (still active.length - MAX_VISIBLE).
-    const ipIdx = active.findIndex(i => i.status === "in_progress");
-    if (ipIdx >= MAX_VISIBLE) {
-      visible[MAX_VISIBLE - 1] = active[ipIdx];
-    }
-  }
-
   const lines: string[] = [];
-  lines.push(`┌─ Todo (${done}/${total}) ──────────`);
 
-  for (let i = 0; i < visible.length; i++) {
-    const item = visible[i];
+  for (let i = 0; i < active.length; i++) {
+    const item = active[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    const safe = truncate(item.content, 40);
+    const safe = truncate(item.content, 50);
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
-    lines.push(`│  ${bold}${icon}${reset} ${bold}${safe}${reset}`);
-    if (i < visible.length - 1) lines.push(`│  │`);
+    lines.push(`${bold}${icon}${reset} ${bold}${safe}${reset}`);
   }
 
-  if (!showAll) {
-    lines.push(`│  ... ${active.length - MAX_VISIBLE} more`);
-  }
-  lines.push(`└─ /todo for all ${total} items`);
+  const more = total - active.length - done;
+  const parts: string[] = [];
+  if (done > 0) parts.push(`${done} done`);
+  if (active.length > 0) parts.push(`${active.length} active`);
+  parts.push("/todo for all");
+  lines.push(parts.join(" · "));
 
   ui.setWidget?.("todo", lines);
 }
