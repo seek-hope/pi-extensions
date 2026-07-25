@@ -1106,9 +1106,6 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     let timedOut = false;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
-      resolve({ stdout: "", stderr: `[spawn error] ${err.message}`, exitCode: -2 });
-      return;
-    }
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
