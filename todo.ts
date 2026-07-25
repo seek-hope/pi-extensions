@@ -72,7 +72,8 @@ let _itemIdCounter = 0;
     const truncated = truncate(sanitized, 200);
     const s = String(newStatus).trim().toLowerCase();
     const valid = isValidTodoStatus(s) ? s : "pending";
-    const idx = todo.items.findIndex(item => item.content === truncated);
+    // Match by prefix — the key portion is unique enough for reliable matching
+    const idx = todo.items.findIndex(item => item.content.startsWith(truncated));
     if (idx !== -1) {
       const item = todo.items[idx];
       item.status = valid;
@@ -552,7 +553,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     _pi = _pi ?? pi;
+    // Protect programmatically-added items (improve/analyze progress) from being wiped
+    const programmaticItems = todo.items.filter(i => i.content?.includes("improve:") || i.content?.includes("analyze:") || i.content?.includes("execute:"));
     restoreFromBranch(ctx);
+    // Re-add items that were wiped by restore
+    for (const item of programmaticItems) {
+      if (!todo.items.some(i => i.content === item.content)) {
+        todo.items.push(item);
+      }
+    }
     clearDetailWidget(ctx);
 
     // Auto-clean: remove completed/cancelled items after each interaction
