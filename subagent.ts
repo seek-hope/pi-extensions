@@ -1283,7 +1283,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       return;
     }
 
-    const { killTimer: timer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
+    const { killTimer: procKillTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
       proc,
       killTimeout,
       () => {
