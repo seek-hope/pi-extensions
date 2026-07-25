@@ -858,7 +858,9 @@ export default function (pi: ExtensionAPI) {
       // Remember cleaned contents so this notification doesn't repeat on the next
       // tree event (restore re-surfaces the same done items every time)
       for (const i of removable) _autoCleanedContents.add(i.content);
-      // Completed items stay visible (Claude Code style) — don't filter them out
+      // Remove completed items at turn end, notify user
+      todo.items = todo.items.filter(i =>
+        (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
     }
 
     // Keep the all-done notify dedup in sync with the post-restore list: a stale
