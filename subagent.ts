@@ -118,6 +118,7 @@ function safeId(raw: string): string | null {
 // Read default/cheap model from pi settings
 let _defaultModel: string | undefined;
 let _cheapModel: string | undefined;
+let _currentTaskLabel: string = ""; // for todo progress display
 
 function refreshModels() {
   try {
@@ -190,7 +191,7 @@ async function reviewLoop(
   runAction: (issuesCount: number, reviewerOutput: string, i: number) => Promise<string>,
   commitPrefix = "loop",
   signal?: AbortSignal,
-  todoMatchKey?: string, // unique key for todo bridge updates (avoids substring collisions)
+  todoMatchKey?: string,
   model?: string // model override for reviewer
 ): Promise<LoopResult> {
   const iterations: { iter: number; issuesFound: number; clean: boolean }[] = [];
@@ -201,7 +202,7 @@ async function reviewLoop(
     const tb = getTodoBridge();
     // Keep the match key as a PREFIX of newContent — updateItemByContent matches
     // via startsWith(key); dropping the prefix makes every later update a silent no-op.
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 ${todoMatchKey} — round ${i}/${MAX_ROUNDS}: reviewing...`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `${_currentTaskLabel || "improve"} — round ${i}/${MAX_ROUNDS}: reviewing...`);
 
     evictTerminalAgents();
     const reviewTask = buildReviewTask(i);
@@ -250,7 +251,7 @@ async function reviewLoop(
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
 
     if (isClean) {
-      if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ✅ clean after ${i} rounds`);
+      if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${_currentTaskLabel || "improve"} — ✅ clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -267,7 +268,7 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 ${todoMatchKey} — 🔧 round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `${_currentTaskLabel || "improve"} — 🔧 round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
     // Check for cancellation BEFORE empty-output check — a cancelled fixer that is killed
     // before any output is buffered could produce truly empty output rather than the
     // "[cancelled by user]" sentinel. We must detect cancellation first to avoid
@@ -301,7 +302,7 @@ async function reviewLoop(
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
   const tb = getTodoBridge();
-  if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
+  if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${_currentTaskLabel || "improve"} — ⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
@@ -1858,9 +1859,11 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
+        const taskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
+        _currentTaskLabel = taskLabel;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
-        // Keep the match key as a prefix of the new content — updateItemByContent
+        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${_currentTaskLabel || "analyze"} — ${result.clean ? "✅" : "⚠"} (${result.iterations}r)`);
         // matches via startsWith(key), so the final update would otherwise no-op.
         if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
@@ -1873,6 +1876,7 @@ export default function (pi: ExtensionAPI) {
         const tb = getTodoBridge();
         const taskHash = createHash("sha256").update(params.task).digest("hex").substring(0, 8);
         const todoMatchKey = `improve:${taskHash}:${params.task.substring(0, 50)}`;
+        _currentTaskLabel = `🔍 ${params.task.substring(0, 40).replace(/\n/g, " ")}`;
         const todoItemId = tb ? tb.addItem(`🔍 ${todoMatchKey}`) : null;
         const updateTodo = (status: string, content: string) => {
           if (tb && todoItemId) tb.updateItemById(todoItemId, status, content);
