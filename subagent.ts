@@ -1611,7 +1611,7 @@ function spawnSubAgent(
       }
     }
 
-    const { killTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
+    const { killTimer: agentKillTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
       proc,
       killTimeout,
       () => {
