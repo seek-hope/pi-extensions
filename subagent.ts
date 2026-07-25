@@ -102,6 +102,9 @@ function safeId(raw: string): string | null {
   // Allow alphanumeric, dash, underscore. Replace anything else.
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "");
   if (cleaned.length === 0 || cleaned.length > 71) return null;
+  // If the cleaned ID equals the raw input, it was already safe (e.g., internally-generated
+  // shortId values) — skip hashing to keep branch names readable.
+  if (cleaned === raw) return cleaned;
   const hash = createHash("sha256").update(raw).digest("hex").substring(0, 8);
   return `${cleaned}-${hash}`;
 }
@@ -259,12 +262,12 @@ async function reviewLoop(
       return { iterations: i, clean: false, summary: `❌ Fixer failed at round ${i}: ${fixerOutput.substring(0, 200)}` };
     }
     if (commitPrefix !== "") {
-      const hash = commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
-      if (hash === "no-changes") {
+      const cr = commitWorktree(workCwd, commitPrefix, `iteration ${i}: ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+      if (cr.ok && cr.hash === "") {
         // No changes to commit — the fixer correctly determined no modifications
         // were needed (e.g., false positive review). Continue the loop.
-      } else if (!hash) {
-        console.error(`reviewLoop: commitWorktree failed at iteration ${i} in ${workCwd}`);
+      } else if (!cr.ok) {
+        console.error(`reviewLoop: commitWorktree failed at iteration ${i} in ${workCwd}: ${cr.reason}`);
         // Reset the worktree to prevent residual uncommitted changes from leaking
         // into the next iteration. The fixer's changes remain uncommitted; if the
         // caller retries the improve loop, a clean review round would start fresh.
@@ -348,6 +351,11 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
         const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
         return `[Sub-agent timeout] Fixer timed out (exit -1): ${improved.substring(0, 200)}`;
       }
+      // Check for signal-killed process before generic non-zero handling
+      if (r.exitCode === null) {
+        const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
+        return `[Sub-agent killed by signal] Fixer killed by signal: ${improved.substring(0, 200)}`;
+      }
       const improved = r.stdout + (r.stderr ? "\n" + r.stderr : "");
       if (improved.trim().length > 0) analysis = improved; // update for next review round
       // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
@@ -358,7 +366,8 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
     },
     "",
     signal,
-    todoMatchKey
+    todoMatchKey,
+    model
   );
   return result;
 }
@@ -393,6 +402,13 @@ async function handleImproveMode(
     if (!existsSync(workCwd)) {
       return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree path ${workCwd} was externally removed.` };
     }
+    // Verify it's a valid git worktree (not a regular directory with .git missing,
+    // and not a standalone repo or submodule which have .git directories).
+    // Must be a .git file (worktree marker), matching the defense-in-depth check in commitWorktree.
+    const dotGitExisting = join(workCwd, ".git");
+    if (!existsSync(dotGitExisting) || !lstatSync(dotGitExisting).isFile()) {
+      return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree at ${workCwd} is not a valid git worktree (missing .git file).` };
+    }
   } else if (targetAgentId) {
     const safe = safeId(targetAgentId);
     if (!safe) {
@@ -405,9 +421,11 @@ async function handleImproveMode(
       catch {
         return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree exists but branch is missing.` };
       }
-      // Verify it's a valid git worktree (contains .git file or .git directory)
-      if (!existsSync(join(reconstructed, ".git"))) {
-        return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree ${reconstructed} is not a valid git worktree (missing .git).` };
+      // Verify it's a valid git worktree — must be a .git file (worktree marker),
+      // not a standalone repo or submodule (.git directory).
+      const dotGitReconstructed = join(reconstructed, ".git");
+      if (!existsSync(dotGitReconstructed) || !lstatSync(dotGitReconstructed).isFile()) {
+        return { iterations: 0, clean: false, summary: `Sub-agent ${targetAgentId} worktree ${reconstructed} is not a valid git worktree (missing .git file).` };
       }
       workCwd = reconstructed;
     } else {
@@ -466,6 +484,10 @@ async function handleImproveMode(
         if (r.exitCode === -1) {
           return `[Sub-agent timeout] Fixer timed out (exit -1): ${output.substring(0, 200)}`;
         }
+        // Check for signal-killed process before generic non-zero handling
+        if (r.exitCode === null) {
+          return `[Sub-agent killed by signal] Fixer killed by signal: ${output.substring(0, 200)}`;
+        }
         // Non-zero exit code means the sub-process crashed or failed mid-way — don't trust partial output.
         if (r.exitCode !== 0) {
           return `[Sub-agent error] Fixer process failed (exit ${r.exitCode}): ${output.substring(0, 200)}`;
@@ -474,7 +496,8 @@ async function handleImproveMode(
       },
       targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
       signal,
-      todoMatchKey
+      todoMatchKey,
+      model
     );
   } catch (e: any) {
     return { iterations: 0, clean: false, summary: `Unexpected error in review loop: ${(e.message || e).substring(0, 200)}` };
@@ -486,6 +509,10 @@ async function handleImproveMode(
     // would allow evictTerminalAgents to delete a branch with committed work.
     if (existing && originalStatus && existing.status === "improving") {
       existing.status = originalStatus;
+      // Only update endTime if the agent hadn't already reached a terminal state
+      // (and thus had an endTime set). Preserving the original endTime prevents
+      // artificially extending the agent's lifetime in the eviction map.
+      if (!existing.endTime) existing.endTime = Date.now();
     }
   }
   return _loopResult;
@@ -834,12 +861,21 @@ function getDiff(projectRoot: string, id: string): string {
   }
 }
 
+/** Structured result from {@link commitWorktree}. */
+interface CommitResult {
+  ok: boolean;
+  /** Commit hash. Empty string when there were no changes to commit.
+   *  "committed-no-hash" when the commit succeeded but hash retrieval failed. */
+  hash: string;
+  /** Failure reason when ok is false */
+  reason?: string;
+}
+
 /** Commit changes in the worktree directly (run git from the worktree path, not the main repo).
- *  Returns the short commit hash on success.
- *  Returns "no-changes" if the worktree has no uncommitted changes (caller should treat as skip).
- *  Returns "" on failure (git add/commit error, or hash retrieval failure).
- *  Callers: check for empty string to detect failure, check for "no-changes" to skip. */
-function commitWorktree(worktreePath: string, id: string, task: string): string {
+ *  Returns a structured {@link CommitResult} so callers can distinguish failure modes
+ *  (missing .git file, corrupted repo, git add/commit error, etc.) rather than
+ *  receiving an ambiguous empty string. */
+function commitWorktree(worktreePath: string, id: string, task: string): CommitResult {
   // Use Intl.Segmenter for grapheme-cluster-aware truncation (avoids splitting combining characters).
   // Fall back to code-point spread if Segmenter is unavailable (e.g., older Node.js).
   let truncated: string;
@@ -854,11 +890,32 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
   if (!truncated || !truncated.trim()) truncated = "(empty task)";
   const msg = id ? `pi: ${id} — ${truncated}` : `pi: ${truncated}`;
 
-  if (!worktreePath || !existsSync(join(worktreePath, ".git"))) return "";
+  // Defense-in-depth: verify this is a git worktree (uses a .git file pointing to
+  // the main repo), not a standalone repo or submodule (which have .git directories).
+  // The extensions dir is a different git repo — this check prevents accidentally
+  // committing changes there.
+  if (!worktreePath) return { ok: false, hash: "", reason: "worktree path is empty" };
+  const dotGit = join(worktreePath, ".git");
+  if (!existsSync(dotGit)) return { ok: false, hash: "", reason: ".git file missing" };
+  try {
+    const st = lstatSync(dotGit);
+    if (!st.isFile()) {
+      console.warn(`commitWorktree: refusing to commit in ${worktreePath} — .git is a directory, not a worktree marker file`);
+      return { ok: false, hash: "", reason: ".git is a directory, not a worktree marker file" };
+    }
+  } catch {
+    return { ok: false, hash: "", reason: "cannot stat .git file" };
+  }
 
   // Only commit changes in the sub-agent's worktree repo.
-  // The extensions dir is a different git repo — do NOT commit unrelated changes there.
-  if (!gitQuiet(["status", "--porcelain"], worktreePath).trim()) return "no-changes";
+  // Use git() (not gitQuiet()) so that errors from status --porcelain
+  // (e.g. corrupted repo) are not silently treated as dirty state.
+  try {
+    if (!git(["status", "--porcelain"], worktreePath).trim()) return { ok: true, hash: "" };
+  } catch (e: any) {
+    console.error(`commitWorktree: git status --porcelain failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
+    return { ok: false, hash: "", reason: `git status failed: ${(e.message || e).substring(0, 100)}` };
+  }
 
   try {
     // Use git add -A to stage all changes including new files the sub-agent may
@@ -871,12 +928,12 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
     // return a success indicator rather than undoing the commit (which would
     // create a false negative for the caller).
     try {
-      return git(["rev-parse", "--short", "HEAD"], worktreePath).trim();
+      return { ok: true, hash: git(["rev-parse", "--short", "HEAD"], worktreePath).trim() };
     } catch {
       const fullHash = gitQuiet(["rev-parse", "HEAD"], worktreePath).trim();
-      if (/^[a-f0-9]{40}$/.test(fullHash)) return fullHash.substring(0, 7);
+      if (/^[a-f0-9]{40}$/.test(fullHash)) return { ok: true, hash: fullHash.substring(0, 7) };
       console.warn(`commitWorktree: commit succeeded but rev-parse HEAD failed in ${worktreePath}; hash unknown.`);
-      return "committed-no-hash";
+      return { ok: true, hash: "committed-no-hash" };
     }
   } catch (e: any) {
     // git add or git commit failed. Reset the index to prevent dirty staging area
@@ -889,7 +946,7 @@ function commitWorktree(worktreePath: string, id: string, task: string): string 
       console.error(`commitWorktree: git reset HEAD also failed in ${worktreePath}: ${(resetErr.message || resetErr).substring(0, 200)}`);
     }
     console.error(`commitWorktree failed in ${worktreePath}: ${(e.message || e).substring(0, 200)}`);
-    return "";
+    return { ok: false, hash: "", reason: `git add/commit failed: ${(e.message || e).substring(0, 100)}` };
   }
 }
 
@@ -933,7 +990,11 @@ async function cancelSubAgent(id: string, projectRootArg: string): Promise<void>
   if (!ag) return;
   // Guard against cancelling terminal-state agents. If the agent already completed
   // with committed work, destroying the branch would cause data loss.
-  if (ag.status !== "running") return;
+  // Allow cancelling "improving" agents — handleImproveMode runs an AbortSignal-aware
+  // reviewLoop and the fixer sub-process, but doesn't store a proc reference on the
+  // agent, so we can't kill a sub-process here. The reviewLoop will detect the
+  // cancellation via its own signal path.
+  if (ag.status !== "running" && ag.status !== "improving") return;
   ag.status = "cancelled";
   // Wait for process to fully exit before cleaning up worktree to avoid
   // file handle races (e.g., rmSync on locked files after SIGKILL).
@@ -956,7 +1017,9 @@ async function cancelSubAgent(id: string, projectRootArg: string): Promise<void>
     }
     // If proc.exitCode !== null, process already existed — skip wait entirely
   }
-  cleanupWorktree(projectRootArg, id, true);
+  // If the close handler committed work (code===0 before SIGKILL landed),
+  // agent status was changed to "done" — preserve the branch to avoid data loss.
+  cleanupWorktree(projectRootArg, id, ag.status !== "done");
   subAgents.delete(id);
 }
 
@@ -1071,6 +1134,47 @@ function mergeBranch(ctxCwd: string, execId: string, options: MergeBranchOptions
 
 // ── sub-process runner ───────────────────────────────────────────────────────
 
+/**
+ * Shared timeout → escalation pattern used by both runSubProcess and spawnSubAgent.
+ *
+ * When the timeout fires:
+ * 1. Calls onTimeout() for caller-specific state updates
+ * 2. Sends SIGTERM, then after 10s grace sends SIGKILL
+ * 3. After another 10s safety net, calls onSettle() if the process hasn't exited
+ *
+ * Returns the kill timer (for clearing on natural exit) and a function to clear
+ * internal escalation timers (forceKill + safety net).
+ */
+function createProcessTimeout(
+  proc: ChildProcess,
+  timeoutMs: number,
+  onTimeout: () => void,
+  onSettle: () => void,
+): { killTimer: NodeJS.Timeout; clearEscalation: () => void } {
+  let forceKillTimer: NodeJS.Timeout | null = null;
+  let safetyTimer: NodeJS.Timeout | null = null;
+
+  const clearEscalation = () => {
+    if (forceKillTimer) { clearTimeout(forceKillTimer); forceKillTimer = null; }
+    if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+  };
+
+  const killTimer = setTimeout(() => {
+    onTimeout();
+    try { proc.kill("SIGTERM"); } catch { /* already dead */ }
+    forceKillTimer = setTimeout(() => {
+      forceKillTimer = null;
+      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+      safetyTimer = setTimeout(() => {
+        safetyTimer = null;
+        onSettle();
+      }, 10_000);
+    }, 10_000);
+  }, timeoutMs);
+
+  return { killTimer, clearEscalation };
+}
+
 /** Run pi as a sub-process directly in a given directory (no worktree). */
 function runSubProcess(task: string, cwd: string, model?: string, tools?: string, timeoutMs?: number, signal?: AbortSignal): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   const killTimeout = timeoutMs ?? 1_200_000; // default 20 min
@@ -1100,7 +1204,6 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     let resolved = false;
     let exitCode: number | null = null;
     let timedOut = false;
-    let forceKillTimer: NodeJS.Timeout | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
@@ -1111,13 +1214,15 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);
-        if (forceKillTimer) { clearTimeout(forceKillTimer); forceKillTimer = null; }
+        clearTimeoutEscalation();
         if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
         if (abortHandler && signal) {
           signal.removeEventListener("abort", abortHandler);
         }
         proc.removeListener("close", closeHandler);
         proc.removeListener("error", errorHandler);
+        proc.stdout.removeAllListeners("data");
+        proc.stderr.removeAllListeners("data");
         resolve({ stdout, stderr, exitCode });
       }
     };
@@ -1137,7 +1242,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       done();
     };
     const errorHandler = (err: Error) => {
-      stderr = `[spawn error] ${err.message}`;
+      stderr = (stderr ? stderr + "\n" : "") + `[spawn error] ${err.message}`;
       exitCode = -2;
       done();
     };
@@ -1151,14 +1256,18 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
         // instead of overwriting it with a cancellation sentinel.
         if (timedOut) {
           // timeout handler already set exitCode = -1 and stderr = timeout message.
-          // Just kill the process and let the close/fire timers resolve naturally.
+          // Just kill the process, but create a safety timer in case closeHandler
+          // never fires (zombie process).
           try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+          if (!resolved) {
+            safetyTimer = setTimeout(() => { if (!resolved) done(); }, 10_000);
+          }
           return;
         }
         if (proc.exitCode !== null) return;
         try { proc.kill("SIGKILL"); } catch { /* already dead */ }
         exitCode = -3;
-        stderr = "[cancelled by user]";
+        stderr = (stderr ? stderr + "\n" : "") + "[cancelled by user]";
         done();
       };
       signal.addEventListener("abort", abortHandler, { once: true });
@@ -1166,35 +1275,27 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     // Early abort check — after attaching listener to prevent signal firing between check and listener
     if (signal?.aborted) {
       // If the process already exited, let closeHandler handle it
-      if (proc.exitCode !== null) { done(); return; }
+      if (proc.exitCode !== null) { exitCode = proc.exitCode; done(); return; }
       try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-      stderr = "[cancelled by user]";
+      stderr = (stderr ? stderr + "\n" : "") + "[cancelled by user]";
       exitCode = -3;
       done(); // Call done() to clean up timers and listeners, not raw resolve()
       return;
     }
 
-    timer = setTimeout(() => {
-      // Use a separate timedOut flag instead of setting exitCode = -1 as a sentinel.
-      // This avoids a race where the process exits naturally with code 0 between the
-      // assignment and the close handler firing, permanently masking the real exit code.
-      timedOut = true;
-      exitCode = -1;
-      stderr = `[sub-process timeout after ${Math.round(killTimeout / 60_000)} min]`;
-      try { proc.kill("SIGTERM"); } catch { /* already dead */ }
-      // Schedule SIGKILL escalation after grace period
-      // Don't call done() here — let the close event resolve the promise naturally
-      forceKillTimer = setTimeout(() => {
-        forceKillTimer = null;
-        try { proc.kill("SIGKILL"); } catch { /* ok */ }
-        // Safety net: if close event still hasn't fired after SIGKILL, force-resolve
-        // Guard: only create safetyTimer if done() hasn't already resolved (race)
-        // to avoid an orphaned timer that would fire 10s later as a no-op.
-        if (!resolved) {
-          safetyTimer = setTimeout(() => { if (!resolved) done(); }, 10_000);
-        }
-      }, 10_000);
-    }, killTimeout);
+    const { killTimer: timer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
+      proc,
+      killTimeout,
+      () => {
+        // Use a separate timedOut flag instead of setting exitCode = -1 as a sentinel.
+        // This avoids a race where the process exits naturally with code 0 between the
+        // assignment and the close handler firing, permanently masking the real exit code.
+        timedOut = true;
+        exitCode = -1;
+        stderr = (stderr ? stderr + "\n" : "") + `[sub-process timeout after ${Math.round(killTimeout / 60_000)} min]`;
+      },
+      () => { if (!resolved) done(); }
+    );
   });
 }
 
@@ -1370,8 +1471,6 @@ function spawnSubAgent(
 
     let settled = false;
     let timedOut = false;
-    let forceKillTimer: NodeJS.Timeout | null = null;
-    let safetyTimer: NodeJS.Timeout | null = null;
     let killTimer: NodeJS.Timeout | null = null;
 
     const extSignal = options?.signal;
@@ -1381,10 +1480,11 @@ function spawnSubAgent(
       if (settled) return;
       settled = true;
       if (killTimer) clearTimeout(killTimer);
-      if (forceKillTimer) { clearTimeout(forceKillTimer); forceKillTimer = null; }
-      if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+      clearTimeoutEscalation();
       proc.removeListener("close", closeHandler);
       proc.removeListener("error", errorHandler);
+      proc.stdout.removeAllListeners("data");
+      proc.stderr.removeAllListeners("data");
       if (abortHandler && extSignal) {
         extSignal.removeEventListener("abort", abortHandler);
         abortHandler = null;
@@ -1416,25 +1516,43 @@ function spawnSubAgent(
         // may have set status to "cancelled" between process exit and this close event,
         // and without this commit the sub-agent's completed work would be silently lost.
         if (code === 0) {
-          const ch = commitWorktree(worktreePath, id, task);
-          if (ch && ch !== "no-changes") agent.commitHash = ch === "committed-no-hash" ? "(hash unknown)" : ch;
+          agent.result = stdout.trim();
+          const cr = commitWorktree(worktreePath, id, task);
+          if (!cr.ok) {
+            agent.commitFailed = true;
+            agent.error = `Sub-agent completed but git commit failed: ${cr.reason || "unknown error"}`;
+            settle(`[Sub-agent commit failed]\n${stdout.trim()}\n\nSub-agent completed but could not commit changes to git. The worktree at ${worktreePath} may contain uncommitted work.`, "error");
+            return;
+          }
+          agent.commitHash = cr.hash === "" ? "" : cr.hash === "committed-no-hash" ? "(hash unknown)" : cr.hash;
+          // Work completed successfully despite the cancellation — settle as "done"
+          // so callers correctly detect committed work on the branch.
+          settle(stdout.trim(), "done");
+          return;
         }
-        cleanupWorktree(root, id, code !== 0);
+        cleanupWorktree(root, id, true);
         settle("[Sub-agent cancelled]", "cancelled");
         return;
       }
 
       if (code === 0) {
         agent.result = stdout.trim();
+        // Guard: if the worktree was externally removed between process exit and
+        // this handler (e.g., cancelSubAgent or an external rm -rf), treat as done
+        // since the sub-agent itself completed successfully.
+        if (!existsSync(worktreePath)) {
+          settle(stdout.trim(), "done");
+          return;
+        }
         // Auto-commit changes made by the sub-agent
-        const ch = commitWorktree(worktreePath, id, task);
-        if (ch === "") {
+        const cr = commitWorktree(worktreePath, id, task);
+        if (!cr.ok) {
           agent.commitFailed = true;
-          agent.error = "Sub-agent completed but git commit failed. Check worktree for uncommitted work.";
+          agent.error = `Sub-agent completed but git commit failed: ${cr.reason || "unknown error"}`;
           settle(`[Sub-agent commit failed]\n${stdout.trim()}\n\nSub-agent completed but could not commit changes to git. The worktree at ${worktreePath} may contain uncommitted work.`, "error");
           return;
         }
-        agent.commitHash = ch === "no-changes" ? "" : ch === "committed-no-hash" ? "(hash unknown)" : ch;
+        agent.commitHash = cr.hash === "" ? "" : cr.hash === "committed-no-hash" ? "(hash unknown)" : cr.hash;
         settle(stdout.trim(), "done");
         return;
       }
@@ -1493,32 +1611,25 @@ function spawnSubAgent(
       }
     }
 
-    killTimer = setTimeout(() => {
-      if (agent.status === "running" && !settled) {
-        // Use a boolean flag to indicate timeout, not a string sentinel in agent.error.
-        // The closeHandler checks this flag to classify signal kills vs. timeouts,
-        // avoiding a fragile startsWith("timeout") check on possibly-user-generated stderr.
-        timedOut = true;
-        // Escalation: SIGTERM → 10s grace → SIGKILL
-        try { proc.kill("SIGTERM"); } catch { /* already dead */ }
-        agent.error = `timeout (${Math.round(killTimeout / 60_000)} min)`;
-        // Schedule SIGKILL escalation after grace period
-        // Don't call settle() here — let the close event resolve the promise naturally
-        forceKillTimer = setTimeout(() => {
-          forceKillTimer = null;
-          try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-          // Safety net: if close event still hasn't fired after SIGKILL, force-settle
-          // Guard: only create safetyTimer if settle() hasn't already resolved (race)
-          // to avoid an orphaned timer that would fire 10s later as a no-op.
-          if (!settled) {
-            safetyTimer = setTimeout(() => {
-              safetyTimer = null;
-              if (!settled) settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
-            }, 10_000);
-          }
-        }, 10_000);
+    const { killTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
+      proc,
+      killTimeout,
+      () => {
+        // Guard: only mark as timed out if the agent is still running and not yet settled.
+        // If the agent was cancelled or already settled, skip state mutation to avoid
+        // overwriting legitimate error messages or cancellation status.
+        if (agent.status === "running" && !settled) {
+          // Use a boolean flag to indicate timeout, not a string sentinel in agent.error.
+          // The closeHandler checks this flag to classify signal kills vs. timeouts,
+          // avoiding a fragile startsWith("timeout") check on possibly-user-generated stderr.
+          timedOut = true;
+          agent.error = `timeout (${Math.round(killTimeout / 60_000)} min)`;
+        }
+      },
+      () => {
+        if (!settled) settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
       }
-    }, killTimeout);
+    );
   });
 
   return { id, promise };
@@ -1927,7 +2038,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // Commit failure (abort-merge already handled inside mergeBranch)
-        if (result.error?.startsWith(COMMIT_FAILED_PREFIX.trimEnd())) {
+        if (result.error?.startsWith(COMMIT_FAILED_PREFIX)) {
           return {
             content: [{
               type: "text",
