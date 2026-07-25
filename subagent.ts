@@ -33,6 +33,10 @@ interface SubAgent {
   commitHash?: string;
   /** Set to true when git commit fails in the close handler (structured alternative to string matching) */
   commitFailed?: boolean;
+  /** AbortController wired into an active improve loop so cancelSubAgent can actually stop it */
+  abortController?: AbortController;
+  /** Terminal status the agent held before entering "improving" — restored on cancel/teardown */
+  prevStatus?: SubAgent["status"];
 }
 
 const subAgents = new Map<string, SubAgent>();
@@ -151,6 +155,21 @@ function getTodoBridge(): any {
   return (globalThis as any).__pi_todo;
 }
 
+/** Combine multiple AbortSignals into one: the result aborts when ANY input aborts. */
+function linkSignals(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const present = signals.filter((s): s is AbortSignal => !!s);
+  if (present.length === 0) return undefined;
+  if (present.some(s => s.aborted)) {
+    const ac = new AbortController();
+    ac.abort();
+    return ac.signal;
+  }
+  if (present.length === 1) return present[0];
+  const ac = new AbortController();
+  for (const s of present) s.addEventListener("abort", () => ac.abort(), { once: true });
+  return ac.signal;
+}
+
 // ── Unified Review Loop Engine ─────────────────────────────────────────────
 
 interface LoopResult {
@@ -178,7 +197,9 @@ async function reviewLoop(
     if (signal?.aborted) return { iterations: i, clean: false, summary: "❌ Cancelled by user during review loop." };
     // Update todo progress if bridge available
     const tb = getTodoBridge();
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 improve round ${i}/${MAX_ROUNDS}: reviewing...`);
+    // Keep the match key as a PREFIX of newContent — updateItemByContent matches
+    // via startsWith(key); dropping the prefix makes every later update a silent no-op.
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 ${todoMatchKey} — round ${i}/${MAX_ROUNDS}: reviewing...`);
 
     evictTerminalAgents();
     const reviewTask = buildReviewTask(i);
@@ -227,7 +248,7 @@ async function reviewLoop(
     iterations.push({ iter: i, issuesFound: actualIssuesCountForIter, clean: isClean });
 
     if (isClean) {
-      if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `✅ improve: clean after ${i} rounds`);
+      if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ✅ clean after ${i} rounds`);
       const summary = iterations.map(it =>
         `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
       ).join("\n");
@@ -244,7 +265,7 @@ async function reviewLoop(
       }
       return { iterations: i, clean: false, summary: `❌ Fixer threw at round ${i}: ${(e.message || e).substring(0, 200)}` };
     }
-    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔧 improve round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
+    if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "in_progress", `🔍 ${todoMatchKey} — 🔧 round ${i}/${MAX_ROUNDS}: fixed ${actualIssuesCount} ${actualIssuesCount === 1 ? 'issue' : 'issues'}`);
     // Check for cancellation BEFORE empty-output check — a cancelled fixer that is killed
     // before any output is buffered could produce truly empty output rather than the
     // "[cancelled by user]" sentinel. We must detect cancellation first to avoid
@@ -268,19 +289,17 @@ async function reviewLoop(
         // were needed (e.g., false positive review). Continue the loop.
       } else if (!cr.ok) {
         console.error(`reviewLoop: commitWorktree failed at iteration ${i} in ${workCwd}: ${cr.reason}`);
-        // Reset the worktree to prevent residual uncommitted changes from leaking
-        // into the next iteration. The fixer's changes remain uncommitted; if the
-        // caller retries the improve loop, a clean review round would start fresh.
-        try { gitQuiet(["checkout", "--", "."], workCwd); } catch { /* best effort */ }
-        try { gitQuiet(["clean", "-fd"], workCwd); } catch { /* best effort */ }
-        return { iterations: i, clean: false, summary: `❌ Fix applied but git commit failed at round ${i}. Aborting to avoid stale state.` };
+        // Do NOT hard-reset the worktree here (`checkout -- .` / `clean -fd`): that
+        // would destroy the fixer's uncommitted work. commitWorktree already reset
+        // the index, so the changes stay in the working tree for manual inspection.
+        return { iterations: i, clean: false, summary: `❌ Fix applied but git commit failed at round ${i} (${cr.reason || "unknown error"}). Aborting; uncommitted changes preserved in ${workCwd}.` };
       }
     }
   }
 
   // Finalize todo item when MAX_ROUNDS reached (non-clean exit)
   const tb = getTodoBridge();
-  if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
+  if (tb && todoMatchKey) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ⚠ MAX_ROUNDS (${MAX_ROUNDS}): unresolved issues remain`);
 
   const summary = iterations.map(it =>
     `Round ${it.iter}: ${it.issuesFound} ${it.issuesFound === 1 ? 'issue' : 'issues'} → ${it.clean ? "CLEAN" : "FIXED"}`
@@ -335,7 +354,8 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
       }
       const r = await runSubProcess(
         `Improve this analysis based on feedback. Produce a complete final analysis. DO NOT modify files.\n\n` +
-        `Feedback: ${reviewerOutput.substring(0, 4000)}`,
+        `--- CURRENT ANALYSIS ---\n${analysis.substring(0, 20000)}\n--- END ANALYSIS ---\n\n` +
+        `--- REVIEW FEEDBACK ---\n${reviewerOutput.substring(0, 4000)}\n--- END FEEDBACK ---`,
         ctxCwd,
         model ?? _defaultModel,
         "read,bash,serena_search_pattern,serena_overview",
@@ -369,6 +389,13 @@ async function handleAnalyzeMode(task: string, ctxCwd: string, signal?: AbortSig
     todoMatchKey,
     model
   );
+  // Surface the final analysis in the result — previously only the round summary
+  // was returned, so the analysis itself (the entire point of analyze mode) was
+  // silently discarded.
+  const finalAnalysis = analysis.trim();
+  if (finalAnalysis) {
+    return { ...result, summary: `${result.summary}\n\n--- FINAL ANALYSIS ---\n${finalAnalysis.substring(0, 24000)}` };
+  }
   return result;
 }
 
@@ -445,8 +472,16 @@ async function handleImproveMode(
   // delete the worktree out from under the active review loop.
   const originalStatus = existing?.status;
   if (existing && originalStatus && ["done", "error", "merged", "rejected", "cancelled"].includes(originalStatus)) {
+    existing.prevStatus = originalStatus;
     existing.status = "improving";
   }
+
+  // Wire an AbortController into the review loop so cancelSubAgent can actually
+  // stop an in-flight improve loop (previously no signal was wired, so the loop
+  // kept running to completion despite cancellation).
+  const improveAbort = new AbortController();
+  if (existing) existing.abortController = improveAbort;
+  const loopSignal = linkSignals(signal, improveAbort.signal);
 
   let _loopResult: LoopResult = { iterations: 0, clean: false, summary: "Unreachable" };
   try {
@@ -466,7 +501,7 @@ async function handleImproveMode(
       },
       async (issuesCount, reviewerOutput, _i) => {
         // Check for cancellation before running the fixer to avoid wasted work
-        if (signal?.aborted) {
+        if (loopSignal?.aborted) {
           return "[cancelled by user]";
         }
         // Fixer runs directly in the target worktree (no merge needed)
@@ -474,10 +509,10 @@ async function handleImproveMode(
         // commitPrefix is non-empty (i.e., when working in a sub-agent worktree).
         // For direct codebase improvement (no targetAgentId), changes are not auto-committed.
         const fixerTask = `Fix ${issuesCount} ${issuesCount === 1 ? 'issue' : 'issues'}:\n\n${reviewerOutput.substring(0, 4000)}\n\nMake concrete edits to the files.`;
-        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, signal);
+        const r = await runSubProcess(fixerTask, workCwd, model ?? _defaultModel, "read,edit,write,bash,serena_search_pattern,serena_overview", undefined, loopSignal);
         const output = r.stdout + (r.stderr ? "\n[stderr]\n" + r.stderr : "");
         // Check if the fixer was cancelled/aborted mid-execution before trusting its output
-        if (signal?.aborted || r.exitCode === -3) {
+        if (loopSignal?.aborted || r.exitCode === -3) {
           return "[cancelled by user]";
         }
         // Check for timeout before generic non-zero handling — gives clearer diagnostics
@@ -495,20 +530,23 @@ async function handleImproveMode(
         return output;
       },
       targetAgentId ? `improve-${safeId(targetAgentId) || "unknown"}` : "",
-      signal,
+      loopSignal,
       todoMatchKey,
       model
     );
   } catch (e: any) {
     return { iterations: 0, clean: false, summary: `Unexpected error in review loop: ${(e.message || e).substring(0, 200)}` };
   } finally {
+    // Detach the improve-loop abort controller — cancellation is no longer meaningful.
+    if (existing && existing.abortController === improveAbort) existing.abortController = undefined;
     // Restore original status after loop completes so evictTerminalAgents
     // can resume normal eviction for this agent.
     // Only restore status if it hasn't been externally changed (e.g., by
-    // cancelSubAgent setting it to "cancelled"). Silently undoing a cancellation
-    // would allow evictTerminalAgents to delete a branch with committed work.
+    // cancelSubAgent restoring the pre-improve status). Silently undoing a
+    // cancellation would allow evictTerminalAgents to delete a branch with committed work.
     if (existing && originalStatus && existing.status === "improving") {
       existing.status = originalStatus;
+      existing.prevStatus = undefined;
       // Only update endTime if the agent hadn't already reached a terminal state
       // (and thus had an endTime set). Preserving the original endTime prevents
       // artificially extending the agent's lifetime in the eviction map.
@@ -549,7 +587,8 @@ function autoMergeBranch(
  * After each item, the sub-agent's branch is auto-merged (on success) or rejected (on failure).
  */
 async function handleExecuteMode(
-  items: { description: string }[], ctxCwd: string, signal?: AbortSignal
+  items: { description: string }[], ctxCwd: string, signal?: AbortSignal,
+  execOptions?: { model?: string; timeoutMs?: number; tools?: string[]; systemPrompt?: string }
 ): Promise<{ results: string[]; allClean: boolean }> {
   const results: string[] = [];
   let allClean = true;
@@ -562,11 +601,29 @@ async function handleExecuteMode(
     const { id: execId, promise: execPromise } = spawnSubAgent(
       `Execute: ${item.description || "(unnamed task)"}. Make changes as needed.`,
       ctxCwd,
-      signal ? { signal } : undefined
+      {
+        signal,
+        model: execOptions?.model,
+        timeoutMs: execOptions?.timeoutMs,
+        tools: execOptions?.tools,
+        systemPrompt: execOptions?.systemPrompt,
+      }
     );
     try {
       const execResult = await execPromise;
       const ag = subAgents.get(execId);
+      // spawnSubAgent's early-error returns (depth limit, empty task, git-init or
+      // worktree failure) resolve with an error sentinel but NEVER insert the agent
+      // into subAgents. Detect that here — before the evicted-recovery branch —
+      // so denials are reported as failures, not "already merged (evicted)".
+      if (!ag && /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(execResult)) {
+        results.push(`${i + 1}. ${item.description}: ✗ error (${execResult.substring(0, 100)})`);
+        allClean = false;
+        // Early denials may have no worktree/branch — cleanupWorktree is a safe no-op then.
+        cleanupWorktree(root, execId, true);
+        subAgents.delete(execId);
+        continue;
+      }
       if (ag) {
         if (ag.status === "error" || ag.status === "cancelled" || /^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(execResult)) {
           results.push(`${i + 1}. ${item.description}: ✗ error (${(ag.error || execResult.substring(0, 100))})`);
@@ -587,7 +644,12 @@ async function handleExecuteMode(
           const desc = typeof item.description === "string" ? item.description : String(item.description ?? "");
           const executeHash = createHash("sha256").update(desc).digest("hex").substring(0, 8);
           const todoMatchKey = `execute:${executeHash}:${desc.substring(0, 50)}`;
-          const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey);
+          // Create the todo item that reviewLoop's progress updates target — without
+          // this, every updateItemByContent call inside the loop silently no-ops.
+          const tb = getTodoBridge();
+          if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
+          const ir = await handleImproveMode(execId, ctxCwd, undefined, undefined, signal, todoMatchKey, execOptions?.model);
+          if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ${ir.clean ? "✅ clean" : "⚠ issues remain"} (${ir.iterations}r)`);
           results.push(`${i + 1}. ${item.description}: ${ir.clean ? "✅" : "⚠"} (${ir.iterations}r)`);
           if (!ir.clean) allClean = false;
           // Only auto-merge clean improvements — failed loops leave the branch for manual review
@@ -623,6 +685,8 @@ async function handleExecuteMode(
         }
         if (branchExists && hasUnmergedCommits) {
           results.push(`${i + 1}. ${item.description}: ⚠ evicted but had committed work (branch preserved)`);
+          // Committed work was never merged — the pipeline did not deliver this item.
+          allClean = false;
         } else if (branchExists) {
           // Branch exists but has no unmerged commits — agent either completed
           // with no changes ("no-changes" from commitWorktree) or was already
@@ -990,11 +1054,29 @@ async function cancelSubAgent(id: string, projectRootArg: string): Promise<void>
   if (!ag) return;
   // Guard against cancelling terminal-state agents. If the agent already completed
   // with committed work, destroying the branch would cause data loss.
-  // Allow cancelling "improving" agents — handleImproveMode runs an AbortSignal-aware
-  // reviewLoop and the fixer sub-process, but doesn't store a proc reference on the
-  // agent, so we can't kill a sub-process here. The reviewLoop will detect the
-  // cancellation via its own signal path.
   if (ag.status !== "running" && ag.status !== "improving") return;
+
+  // Committed work on the branch must survive cancellation regardless of status.
+  const hasCommittedWork = !!ag.commitHash && ag.commitHash !== "no-changes";
+
+  if (ag.status === "improving") {
+    // An improve loop is actively working in this agent's worktree, and
+    // handleImproveMode still holds a reference to this record. Deleting the
+    // worktree/map entry here would be use-after-delete (the loop keeps spawning
+    // fixer sub-processes in the removed directory), and deleting the branch
+    // would destroy the agent's previously committed work — its pre-improve
+    // terminal status (e.g. "done") is hidden behind "improving".
+    // Instead: abort the loop's signal (wired up in handleImproveMode) so the
+    // loop stops at the next round boundary, and restore the pre-improve status
+    // so eviction/branch-preservation logic sees the true terminal state.
+    // Teardown/eviction handles worktree cleanup afterwards.
+    try { ag.abortController?.abort(); } catch { /* ok */ }
+    ag.status = ag.prevStatus ?? (hasCommittedWork ? "done" : "cancelled");
+    ag.prevStatus = undefined;
+    ag.endTime = Date.now();
+    return;
+  }
+
   ag.status = "cancelled";
   // Wait for process to fully exit before cleaning up worktree to avoid
   // file handle races (e.g., rmSync on locked files after SIGKILL).
@@ -1019,7 +1101,7 @@ async function cancelSubAgent(id: string, projectRootArg: string): Promise<void>
   }
   // If the close handler committed work (code===0 before SIGKILL landed),
   // agent status was changed to "done" — preserve the branch to avoid data loss.
-  cleanupWorktree(projectRootArg, id, ag.status !== "done");
+  cleanupWorktree(projectRootArg, id, ag.status !== "done" && !hasCommittedWork);
   subAgents.delete(id);
 }
 
@@ -1249,6 +1331,29 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
     proc.on("close", closeHandler);
     proc.on("error", errorHandler);
 
+    // Create the kill timeout BEFORE the early-abort check below. done() calls
+    // clearTimeoutEscalation, so the timeout must be initialized before any code
+    // path can invoke done() — previously a pre-aborted signal hit the temporal
+    // dead zone and threw a ReferenceError inside the Promise executor, rejecting
+    // a promise that callers (reviewLoop/analyze) rely on always resolving.
+    const { killTimer: procKillTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
+      proc,
+      killTimeout,
+      () => {
+        // Use a separate timedOut flag instead of setting exitCode = -1 as a sentinel.
+        // This avoids a race where the process exits naturally with code 0 between the
+        // assignment and the close handler firing, permanently masking the real exit code.
+        timedOut = true;
+        exitCode = -1;
+        stderr = (stderr ? stderr + "\n" : "") + `[sub-process timeout after ${Math.round(killTimeout / 60_000)} min]`;
+      },
+      () => { if (!resolved) done(); }
+    );
+    // Track the real kill timer so done() clears it on normal exit — previously
+    // `timer` was never assigned, leaving a 20-minute timer pending (retaining the
+    // proc handle and stdout/stderr buffers) for every completed sub-process.
+    timer = procKillTimer;
+
     // Wire up AbortSignal for mid-flight cancellation BEFORE early check to prevent race
     if (signal) {
       abortHandler = () => {
@@ -1282,20 +1387,6 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
       done(); // Call done() to clean up timers and listeners, not raw resolve()
       return;
     }
-
-    const { killTimer: procKillTimer, clearEscalation: clearTimeoutEscalation } = createProcessTimeout(
-      proc,
-      killTimeout,
-      () => {
-        // Use a separate timedOut flag instead of setting exitCode = -1 as a sentinel.
-        // This avoids a race where the process exits naturally with code 0 between the
-        // assignment and the close handler firing, permanently masking the real exit code.
-        timedOut = true;
-        exitCode = -1;
-        stderr = (stderr ? stderr + "\n" : "") + `[sub-process timeout after ${Math.round(killTimeout / 60_000)} min]`;
-      },
-      () => { if (!resolved) done(); }
-    );
   });
 }
 
@@ -1499,7 +1590,8 @@ function spawnSubAgent(
     // Kill process after timeout (min 20 min, configurable via options).
     // Declared before closeHandler so the function can reference it without
     // a temporal-dead-zone dependency.
-    const killTimeout = options?.timeoutMs ?? 1_200_000;
+    // Enforce the documented 20-minute floor even when callers pass a smaller value.
+    const killTimeout = Math.max(options?.timeoutMs ?? 1_200_000, 1_200_000);
 
     const closeHandler = (code: number | null) => {
       if (settled) return;
@@ -1630,6 +1722,10 @@ function spawnSubAgent(
         if (!settled) settle(`[Sub-agent timeout after ${Math.round(killTimeout / 60_000)} min]\n\nPartial:\n${stdout.trim().substring(0, 2000)}`, "error");
       }
     );
+    // Track the real kill timer so settle() clears it on natural exit — previously
+    // `killTimer` was never assigned, so every completed agent left a 20-minute
+    // timer pending (firing SIGTERM/SIGKILL at a dead process before self-cleaning).
+    killTimer = agentKillTimer;
   });
 
   return { id, promise };
@@ -1668,7 +1764,7 @@ export default function (pi: ExtensionAPI) {
           if (!rest) { ctx.ui.notify("Usage: /subagent cancel <id>", "warning"); return; }
           if (!subAgents.has(rest)) { ctx.ui.notify(`No sub-agent: ${rest}`, "error"); return; }
           await cancelSubAgent(rest, projectRoot(ctx.cwd));
-          ctx.ui.notify(`Sub-agent ${rest} cancelled and cleaned up.`, "info");
+          ctx.ui.notify(`Sub-agent ${rest} cancelled.`, "info");
           return;
         }
         case "status": {
@@ -1743,7 +1839,9 @@ export default function (pi: ExtensionAPI) {
         const todoMatchKey = `analyze:${taskHash}:${params.task.substring(0, 50)}`;
         if (tb) tb.addItem(`🔍 ${todoMatchKey}`);
         const result = await handleAnalyzeMode(params.task, ctx.cwd, _signal, todoMatchKey, params.model);
-        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
+        // Keep the match key as a prefix of the new content — updateItemByContent
+        // matches via startsWith(key), so the final update would otherwise no-op.
+        if (tb) tb.updateItemByContent(`🔍 ${todoMatchKey}`, "completed", `🔍 ${todoMatchKey} — ${result.clean ? "✅" : "⚠"} analyze: ${result.clean ? "clean" : result.iterations + " rounds"}`);
         return { content: [{ type: "text", text: result.summary }], details: { mode: "analyze", ...result } };
       }
 
@@ -1828,7 +1926,12 @@ export default function (pi: ExtensionAPI) {
         if (!items.every((x: any) => typeof x?.description === "string")) {
           return { content: [{ type: "text", text: "Each todo item must have a string description." }], details: {}, isError: true };
         }
-        const result = await handleExecuteMode(items, ctx.cwd, _signal);
+        const result = await handleExecuteMode(items, ctx.cwd, _signal, {
+          model: params.model,
+          timeoutMs: params.timeoutMs,
+          tools: params.tools ? params.tools.split(",").map((t: string) => t.trim()).filter(Boolean) : undefined,
+          systemPrompt: params.systemPrompt,
+        });
         const summary = [
           `┌─ Execute Complete ──────────────────────`,
           ...result.results.map(r => `│ ${r}`),
@@ -2202,7 +2305,9 @@ export default function (pi: ExtensionAPI) {
               task,
               id,
               result,
-              status: ag?.status || "done",
+              // Derive status from the result sentinel when the agent is absent from
+              // the map (early denials/errors never insert it) — don't default to "done".
+              status: ag?.status ?? (/^\[Sub-agent (?:error|spawn error|denied|timeout|commit failed|killed by signal)[^\]]*\]/.test(result) ? "error" : "done"),
               elapsed: ((ag?.endTime || Date.now()) - (ag?.startTime || Date.now())) / 1000,
               commitHash: ag?.commitHash,
             };
@@ -2302,7 +2407,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Sub-agent ${params.id} not found.` }], details: {}, isError: true };
       }
       await cancelSubAgent(params.id, projectRoot(ctx.cwd));
-      return { content: [{ type: "text", text: `Sub-agent ${params.id} cancelled. Worktree and branch removed.` }], details: {} };
+      return { content: [{ type: "text", text: `Sub-agent ${params.id} cancelled.` }], details: {} };
     },
   });
 
