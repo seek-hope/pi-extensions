@@ -495,7 +495,7 @@ function renderWidget(ctx?: any): void {
   for (let i = 0; i < active.length; i++) {
     const item = active[i];
     const icon = STATUS_ICONS[item.status] || "○";
-    const safe = truncate(item.content, 50);
+    const safe = item.content;
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
     lines.push(`${bold}${icon}${reset} ${bold}${safe}${reset}`);
@@ -785,7 +785,7 @@ export default function (pi: ExtensionAPI) {
     // item to be dropped — replace that unprotected twin so bridge ownership
     // (and protection from auto-clean) survives.
     for (const item of programmaticItems) {
-      const sameIdIdx = todo.items.findIndex(i => i.id === item.id);
+      let sameIdIdx = todo.items.findIndex(i => i.id === item.id);
       if (sameIdIdx !== -1) {
         // A restored item fabricated the same id — the restored snapshot is stale.
         // Keep the live programmatic item so bridge-side status/content changes
