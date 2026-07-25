@@ -1206,7 +1206,7 @@ function runSubProcess(task: string, cwd: string, model?: string, tools?: string
 
 const MAX_DEPTH = 5;
 const MAX_ROUNDS = 20;
-const MAX_LOOP_DURATION_MS = 180_000; // 3-minute absolute deadline for the entire review loop
+const MAX_LOOP_DURATION_MS = 3_600_000; // 60 min total for the entire review loop
 
 function currentDepth(): number {
   const d = parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10);
