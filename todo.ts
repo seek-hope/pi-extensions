@@ -39,6 +39,8 @@ let _ui: any = null;
 /** Warn-once latch: a missing UI surface is logged once per gap, not on every render. */
 let _uiDropWarned = false;
 let todo: TodoList = { items: [] };
+// Progress items survive session_tree restores (stored separately, not in todo.items)
+const _progressItems = new Map<string, { status: string; content: string }>();
 let detailWidgetActive = false;
 let _autoClearTimer: ReturnType<typeof setTimeout> | null = null;
 let _itemIdCounter = 0;
@@ -136,7 +138,10 @@ function resolveUi(ctx?: any): any {
 }
 
 // ── global bridge: allow other extensions (e.g. subagent) to push/update items ──
+// Also provides a progress store immune to session_tree restores
 (globalThis as any).__pi_todo = {
+  // ── regular todo items ──
+  addItem(content: string, status: TodoStatus = "pending"): string | null {
   addItem(content: string, status: TodoStatus = "pending"): string | null {
     const trimmed = String(content ?? "").trim();
     if (!trimmed) { console.warn("todo-bridge: addItem — content cannot be empty"); return null; }
@@ -187,7 +192,13 @@ function resolveUi(ctx?: any): any {
     if (idx !== -1) {
       return applyBridgeUpdate(idx, valid, newContent, `updateItemByContent("${truncated}")`);
     }
-    // not found (expected during session_tree restore) for content "${truncated}"`);
+    // TEMP DEBUG: log full state to diagnose missing items
+    console.error(`[todo] updateItemByContent MISS — key.len=${truncated.length} items=${todo.items.length}`);
+    for (const it of todo.items) {
+      const matchExact = it.content === truncated;
+      const matchPrefix = it.content.startsWith(truncated);
+      console.error(`[todo]   id=${it.id} exact=${matchExact} prefix=${matchPrefix} cnt="${it.content.substring(0, 50)}" st=${it.status}`);
+    }
     return false;
   },
   removeItemByContent(content: string): boolean {
@@ -263,6 +274,16 @@ function resolveUi(ctx?: any): any {
   // (e.g. one-in-progress). Items are flat ({id, content, status}) so a shallow copy
   // suffices — switch to a deep copy if a nested field is ever added.
   getItems() { return todo.items.map(i => ({ ...i })); },
+
+  // ── progress items: survive session_tree restores ──
+  setProgress(key: string, status: string, text: string) {
+    _progressItems.set(key, { status, content: text });
+    renderWidget();
+  },
+  clearProgress(key: string) {
+    _progressItems.delete(key);
+    renderWidget();
+  },
 };
 
 /** Narrow a string to a valid TodoStatus after user input or session restore. */
