@@ -54,6 +54,9 @@ const _bridgeMutations = new Map<string, { content: string; status: TodoStatus }
 /** Ids of model-owned items removed via the bridge since the last todo_write — filtered out of the restored snapshot on session_tree so they are not resurrected. */
 const _bridgeRemovedIds = new Set<string>();
 
+/** Id of the item most recently set to in_progress by the bridge (updateItemById/updateItemByContent/addItem). Used as preferredIdx in session_tree's enforceOneInProgress so the bridge's choice survives restores. Cleared on todo_write and session_start. */
+let _bridgeInProgressId: string | null = null;
+
 /** Contents of done items already auto-cleaned + notified — dedups the session_tree done-notification (restore re-surfaces the same done items on every tree event). Entries are removed when an item re-opens so a later completion notifies again. */
 const _autoCleanedContents = new Set<string>();
 
@@ -78,6 +81,42 @@ function syncBridgeMutations(): void {
   }
 }
 
+/** Shared update logic for bridge mutations — used by both updateItemByContent and updateItemById to avoid duplicated code drifting apart. */
+function applyBridgeUpdate(idx: number, newStatus: TodoStatus, newContent: string | undefined, callerLabel: string): boolean {
+  if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+  const item = todo.items[idx];
+  const oldContent = item.content;
+  item.status = newStatus;
+  if (newContent !== undefined) {
+    const nc = sanitizeContent(newContent.trim());
+    if (nc) {
+      const renamed = truncate(nc, 200);
+      if (todo.items.some((it, j) => j !== idx && it.content === renamed)) {
+        console.warn(`todo-bridge: ${callerLabel} — newContent "${renamed}" duplicates an existing item; content unchanged`);
+      } else {
+        item.content = renamed;
+        if (renamed !== oldContent) {
+          _autoCleanedContents.delete(oldContent);
+        }
+      }
+    } else {
+      console.warn(`todo-bridge: ${callerLabel} — newContent sanitized to empty; content unchanged`);
+    }
+  }
+  if (newStatus === "pending" || newStatus === "in_progress") {
+    // Re-opened — allow a future completion of this content to notify again.
+    _autoCleanedContents.delete(oldContent);
+    _autoCleanedContents.delete(item.content);
+  }
+  if (newStatus === "in_progress") { enforceOneInProgress(idx); _bridgeInProgressId = item.id ?? null; }
+  recordBridgeMutation(item);
+  syncBridgeMutations(); // enforceOneInProgress may have demoted another tracked item
+  renderWidget();
+  checkAndAutoClear();
+  clearDetailWidget();
+  return true;
+}
+
 /** Resolve the UI surface: prefer an explicit ctx, and cache it so ctx-less bridge calls can still reach the UI. */
 function resolveUi(ctx?: any): any {
   if (ctx?.ui) {
@@ -100,9 +139,9 @@ function resolveUi(ctx?: any): any {
 (globalThis as any).__pi_todo = {
   addItem(content: string, status: TodoStatus = "pending"): string | null {
     const trimmed = String(content ?? "").trim();
-    if (!trimmed) throw new Error("Todo item content cannot be empty");
+    if (!trimmed) { console.warn("todo-bridge: addItem — content cannot be empty"); return null; }
     const sanitized = sanitizeContent(trimmed);
-    if (!sanitized) throw new Error("Todo item content is empty after sanitization");
+    if (!sanitized) { console.warn("todo-bridge: addItem — content empty after sanitization"); return null; }
     const truncated = truncate(sanitized, 200);
     const s = String(status).trim().toLowerCase();
     if (!isValidTodoStatus(s)) {
@@ -121,7 +160,7 @@ function resolveUi(ctx?: any): any {
     const id = String(++_itemIdCounter);
     todo.items.push({ id, content: truncated, status: validStatus });
     _programmaticIds.add(id);
-    if (validStatus === "in_progress") enforceOneInProgress(todo.items.length - 1);
+    if (validStatus === "in_progress") { enforceOneInProgress(todo.items.length - 1); _bridgeInProgressId = id; }
     syncBridgeMutations(); // the new in_progress item may have demoted a tracked one
     renderWidget();
     checkAndAutoClear();
@@ -148,38 +187,7 @@ function resolveUi(ctx?: any): any {
       if (prefixMatches.length === 1) idx = todo.items.indexOf(prefixMatches[0]);
     }
     if (idx !== -1) {
-      if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-      const item = todo.items[idx];
-      const oldContent = item.content;
-      item.status = valid;
-      if (newContent !== undefined) {
-        const nc = sanitizeContent(String(newContent ?? "").trim());
-        if (nc) {
-          const renamed = truncate(nc, 200);
-          if (todo.items.some((it, j) => j !== idx && it.content === renamed)) {
-            console.warn(`todo-bridge: updateItemByContent — newContent "${renamed}" duplicates an existing item; content unchanged`);
-          } else {
-            item.content = renamed;
-          }
-        } else {
-          console.warn(`todo-bridge: updateItemByContent — newContent for "${truncated}" sanitized to empty; content unchanged`);
-        }
-      }
-      if (valid === "pending" || valid === "in_progress") {
-        // Re-opened — allow a future completion of this content to notify again.
-        // Delete the pre-rename content (not the lookup key: with a prefix match
-        // + rename, neither the key nor the post-rename content equals it) plus
-        // the current content, so no stale entry leaks (mirrors updateItemById).
-        _autoCleanedContents.delete(oldContent);
-        _autoCleanedContents.delete(item.content);
-      }
-      if (valid === "in_progress") enforceOneInProgress(idx);
-      recordBridgeMutation(item);
-      syncBridgeMutations(); // enforceOneInProgress may have demoted another tracked item
-      renderWidget();
-      checkAndAutoClear();
-      clearDetailWidget();
-      return true;
+      return applyBridgeUpdate(idx, valid, newContent, `updateItemByContent("${truncated}")`);
     }
     console.debug(`todo-bridge: updateItemByContent — no item found for content "${truncated}"`);
     return false;
@@ -194,6 +202,7 @@ function resolveUi(ctx?: any): any {
     if (idx !== -1) {
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
       const [removed] = todo.items.splice(idx, 1);
+      _autoCleanedContents.delete(removed.content);
       if (removed?.id !== undefined) {
         const wasProgrammatic = _programmaticIds.has(removed.id);
         _programmaticIds.delete(removed.id);
@@ -223,37 +232,7 @@ function resolveUi(ctx?: any): any {
     const key = String(id);
     const idx = todo.items.findIndex(item => item.id === key);
     if (idx !== -1) {
-      if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-      const item = todo.items[idx];
-      const oldContent = item.content;
-      item.status = valid;
-      if (newContent !== undefined) {
-        const nc = sanitizeContent(String(newContent ?? "").trim());
-        if (nc) {
-          const renamed = truncate(nc, 200);
-          if (todo.items.some((it, j) => j !== idx && it.content === renamed)) {
-            console.warn(`todo-bridge: updateItemById — newContent "${renamed}" duplicates an existing item; content unchanged`);
-          } else {
-            item.content = renamed;
-          }
-        } else {
-          console.warn(`todo-bridge: updateItemById — newContent for item "${key}" sanitized to empty; content unchanged`);
-        }
-      }
-      if (valid === "pending" || valid === "in_progress") {
-        // Re-opened — allow a future completion of this content to notify again.
-        // Delete both the pre-rename and current content so no stale entry leaks
-        // (updateItemByContent does the same for its lookup + renamed content).
-        _autoCleanedContents.delete(oldContent);
-        _autoCleanedContents.delete(item.content);
-      }
-      if (valid === "in_progress") enforceOneInProgress(idx);
-      recordBridgeMutation(item);
-      syncBridgeMutations(); // enforceOneInProgress may have demoted another tracked item
-      renderWidget();
-      checkAndAutoClear();
-      clearDetailWidget();
-      return true;
+      return applyBridgeUpdate(idx, valid, newContent, `updateItemById("${key}")`);
     }
     console.debug(`todo-bridge: updateItemById — no item found for id "${String(id)}"`);
     return false;
@@ -265,6 +244,7 @@ function resolveUi(ctx?: any): any {
     if (idx !== -1) {
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
       const [removed] = todo.items.splice(idx, 1);
+      _autoCleanedContents.delete(removed.content);
       const wasProgrammatic = removed?.id !== undefined && _programmaticIds.has(removed.id);
       _programmaticIds.delete(key);
       // Model-owned removal — remember it so session_tree restore (which re-reads
@@ -312,17 +292,19 @@ function sanitizeContent(raw: string): string {
     .replace(/\x1b\[[0-9;?>=<:]*[\x20-\x2F]*[@-~]/g, "")   // CSI sequences (include ? > = < : params, intermediate bytes)
     .replace(/\x1b\].*?(?:\x07|\x1b\\)/g, "")   // OSC sequences (with BEL or ST terminator)
     .replace(/\x1b\][^\x1b]*/g, "")               // Unterminated OSC (truncated input — no ST/BEL)
-    .replace(/\x1b[PX^_].*?\x1b\\/g, "")        // DCS, SOS, PM, APC (with ST terminator)
+    .replace(/\x1b[PX^_].*?(?:\x07|\x1b\\)/g, "")        // DCS, SOS, PM, APC (with ST or BEL terminator)
     .replace(/\x1b[PX^_][^\x1b]*/g, "")         // Unterminated DCS/SOS/PM/APC (no ST terminator — truncated input edge case)
     .replace(/\x1b[\x20-\x2F]*[\x30-\x7E]/g, "") // Remaining ESC sequences (single-byte like ESC c, ESC 7, etc.)
     .replace(/[\x00-\x08\x0B-\x1F\x7F\x80-\x9F]/g, "") // remaining C0 + C1 controls (bare ESC, CR, CSI, etc.)
     .replace(/\t/g, " ")
     .replace(/\n/g, " ")
-    .replace(/[\p{Cf}\p{Cs}]/gu, "");        // Unicode format chars + surrogates
+    .replace(/\u2028|\u2029/g, " ")           // Unicode line/paragraph separators → space (like \n)
+    .replace(/(\u200C|\u200D)|[\p{Cf}\p{Cs}]/gu, (m, keep) => keep || "");  // strip format chars & surrogates, preserve ZWJ/ZWNJ
 }
 
 /** Truncate a string to maxLen code points (surrogate-safe). */
 function truncate(str: string, maxLen: number): string {
+  if (maxLen <= 0) return '…';
   const chars = Array.from(str);
   if (chars.length <= maxLen) return str;
   return chars.slice(0, maxLen - 1).join('') + '…';
@@ -340,8 +322,13 @@ function enforceOneInProgress(preferredIdx?: number): void {
     }
   }
   if (inProgressIndices.length > 1) {
-    // Keep the preferred index (most recently updated), falling back to the last one (most recently added)
-    const keepIdx = preferredIdx !== undefined ? preferredIdx : inProgressIndices[inProgressIndices.length - 1];
+    // Keep the preferred index (most recently updated), falling back to the last one (most recently added).
+    // Validate preferredIdx: it must be in bounds and the item must actually be in_progress,
+    // otherwise a caller passing a stale index would silently demote ALL in_progress items to pending.
+    let keepIdx = inProgressIndices[inProgressIndices.length - 1];
+    if (preferredIdx !== undefined && preferredIdx >= 0 && preferredIdx < todo.items.length && todo.items[preferredIdx].status === "in_progress") {
+      keepIdx = preferredIdx;
+    }
     for (const idx of inProgressIndices) {
       if (idx !== keepIdx) {
         todo.items[idx].status = "pending";
@@ -357,6 +344,7 @@ function checkAndAutoClear(ctx?: any): void {
   if (!allDone) {
     // New activity — reset the notification dedup so the next all-done state notifies
     _lastAutoClearNotifyKey = null;
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     return;
   }
   // Dedup: repeated calls while the same all-done list stands (e.g. bridge status
@@ -446,7 +434,7 @@ function restoreFromBranch(ctx?: any): void {
         // hit the wrong twin.
         for (const item of details.items) {
           if (item && typeof item === 'object' && item.id) {
-            _itemIdCounter = Math.max(_itemIdCounter, Number(String(item.id)) || 0);
+            const n = Number(String(item.id)); _itemIdCounter = Math.max(_itemIdCounter, isNaN(n) ? 0 : n);
           }
         }
         // Validate each item individually to skip corrupted entries
@@ -462,7 +450,16 @@ function restoreFromBranch(ctx?: any): void {
             status: normalizeStatus(item.status),
           });
         }
-        todo = { items: safe };
+        // Deduplicate by content to guard against corrupted persisted snapshots
+        const deduped: TodoItem[] = [];
+        const dedupSeen = new Set<string>();
+        for (const item of safe) {
+          if (!dedupSeen.has(item.content)) {
+            dedupSeen.add(item.content);
+            deduped.push(item);
+          }
+        }
+        todo = { items: deduped };
         break;
       }
     }
@@ -564,6 +561,7 @@ export default function (pi: ExtensionAPI) {
       const slice = params.items.slice(0, 100);
 
       let items: TodoItem[] = slice.map((item: { content: string; status?: string }, i: number) => {
+        if (!item || typeof item !== 'object') throw new Error(`Todo item ${i + 1} is not an object`);
         const content = (item.content || "").trim();
         // Sanitize BEFORE empty check and truncation to avoid splitting ANSI escape
         // sequences mid-sequence and to catch content that is only escape codes.
@@ -583,6 +581,20 @@ export default function (pi: ExtensionAPI) {
         return { id: String(++_itemIdCounter), content: truncate(sanitized, 200), status };
       });
 
+      // Remove duplicate items, keeping only the first occurrence of each unique content.
+      // This is consistent with the bridge addItem which also rejects duplicates.
+      // Dedup first so that enforce-one-in-progress below operates on a clean list.
+      const seen = new Set<string>();
+      items = items.filter(item => {
+        if (seen.has(item.content)) {
+          const preview = truncate(item.content, 40);
+          warnings.push(`Duplicate item: "${preview}" — keeping only first occurrence.`);
+          return false;
+        }
+        seen.add(item.content);
+        return true;
+      });
+
       // Enforce: only one in_progress
       const inProgress = items.filter(i => i.status === "in_progress");
       if (inProgress.length > 1) {
@@ -599,24 +611,12 @@ export default function (pi: ExtensionAPI) {
         warnings.push(`Auto-fixed: demoted ${demoted} extra in_progress item(s) → pending (only one allowed).`);
       }
 
-      // Remove duplicate items, keeping only the first occurrence of each unique content.
-      // This is consistent with the bridge addItem which also rejects duplicates.
-      const seen = new Set<string>();
-      items = items.filter(item => {
-        if (seen.has(item.content)) {
-          const preview = item.content.length > 40 ? item.content.substring(0, 40) + "…" : item.content;
-          warnings.push(`Duplicate item: "${preview}" — keeping only first occurrence.`);
-          return false;
-        }
-        seen.add(item.content);
-        return true;
-      });
-
       todo = { items };
       // The model rewrote the whole list — bridge-tracked and auto-clean state is now stale
       _programmaticIds.clear();
       _bridgeMutations.clear();
       _bridgeRemovedIds.clear();
+      _bridgeInProgressId = null;
       _autoCleanedContents.clear();
       renderWidget(ctx);
 
@@ -696,7 +696,7 @@ export default function (pi: ExtensionAPI) {
       for (let i = 0; i < limit; i++) {
         const item = sorted[i];
         const icon = STATUS_ICONS[item.status] || "○";
-        const safeContent = truncate(item.content, 60);
+        const safeContent = truncate(sanitizeContent(item.content), 60);
         if (item.status === "in_progress") {
           detailLines.push(`│ \x1b[1m${icon}\x1b[0m \x1b[1m${safeContent}\x1b[0m`);
         } else {
@@ -735,6 +735,14 @@ export default function (pi: ExtensionAPI) {
 
     // Restore state from the most recent todo_write in the session branch
     restoreFromBranch(ctx);
+    // Seed auto-cleaned contents with any already-done items from the restored
+    // snapshot, so they are not re-notified as "newly done" on the first
+    // session_tree event after resume.
+    for (const item of todo.items) {
+      if (item.status === "completed" || item.status === "cancelled") {
+        _autoCleanedContents.add(item.content);
+      }
+    }
     // In-memory bridge items cannot survive a session switch, so clear the set
     // outright: pruning against restored ids could false-positive when a stale
     // bridge id collides with a persisted restored id (id counters overlap
@@ -744,6 +752,10 @@ export default function (pi: ExtensionAPI) {
     // them for the same cross-session id-collision reason.
     _bridgeMutations.clear();
     _bridgeRemovedIds.clear();
+    _bridgeInProgressId = null;
+    // A corrupted snapshot could contain multiple in_progress items — enforce
+    // the invariant defensively (mirrors session_tree's call after reconcile).
+    enforceOneInProgress();
     // Always start with the compact widget (not the detail view)
     clearDetailWidget(ctx);
     renderWidget(ctx);
@@ -790,18 +802,44 @@ export default function (pi: ExtensionAPI) {
         // identical content, breaking the uniqueness invariant that content-keyed ops
         // (updateItemByContent exact-match, removeItemByContent, _autoCleanedContents)
         // rely on.
-        const twinIdx = todo.items.findIndex((i, j) => j !== sameIdIdx && i.content === item.content);
-        if (twinIdx !== -1) todo.items.splice(twinIdx, 1);
-        // The splice may have shifted indices — re-locate by id before replacing.
-        todo.items[todo.items.findIndex(i => i.id === item.id)] = item;
+        // Remove ALL content-twins at other indices (not just one).
+        // A single findIndex+splice would leave a second twin if the snapshot
+        // somehow contains multiple items with identical content.
+        while (true) {
+          const twinIdx = todo.items.findIndex((i, j) => j !== sameIdIdx && i.content === item.content);
+          if (twinIdx === -1) break;
+          todo.items.splice(twinIdx, 1);
+          if (twinIdx < sameIdIdx) sameIdIdx--;
+        }
+        // The splices may have shifted indices — re-locate by id before replacing.
+        const finalIdx = todo.items.findIndex(i => i.id === item.id);
+        if (finalIdx !== -1) todo.items[finalIdx] = item;
         continue;
       }
-      const twinIdx = todo.items.findIndex(i => i.content === item.content);
-      if (twinIdx !== -1) todo.items.splice(twinIdx, 1);
+      // Remove ALL content-twins (not just one) before re-adding.
+      while (true) {
+        const twinIdx = todo.items.findIndex(i => i.content === item.content);
+        if (twinIdx === -1) break;
+        todo.items.splice(twinIdx, 1);
+      }
       todo.items.push(item);
     }
-    // A restored in_progress plus a re-added in_progress could coexist — enforce the invariant
-    enforceOneInProgress();
+    // Advance the counter past any programmatic id so the next addItem() or
+    // model todo_write won't mint a duplicate id (collision would break
+    // updateItemById, removeItemById, isProgrammaticItem, and _bridgeMutations).
+    for (const item of programmaticItems) {
+      if (item.id !== undefined) {
+        const n = Number(item.id);
+        if (!isNaN(n)) _itemIdCounter = Math.max(_itemIdCounter, n);
+      }
+    }
+    // A restored in_progress plus a re-added in_progress could coexist — enforce the invariant.
+    // Prefer the bridge's latest in_progress choice so it isn't demoted by a stale
+    // persisted snapshot that still marks a previously-demoted item as in_progress.
+    const bridgePreferredIdx = _bridgeInProgressId !== null
+      ? todo.items.findIndex(i => i.id === _bridgeInProgressId)
+      : -1;
+    enforceOneInProgress(bridgePreferredIdx >= 0 ? bridgePreferredIdx : undefined);
     clearDetailWidget(ctx);
 
     // Auto-clean: remove completed/cancelled items, but never protected
@@ -816,8 +854,14 @@ export default function (pi: ExtensionAPI) {
       if (newlyDone.length > 0) {
         const doneList = newlyDone.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
         const truncatedList = doneList.length > 500 ? truncate(doneList, 500) + "\n  … and more" : doneList;
+        const completedCt = newlyDone.filter(i => i.status === "completed").length;
+        const cancelledCt = newlyDone.filter(i => i.status === "cancelled").length;
+        const parts: string[] = [];
+        if (completedCt > 0) parts.push(`✅ ${completedCt} completed`);
+        if (cancelledCt > 0) parts.push(`✗ ${cancelledCt} cancelled`);
+        const label = parts.join(", ");
         const ui = resolveUi(ctx);
-        ui?.notify?.(`✅ ${newlyDone.length} task(s) done:\n${truncatedList}`, "info");
+        ui?.notify?.(`${label}:\n${truncatedList}`, "info");
       }
       // Remember cleaned contents so this notification doesn't repeat on the next
       // tree event (restore re-surfaces the same done items every time)
