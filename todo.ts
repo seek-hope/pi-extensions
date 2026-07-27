@@ -625,7 +625,7 @@ function renderWidget(ctx?: any): void {
     const icon = STATUS_ICONS[item.status] || "○";
     const bold = item.status === "in_progress" ? "\x1b[1m" : "";
     const reset = item.status === "in_progress" ? "\x1b[0m" : "";
-    lines.push(`${bold}${icon} ${truncate(item.content, 60)}${reset}`);
+    lines.push(`${bold}${icon} ${truncate(item.content, 120)}${reset}`);
   }
 
   // Render progress items (set via bridge setProgress/clearProgress)
@@ -635,7 +635,7 @@ function renderWidget(ctx?: any): void {
     }
     lines.push("Progress");
     for (const [key, prog] of _progressItems) {
-      lines.push(`  ⏳ [${truncate(key, 20)}] ${truncate(prog.status, 20)}: ${truncate(prog.content, 60)}`);
+      lines.push(`  ⏳ [${truncate(key, 30)}] ${truncate(prog.status, 20)}: ${truncate(prog.content, 80)}`);
     }
   }
 
