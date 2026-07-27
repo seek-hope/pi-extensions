@@ -73,7 +73,6 @@ pi
 | Extension | Official Tool | Auth |
 |-----------|--------------|------|
 | `github.ts` | `gh` CLI (GitHub official) | `gh auth login` |
-| `context7.ts` | Context7 REST API | `CONTEXT7_API_KEY` |
 | `anysearch.ts` | AnySearch REST API | `ANYSEARCH_API_KEY` |
 | `huggingface.ts` | router.huggingface.co/v1 (OpenAI-compat) | `HF_TOKEN` |
 | `playwright.ts` | Playwright (Microsoft) | none |
@@ -109,7 +108,6 @@ pi session
   │   ├─ Sub-agents:          subagent_spawn/parallel/review/merge/reject/list/cancel/ensure_git
   │   ├─ SSH & SCP:           ssh_exec, ssh_status, scp_to_remote, scp_from_remote
   │   ├─ Computer Use:        computer_screenshot/move/click/type/key/scroll/drag
-  │   ├─ Search:              context7_search, anysearch_web
   │   ├─ Browser:             playwright_snapshot/eval/click/fill
   │   ├─ OCR:                 paddle_ocr
   │   ├─ GitHub:              github_issue/pr/search/read_file
@@ -157,7 +155,6 @@ Global npm tools are auto-installed by `bootstrap.sh`. API keys go in `~/.zshrc`
 ### API Keys (`~/.zshrc`)
 
 ```bash
-export CONTEXT7_API_KEY="ctx7sk-..."       # https://context7.com
 export ANYSEARCH_API_KEY="as_sk-..."       # https://anysearch.com
 export HF_TOKEN="hf_..."                   # https://huggingface.co/settings/tokens
 export ANTHROPIC_AUTH_TOKEN="sk-..."       # DeepSeek API key
@@ -168,7 +165,6 @@ export YDOTOOL_SOCKET=/tmp/.ydotool_socket # computer use
 ### Global Context (`~/.pi/agent/AGENTS.md`)
 
 Loads automatically every session. Contains:
-- "Search before answer" rules (context7 → anysearch fallback)
 - Tool reference and workflow guidelines
 
 ## Project Layout
@@ -183,7 +179,6 @@ Loads automatically every session. Contains:
   ├── ssh.ts                 Persistent SSH + SCP (5 tools)
   ├── computer-use.ts        Desktop automation for Wayland (11 tools)
   ├── github.ts              GitHub issues/PRs/search
-  ├── context7.ts            Documentation search
   ├── anysearch.ts           Web search
   ├── huggingface.ts         Model inference via router API
   ├── playwright.ts          Browser automation

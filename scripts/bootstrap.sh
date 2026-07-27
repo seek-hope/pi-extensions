@@ -90,7 +90,6 @@ NPM_PACKAGES=(
   "playwright"
   "typescript-language-server"
   "pyright"
-  "context7"
   "doc-relay"
 )
 
@@ -165,7 +164,6 @@ if [ ! -f "$ENV_FILE" ]; then
 # Pi agent API keys — copy to ~/.zshrc or ~/.bashrc and fill in values
 # (or set them directly via export)
 
-export CONTEXT7_API_KEY=""     # https://context7.com
 export ANYSEARCH_API_KEY=""    # https://anysearch.com
 export HF_TOKEN=""             # https://huggingface.co/settings/tokens
 export YDOTOOL_SOCKET=/tmp/.ydotool_socket  # computer use

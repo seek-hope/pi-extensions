@@ -50,7 +50,6 @@ export default function (pi: ExtensionAPI) {
         "playwright",
         "typescript-language-server",
         "pyright",
-        "context7",
         "doc-relay",
       ];
       for (const pkg of npmTools) {
@@ -120,7 +119,6 @@ export default function (pi: ExtensionAPI) {
         run("npm: playwright", () => sh("npm install -g playwright@latest 2>&1"));
         run("npm: typescript-language-server", () => sh("npm install -g typescript-language-server@latest 2>&1"));
         run("npm: pyright", () => sh("npm install -g pyright@latest 2>&1"));
-        run("npm: context7", () => sh("npm install -g context7@latest 2>&1"));
         run("npm: doc-relay", () => sh("npm install -g doc-relay@latest 2>&1"));
       }
 
