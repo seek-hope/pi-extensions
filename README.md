@@ -3,7 +3,14 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Pi](https://img.shields.io/badge/pi-%3E%3D0.80.0-blue)](https://pi.dev)
 
-Production extension suite for [@earendil-works/pi-coding-agent](https://github.com/badlogic/pi-mono). Every extension wraps an **official upstream tool** — no third-party wrappers. Git-worktree sub-agents, persistent SSH, computer use, LSP, and more.
+Production extension suite for [@earendil-works/pi-coding-agent](https://github.com/badlogic/pi-mono). Every extension wraps an **official upstream tool** — no third-party wrappers.
+
+> **Note:** The following capabilities have graduated from this suite into the
+> [pi-ex](https://github.com/seek-hope/pi-ex) core (built-in, no extension install
+> needed): **subagent** (in-process multi-agent with git worktrees), **ssh**,
+> **computer-use**, **todo flow**, **bg-tasks**, and **/btw**. The files were
+> removed here; use pi-ex to get them. This repo now holds the remaining
+> external-service and code-intelligence extensions.
 
 ## Quick Deploy
 
@@ -19,7 +26,7 @@ pi
 /reload
 ```
 
-## Extensions (18 files, 77 tools, 6 commands)
+## Extensions (12 files)
 
 ### Core Intelligence
 
@@ -29,44 +36,6 @@ pi
 | `serena.ts` | serena-agent (MCP) | Semantic symbol search, rename refactoring, project onboarding, diagnostics |
 | `codegraph.ts` | @colbymchenry/codegraph | Call graphs, impact analysis, symbol search, structure exploration |
 | `graphify.ts` | @sentropic/graphify | Knowledge graph: explain nodes, find shortest paths |
-
-### Multi-Agent System
-
-`subagent.ts` — 9 tools. Git-worktree isolation, recursive up to depth 5.
-
-| Tool | Purpose |
-|------|---------|
-| `subagent_spawn` | Spawn isolated sub-agent in git worktree (analyze/improve/execute modes) |
-| `subagent_wait` | Collect result when done |
-| `subagent_review` | Inspect git diff before merging |
-| `subagent_merge` / `subagent_reject` | Accept or discard changes |
-| `subagent_parallel` | Fan-out N agents simultaneously |
-| `subagent_list` | List running sub-agents and worktrees |
-| `subagent_cancel` | Cancel a running sub-agent and clean up |
-| `subagent_ensure_git` | Initialize git repo if one doesn't exist |
-
-### SSH & Remote
-
-`ssh.ts` — 5 tools. Persistent multiplexed connections, standard SSH syntax.
-
-| Tool | Purpose |
-|------|---------|
-| `ssh_exec` | Execute commands via persistent ControlMaster connection |
-| `ssh_status` | Check active connections |
-| `scp_to_remote` / `scp_from_remote` | File transfer via existing connection |
-| `ssh_exec(background=true)` | Long tasks auto-wrapped in `nohup` on remote |
-
-### Computer Use
-
-`computer-use.ts` — 11 tools. Desktop automation for Hyprland/Wayland.
-
-| Tool | Purpose |
-|------|---------|
-| `computer_screenshot` | Full-screen or region screenshot (base64 PNG) |
-| `computer_move` / `computer_click` / `computer_double_click` | Mouse control |
-| `computer_type` / `computer_key` | Keyboard input |
-| `computer_scroll` / `computer_drag` | Scroll and drag |
-| `computer_get_position` / `computer_get_screen_size` | Display info |
 
 ### External Services
 
@@ -86,12 +55,16 @@ pi
 | `project-setup.ts` | Auto-enables git/codegraph/docrelay/serena on every session start |
 | `auto-update.ts` | `/update-tools` command: git pull + upgrade all npm/system tools |
 
-### Session Utilities
+### Graduated to pi-ex core
 
-| Extension | What It Does |
-|-----------|--------------|
-| `bg-tasks.ts` | `/bg` — tmux-based background tasks, survive session end, disk-persisted |
-| `btw.ts` | `/btw <question>` — ask temporary questions without polluting session |
+| Former extension | Now built into pi-ex as |
+|------------------|-------------------------|
+| `subagent.ts` | `subagent_*` tools (in-process AgentHarness + git worktrees) |
+| `ssh.ts` | `ssh_exec`/`ssh_status`/`scp_*` tools + `/ssh` command |
+| `computer-use.ts` | `computer_*` tools (Wayland-gated) |
+| `todo.ts` | `todo_write` tool + todo widget + `/todo` command |
+| `bg-tasks.ts` | `bg_spawn`/`bg_status` tools + `/tasks` `/fg` `/kill` `/attach` |
+| `btw.ts` | `/btw` built-in command (in-process, no subprocess) |
 
 ## Architecture
 
@@ -103,11 +76,8 @@ pi session
   │   ├─ auto-update.ts   → git fetch, check for extension updates
   │   └─ AGENTS.md        → "search before answer" rules
   │
-  ├─ AI Tools (77 across all extensions)
+  ├─ AI Tools
   │   ├─ Code Intelligence:   codegraph_*, serena_*, lsp_*
-  │   ├─ Sub-agents:          subagent_spawn/parallel/review/merge/reject/list/cancel/ensure_git
-  │   ├─ SSH & SCP:           ssh_exec, ssh_status, scp_to_remote, scp_from_remote
-  │   ├─ Computer Use:        computer_screenshot/move/click/type/key/scroll/drag
   │   ├─ Browser:             playwright_snapshot/eval/click/fill
   │   ├─ OCR:                 paddle_ocr
   │   ├─ GitHub:              github_issue/pr/search/read_file
@@ -116,11 +86,6 @@ pi session
   │   └─ Knowledge:           graphify_explain/path
   │
   └─ User Commands
-      ├─ /btw              → temporary side question
-      ├─ /bg               → background tasks (tmux-managed)
-      ├─ /tasks            → list background tasks
-      ├─ /ssh              → persistent SSH connections
-      ├─ /subagent         → manual sub-agent management
       └─ /update-tools     → upgrade everything
 ```
 
@@ -135,7 +100,7 @@ pi session
 | rust-analyzer | `rustup component add rust-analyzer` |
 | serena | `uv tool install serena-agent` |
 | Playwright browsers | `npx playwright install chromium` |
-| grim / ydotool / wtype | `sudo pacman -S grim ydotool wtype` (Linux/Wayland) |
+| grim / ydotool / wtype | `sudo pacman -S grim ydotool wtype` (Linux/Wayland, for pi-ex computer use) |
 
 Global npm tools are auto-installed by `bootstrap.sh`. API keys go in `~/.zshrc`.
 
@@ -175,9 +140,6 @@ Loads automatically every session. Contains:
   ├── serena.ts              Semantic code tools (MCP)
   ├── codegraph.ts           Call graphs & impact analysis
   ├── graphify.ts            Knowledge graph
-  ├── subagent.ts            Git-worktree multi-agent system (9 tools)
-  ├── ssh.ts                 Persistent SSH + SCP (5 tools)
-  ├── computer-use.ts        Desktop automation for Wayland (11 tools)
   ├── github.ts              GitHub issues/PRs/search
   ├── anysearch.ts           Web search
   ├── huggingface.ts         Model inference via router API
@@ -186,8 +148,6 @@ Loads automatically every session. Contains:
   ├── docrelay.ts            Code-documentation sync
   ├── project-setup.ts       Auto-enable project infra
   ├── auto-update.ts         /update-tools command
-  ├── bg-tasks.ts            /bg background tasks (tmux)
-  ├── btw.ts                 /btw side-query command
   └── scripts/
       └── bootstrap.sh       One-command deployment
 ```
