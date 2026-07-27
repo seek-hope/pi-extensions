@@ -904,6 +904,27 @@ export default function (pi: ExtensionAPI) {
 
   // ── interceptor: block raw remote ssh ────────────────────────────────
   pi.on("tool_call", async (event, ctx) => {
+    // Block any tool call with timeout >300s — model must use background mode
+    const rawTimeout = (event.input as any)?.timeout;
+    if (rawTimeout !== undefined && rawTimeout !== null) {
+      let ms: number | undefined;
+      if (typeof rawTimeout === "number" && Number.isFinite(rawTimeout) && rawTimeout > 0) ms = rawTimeout;
+      if (ms === undefined && typeof rawTimeout === "string") {
+        const m = String(rawTimeout).trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i);
+        if (m) {
+          const val = parseFloat(m[1]);
+          if (val > 0) {
+            const mult: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+            ms = Math.round(val * (mult[(m[2] || "ms").toLowerCase()] || 1000));
+          }
+        }
+      }
+      if (ms !== undefined && ms > 300_000 && !(event.input as any)?.background) {
+        const seconds = Math.round(ms / 1000);
+        return { block: true, reason: `Timeout ${seconds}s exceeds max synchronous limit (300s). Use background:true or timeout<=300000.` };
+      }
+    }
+
     if (event.toolName !== "bash") return;
     const cmd = ((event.input as any)?.command || "") as string;
     if (/\bsshpass\b/.test(cmd)) {
@@ -988,7 +1009,6 @@ export default function (pi: ExtensionAPI) {
         if (typeof params.timeout === "string" && /^\s*-/.test(params.timeout)) {
           return { content: [{ type: "text", text: `Invalid timeout: "${params.timeout}". Timeout must be a positive value like '60s' or '10000'.` }], details: {}, isError: true };
         }
-        console.error(`[ssh] timeout param: type=${typeof params.timeout} value=${JSON.stringify(params.timeout)}`);
         // Block timeouts >300s — model must explicitly use background mode for long tasks
         let effectiveTimeout: number | undefined = typeof params.timeout === "number" && Number.isFinite(params.timeout) && params.timeout > 0 ? params.timeout : undefined;
         // Handle string timeouts like "10000s" or "10m" that models sometimes pass
