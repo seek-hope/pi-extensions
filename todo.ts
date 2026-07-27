@@ -43,7 +43,6 @@ let todo: TodoList = { items: [] };
 const _progressItems = new Map<string, { status: string; content: string }>();
 let detailWidgetActive = false;
 let _autoClearTimer: ReturnType<typeof setTimeout> | null = null;
-let _turnEndTimer: ReturnType<typeof setTimeout> | null = null;
 let _itemIdCounter = 0;
 /** Per-session nonce prefixed to every minted id, so ids from different sessions (and therefore different branches) never collide in _bridgeRemovedIds or _bridgeMutations. Reset on session_start. */
 let _sessionNonce = Date.now().toString(36);
@@ -89,7 +88,6 @@ function syncBridgeMutations(): void {
 /** Shared update logic for bridge mutations — used by both updateItemByContent and updateItemById to avoid duplicated code drifting apart. */
 function applyBridgeUpdate(idx: number, newStatus: TodoStatus, newContent: string | undefined, callerLabel: string): boolean {
   if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
   const item = todo.items[idx];
   const oldContent = item.content;
 
@@ -204,7 +202,6 @@ function resolveUi(ctx?: any): any {
       // Cancel any pending all-done auto-clear (common to both status-changed
       // and status-unchanged paths — extracted to avoid ~80% duplicated logic).
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
 
       if (existing.status !== s) {
         existing.status = s;
@@ -232,7 +229,6 @@ function resolveUi(ctx?: any): any {
     // Cancel any pending all-done auto-clear only now that validation passed —
     // a failed call must not silently cancel a scheduled clear.
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
     // Purge stale auto-clean entry so a future completion of this content notifies again
     _autoCleanedContents.delete(truncated);
     const id = `${_sessionNonce}_${++_itemIdCounter}`;
@@ -281,7 +277,6 @@ function resolveUi(ctx?: any): any {
     }
     if (idx !== -1) {
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
       const [removed] = todo.items.splice(idx, 1);
       _autoCleanedContents.delete(removed.content);
       if (removed?.id !== undefined && _bridgeInProgressId === removed.id) {
@@ -334,7 +329,6 @@ function resolveUi(ctx?: any): any {
     const idx = todo.items.findIndex(item => item.id === key);
     if (idx !== -1) {
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
       const [removed] = todo.items.splice(idx, 1);
       _autoCleanedContents.delete(removed.content);
       if (_bridgeInProgressId === key) {
@@ -477,7 +471,6 @@ function checkAndAutoClear(ctx?: any): void {
     // New activity — reset the notification dedup so the next all-done state notifies
     _lastAutoClearNotifyKey = null;
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
     return;
   }
   // Dedup: repeated calls while the same all-done list stands (e.g. bridge status
@@ -789,7 +782,6 @@ export default function (pi: ExtensionAPI) {
       renderWidget(ctx);
       // Cancel any pending auto-clear
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
 
       // Count by status for response
       const counts: Record<string, number> = {};
@@ -892,7 +884,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Clear any stale auto-clear timer from a previous session
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
     _lastAutoClearNotifyKey = null;
     // Rotate the session nonce so ids minted in this session cannot collide
     // with ids from previous sessions (and therefore previous branches).
@@ -931,10 +922,31 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx);
   });
 
+  // ── agent_end: cleanup completed items when model finishes working ────
+  pi.on("agent_end", async (_event, ctx) => {
+    const removable = todo.items.filter(i =>
+      (i.status === "completed" || i.status === "cancelled") && !isProgrammaticItem(i));
+    if (removable.length === 0) return;
+    const newlyDone = removable.filter(i => !_autoCleanedContents.has(i.content));
+    if (newlyDone.length > 0) {
+      const doneList = newlyDone.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
+      const parts: string[] = [];
+      const completedCt = newlyDone.filter(i => i.status === "completed").length;
+      if (completedCt > 0) parts.push(`✅ ${completedCt} completed`);
+      const cancelledCt = newlyDone.filter(i => i.status === "cancelled").length;
+      if (cancelledCt > 0) parts.push(`✗ ${cancelledCt} cancelled`);
+      const ui = resolveUi(ctx);
+      ui?.notify?.(`${parts.join(", ")}:\n${doneList}`, "info");
+    }
+    for (const i of removable) _autoCleanedContents.add(i.content);
+    todo.items = todo.items.filter(i =>
+      (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
+    renderWidget(ctx);
+  });
+
   // ── session_tree: rebuild state after tree navigation ────────────────
   pi.on("session_tree", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
     // Protect programmatically-added items (tracked by id via the bridge) from being
     // wiped by restore — content-based heuristics would miss arbitrary bridge items
     // and false-positive on user items containing magic substrings.
@@ -1057,9 +1069,6 @@ export default function (pi: ExtensionAPI) {
     clearDetailWidget(ctx);
 
     // Auto-clean: debounced — only fire after model has stopped (500ms quiet)
-    if (_turnEndTimer !== null) clearTimeout(_turnEndTimer);
-    _turnEndTimer = setTimeout(() => {
-      _turnEndTimer = null;
       const removable = todo.items.filter(i =>
         (i.status === "completed" || i.status === "cancelled") && !isProgrammaticItem(i));
       if (removable.length === 0) return;
@@ -1079,16 +1088,7 @@ export default function (pi: ExtensionAPI) {
       for (const i of removable) _autoCleanedContents.add(i.content);
       todo.items = todo.items.filter(i =>
         (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
-      // persisted todo_write snapshot is stale).  Add their ids to
-      // _bridgeRemovedIds so the restore filter drops them, and clear any
-      // _bridgeMutations entries so they become eligible for GC.
-      for (const item of removable) {
-        if (item.id !== undefined) {
-          _bridgeRemovedIds.add(item.id);
-          _bridgeMutations.delete(item.id);
-        }
-      }
-    }, 500);
+    }
 
     // Clear stale bridge progress id when the referenced item is absent from the
     // restored branch, even when no items were removable (all pending).
@@ -1112,7 +1112,6 @@ export default function (pi: ExtensionAPI) {
   // ── session_shutdown: clear widgets, keep state for restore ─────────
   pi.on("session_shutdown", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-    if (_turnEndTimer !== null) { clearTimeout(_turnEndTimer); _turnEndTimer = null; }
     try {
       const ui = resolveUi(ctx);
       ui?.setWidget?.("todo", undefined);
