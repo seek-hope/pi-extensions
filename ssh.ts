@@ -988,6 +988,7 @@ export default function (pi: ExtensionAPI) {
         if (typeof params.timeout === "string" && /^\s*-/.test(params.timeout)) {
           return { content: [{ type: "text", text: `Invalid timeout: "${params.timeout}". Timeout must be a positive value like '60s' or '10000'.` }], details: {}, isError: true };
         }
+        console.error(`[ssh] timeout param: type=${typeof params.timeout} value=${JSON.stringify(params.timeout)}`);
         // Block timeouts >300s — model must explicitly use background mode for long tasks
         let effectiveTimeout: number | undefined = typeof params.timeout === "number" && Number.isFinite(params.timeout) && params.timeout > 0 ? params.timeout : undefined;
         // Handle string timeouts like "10000s" or "10m" that models sometimes pass
