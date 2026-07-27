@@ -43,6 +43,7 @@ let todo: TodoList = { items: [] };
 const _progressItems = new Map<string, { status: string; content: string }>();
 let detailWidgetActive = false;
 let _autoClearTimer: ReturnType<typeof setTimeout> | null = null;
+let _turnEndCleanupTimer: ReturnType<typeof setTimeout> | null = null;
 let _itemIdCounter = 0;
 /** Per-session nonce prefixed to every minted id, so ids from different sessions (and therefore different branches) never collide in _bridgeRemovedIds or _bridgeMutations. Reset on session_start. */
 let _sessionNonce = Date.now().toString(36);
@@ -781,13 +782,18 @@ export default function (pi: ExtensionAPI) {
       _autoCleanedContents.clear();
       renderWidget(ctx);
 
-      // Cancel any pending auto-clear timer to avoid race conditions.
-      // This must run unconditionally so that a new non-done list written
-      // after an all-done list does not get erroneously auto-cleared.
-      if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
-
-      // Auto-clear when all done: show completed list as notification, then clear widget
-      checkAndAutoClear(ctx);
+      // Turn-end cleanup: after model finishes, schedule removal of completed items
+      if (_turnEndCleanupTimer !== null) clearTimeout(_turnEndCleanupTimer);
+      _turnEndCleanupTimer = setTimeout(() => {
+        _turnEndCleanupTimer = null;
+        const doneItems = todo.items.filter(i => i.status === "completed" || i.status === "cancelled");
+        if (doneItems.length === 0) return;
+        const doneList = doneItems.map(i => `  ${i.status === "completed" ? "✓" : "✗"} ${i.content}`).join("\n");
+        const ui = resolveUi(ctx);
+        ui?.notify?.(`✅ ${doneItems.length} task(s) done:\n${doneList}`, "info");
+        todo.items = todo.items.filter(i => i.status !== "completed" && i.status !== "cancelled");
+        renderWidget(ctx);
+      }, 800);
 
       // Count by status for response
       const counts: Record<string, number> = {};
@@ -931,6 +937,7 @@ export default function (pi: ExtensionAPI) {
   // ── session_tree: rebuild state after tree navigation ────────────────
   pi.on("session_tree", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    if (_turnEndCleanupTimer !== null) { clearTimeout(_turnEndCleanupTimer); _turnEndCleanupTimer = null; }
     // Protect programmatically-added items (tracked by id via the bridge) from being
     // wiped by restore — content-based heuristics would miss arbitrary bridge items
     // and false-positive on user items containing magic substrings.
@@ -1114,6 +1121,7 @@ export default function (pi: ExtensionAPI) {
   // ── session_shutdown: clear widgets, keep state for restore ─────────
   pi.on("session_shutdown", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
+    if (_turnEndCleanupTimer !== null) { clearTimeout(_turnEndCleanupTimer); _turnEndCleanupTimer = null; }
     try {
       const ui = resolveUi(ctx);
       ui?.setWidget?.("todo", undefined);
