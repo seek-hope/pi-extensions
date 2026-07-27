@@ -1067,29 +1067,6 @@ export default function (pi: ExtensionAPI) {
     enforceOneInProgress(bridgePreferredIdx >= 0 ? bridgePreferredIdx : undefined);
     syncBridgeMutations();
     clearDetailWidget(ctx);
-
-    // Auto-clean: debounced — only fire after model has stopped (500ms quiet)
-      const removable = todo.items.filter(i =>
-        (i.status === "completed" || i.status === "cancelled") && !isProgrammaticItem(i));
-      if (removable.length === 0) return;
-      const newlyDone = removable.filter(i => !_autoCleanedContents.has(i.content));
-      if (newlyDone.length > 0) {
-        const doneList = newlyDone.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
-        const completedCt = newlyDone.filter(i => i.status === "completed").length;
-        const cancelledCt = newlyDone.filter(i => i.status === "cancelled").length;
-        const parts: string[] = [];
-        if (completedCt > 0) parts.push(`✅ ${completedCt} completed`);
-        if (cancelledCt > 0) parts.push(`✗ ${cancelledCt} cancelled`);
-        const label = parts.join(", ");
-        const ui = resolveUi(ctx);
-        ui?.notify?.(`${label}:\n${doneList}`, "info");
-      }
-      pruneAutoCleanedContents();
-      for (const i of removable) _autoCleanedContents.add(i.content);
-      todo.items = todo.items.filter(i =>
-        (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
-    }
-
     // Clear stale bridge progress id when the referenced item is absent from the
     // restored branch, even when no items were removable (all pending).
     if (_bridgeInProgressId !== null && !todo.items.some(i => i.id === _bridgeInProgressId)) {
