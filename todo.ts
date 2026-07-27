@@ -61,6 +61,9 @@ const _bridgeRemovedIds = new Set<string>();
 /** Id of the item most recently set to in_progress by the bridge (updateItemById/updateItemByContent/addItem). Used as preferredIdx in session_tree's enforceOneInProgress so the bridge's choice survives restores. Cleared on todo_write and session_start. */
 let _bridgeInProgressId: string | null = null;
 
+/** Ids whose _bridgeMutations content is an intended rename that session_tree's collision guard skipped. Preserved across syncs so the rename retries on future restores; deleted when the rename applies (session_tree) or the bridge pushes a fresh authoritative update (applyBridgeUpdate). Cleared wherever _bridgeMutations is cleared. */
+const _pendingBridgeRenames = new Set<string>();
+
 /** Contents of done items already auto-cleaned + notified — dedups the session_tree done-notification (restore re-surfaces the same done items on every tree event). Entries are removed when an item re-opens so a later completion notifies again. */
 const _autoCleanedContents = new Set<string>();
 
@@ -72,7 +75,11 @@ function isProgrammaticItem(item: TodoItem): boolean {
 /** Record the live state of a model-owned item mutated via the bridge, so the session_tree handler can re-apply it over the stale persisted snapshot. */
 function recordBridgeMutation(item: TodoItem): void {
   if (item.id !== undefined && !isProgrammaticItem(item)) {
-    _bridgeMutations.set(item.id, { content: item.content, status: item.status });
+    // Preserve an unapplied rename's intended content — a status-only bridge
+    // update must not erase it (session_tree retries the rename later).
+    const prev = _bridgeMutations.get(item.id);
+    const content = (prev && _pendingBridgeRenames.has(item.id)) ? prev.content : item.content;
+    _bridgeMutations.set(item.id, { content, status: item.status });
   }
 }
 
@@ -80,7 +87,11 @@ function recordBridgeMutation(item: TodoItem): void {
 function syncBridgeMutations(): void {
   for (const item of todo.items) {
     if (item.id !== undefined && _bridgeMutations.has(item.id)) {
-      _bridgeMutations.set(item.id, { content: item.content, status: item.status });
+      // Preserve intended content for pending renames (skipped on collision in
+      // session_tree's re-apply) — syncing live state would forget the rename.
+      const prev = _bridgeMutations.get(item.id)!;
+      const content = _pendingBridgeRenames.has(item.id) ? prev.content : item.content;
+      _bridgeMutations.set(item.id, { content, status: item.status });
     }
   }
 }
@@ -110,6 +121,9 @@ function applyBridgeUpdate(idx: number, newStatus: TodoStatus, newContent: strin
     if (renamed !== oldContent) {
       _autoCleanedContents.delete(oldContent);
     }
+    // The bridge's rename applied live — clear any pending-rename marker from a
+    // previous session_tree collision skip (the live state is now authoritative).
+    if (item.id !== undefined) _pendingBridgeRenames.delete(item.id);
   }
 
   item.status = newStatus;
@@ -196,6 +210,7 @@ function resolveUi(ctx?: any): any {
       if (existing.id !== undefined) {
         _programmaticIds.add(existing.id);
         _bridgeMutations.delete(existing.id);  // was model-owned, now programmatic
+        _pendingBridgeRenames.delete(existing.id);
       }
       // Honor the requested status on the existing item — the caller gets back
       // a valid id and reasonably assumes the status was applied.
@@ -290,6 +305,7 @@ function resolveUi(ctx?: any): any {
         if (!wasProgrammatic) {
           _bridgeRemovedIds.add(removed.id);
           _bridgeMutations.delete(removed.id);
+          _pendingBridgeRenames.delete(removed.id);
         }
       }
       renderWidget();
@@ -341,6 +357,7 @@ function resolveUi(ctx?: any): any {
       if (!wasProgrammatic) {
         _bridgeRemovedIds.add(key);
         _bridgeMutations.delete(key);
+        _pendingBridgeRenames.delete(key);
       }
       renderWidget();
       checkAndAutoClear();
@@ -499,8 +516,11 @@ function checkAndAutoClear(ctx?: any): void {
     // so wiping them here would silently invalidate those ids.
     const wiped = todo.items.filter(i => !isProgrammaticItem(i));
     todo = { items: todo.items.filter(isProgrammaticItem) };
-    // Pre-seed the dedup key for any remaining done items so they don't re-notify
-    const remaining = todo.items;
+    // Pre-seed the dedup key for any remaining done MODEL items so they don't
+    // re-notify. Compute over model items only (mirrors checkAndAutoClear's
+    // doneKey) — after the wipe this is empty, so the key resets to null and a
+    // future all-done list notifies again.
+    const remaining = todo.items.filter(i => !isProgrammaticItem(i));
     _lastAutoClearNotifyKey = remaining.length > 0 && remaining.every(i => i.status === "completed" || i.status === "cancelled")
       ? remaining.map(i => `${i.status}:${i.content}`).sort().join("\n")
       : null;
@@ -509,7 +529,14 @@ function checkAndAutoClear(ctx?: any): void {
     // Remember the wiped done items (don't clear the set): a later session_tree
     // restore re-surfaces the same done items from the last todo_write details,
     // and without these entries the "task(s) done" notification would repeat.
-    for (const i of wiped) _autoCleanedContents.add(i.content);
+    // Also record their ids in _bridgeRemovedIds so the session_tree restore
+    // filter blocks the resurrection outright (mirrors agent_end) — content
+    // dedup alone still lets the items reappear in the widget, causing a
+    // resurrect/wipe flap when the restored snapshot is all-done.
+    for (const i of wiped) {
+      _autoCleanedContents.add(i.content);
+      if (i.id !== undefined) _bridgeRemovedIds.add(i.id);
+    }
     // A /todo detail widget opened during the 3s window would show wiped items —
     // clear it explicitly and keep detailWidgetActive in sync.
     // Guard against the stub UI: if _ui is still null (no ctx-bearing event has
@@ -546,6 +573,7 @@ function restoreFromBranch(ctx?: any): void {
       return;
     }
     // Iterate in reverse so the most recent todo_write wins
+    let restored = false;
     for (let i = branch.length - 1; i >= 0; i--) {
       const entry = branch[i];
       // Validate each entry's structure before accessing nested properties
@@ -595,8 +623,17 @@ function restoreFromBranch(ctx?: any): void {
           }
         }
         todo = { items: deduped };
+        restored = true;
         break;
       }
+    }
+    // No todo_write anywhere on this branch — the branch point genuinely has no
+    // todo list. Clear rather than leave the stale list in place: without this,
+    // items from a different branch (session_tree) or a previous session
+    // (session_start) leak into a location where they never existed, stripped
+    // of their programmatic/bridge protection.
+    if (!restored) {
+      todo = { items: [] };
     }
   } catch (e) {
     console.warn("restoreFromBranch: failed to restore todo from branch", e);
@@ -777,8 +814,12 @@ export default function (pi: ExtensionAPI) {
       // model-owned items are now stale (the model's list is authoritative).
       _bridgeMutations.clear();
       _bridgeRemovedIds.clear();
+      _pendingBridgeRenames.clear();
       _bridgeInProgressId = null;
       _autoCleanedContents.clear();
+      // The dedup key was computed over the pre-rewrite list — reset it so a
+      // rewritten all-done list is re-evaluated (and notified) on its own terms.
+      _lastAutoClearNotifyKey = null;
       renderWidget(ctx);
       // Cancel any pending auto-clear
       if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
@@ -912,6 +953,7 @@ export default function (pi: ExtensionAPI) {
     // them for the same cross-session id-collision reason.
     _bridgeMutations.clear();
     _bridgeRemovedIds.clear();
+    _pendingBridgeRenames.clear();
     _progressItems.clear();
     _bridgeInProgressId = null;
     // A corrupted snapshot could contain multiple in_progress items — enforce
@@ -924,6 +966,11 @@ export default function (pi: ExtensionAPI) {
 
   // ── agent_end: cleanup completed items when model finishes ────
   pi.on("agent_end", async (_event, ctx) => {
+    // Cancel any pending auto-clear timer — agent_end performs the same wipe
+    // (with better bookkeeping), and a stray timer firing later would run
+    // pruneAutoCleanedContents with an empty wipe list, destroying the dedup
+    // entries added below and causing duplicate notifications on resurrection.
+    if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
     const removable = todo.items.filter(i =>
       (i.status === "completed" || i.status === "cancelled") && !isProgrammaticItem(i));
     if (removable.length === 0) return;
@@ -941,10 +988,21 @@ export default function (pi: ExtensionAPI) {
     for (const i of removable) {
       _autoCleanedContents.add(i.content);
       // Track removals so session_tree restore doesn't resurrect them
-      if (i.id !== undefined) _bridgeRemovedIds.add(i.id);
+      if (i.id !== undefined) {
+        _bridgeRemovedIds.add(i.id);
+        // Pair the removal record with mutation cleanup (mirrors the bridge
+        // remove paths) — a leaked mutation entry is dead weight the
+        // session_tree GC no longer collects.
+        _bridgeMutations.delete(i.id);
+        _pendingBridgeRenames.delete(i.id);
+      }
     }
     todo.items = todo.items.filter(i =>
       (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
+    // The done list this turn's key was computed over is gone — reset the dedup
+    // key so a later identical all-done list notifies again (mirrors
+    // checkAndAutoClear's not-all-done branch).
+    _lastAutoClearNotifyKey = null;
     renderWidget(ctx);
   });
 
@@ -956,34 +1014,24 @@ export default function (pi: ExtensionAPI) {
     // and false-positive on user items containing magic substrings.
     const programmaticItems = todo.items.filter(isProgrammaticItem);
     restoreFromBranch(ctx);
-    // Capture ids present in the restored snapshot before filtering, so we can
-    // garbage-collect stale _bridgeRemovedIds entries below.
-    let restoredIds = new Set(todo.items.map(i => i.id).filter(Boolean) as string[]);
     // Re-apply bridge removals of model-owned items — the persisted snapshot is
     // stale (todo_write hasn't run since), so restore would resurrect them.
+    // NOTE: no garbage-collection of _bridgeRemovedIds here. An id absent from
+    // the CURRENT snapshot is not proof the removal is stale — the user may have
+    // navigated to an earlier tree point or another branch whose snapshot predates
+    // the item. Deleting the record then would silently resurrect the item when
+    // navigating back (Bug: resurrection of explicitly removed items). Records
+    // are bounded: todo_write and session_start both clear the set.
     if (_bridgeRemovedIds.size > 0) {
       todo.items = todo.items.filter(i => i.id === undefined || !_bridgeRemovedIds.has(i.id));
-      // Clean up stale entries: ids that are no longer in the restored snapshot
-      // were already removed by a todo_write on this branch, so tracking them is
-      // unnecessary. This bounds _bridgeRemovedIds growth between todo_write calls.
-      // Two-pass to avoid Set.delete() during for...of iteration (spec-leaves
-      // mutation-during-iteration behaviour implementation-defined).
-      const staleRemovedIds: string[] = [];
-      for (const id of _bridgeRemovedIds) {
-        if (!restoredIds.has(id)) {
-          staleRemovedIds.push(id);
-        }
-      }
-      for (const id of staleRemovedIds) {
-        _bridgeRemovedIds.delete(id);
-      }
-      // Re-compute restoredIds after filtering so the _bridgeMutations GC below
-      // only considers ids that survived _bridgeRemovedIds filtering.
-      restoredIds = new Set(todo.items.map(i => i.id).filter(Boolean) as string[]);
     }
     // Re-apply bridge mutations to model-owned items — restore would otherwise
     // silently revert bridge-side status/content changes (e.g. an item completed
     // via the bridge would come back as pending).
+    // NOTE: no garbage-collection of _bridgeMutations here either, for the same
+    // reason as _bridgeRemovedIds above — GC on snapshot absence permanently
+    // reverts bridge changes when navigating away and back. Cleared on
+    // todo_write/session_start.
     for (const [id, mutation] of _bridgeMutations) {
       const idx = todo.items.findIndex(i => i.id === id);
       if (idx === -1) continue; // a snapshot from another branch never had this id
@@ -991,8 +1039,15 @@ export default function (pi: ExtensionAPI) {
       item.status = mutation.status;
       // Apply the content change only when it cannot collide — dropping a
       // coincidental content-twin from another branch would lose a task.
+      // When the apply is skipped, mark the rename as pending so
+      // syncBridgeMutations doesn't overwrite the intended content with live
+      // (stale) state — the rename is retried on every future session_tree and
+      // applies once the twin disappears.
       if (!todo.items.some((it, j) => j !== idx && it.content === mutation.content)) {
         item.content = mutation.content;
+        _pendingBridgeRenames.delete(id);
+      } else {
+        _pendingBridgeRenames.add(id);
       }
       // Keep _bridgeInProgressId in sync (mirrors applyBridgeUpdate logic).
       if (mutation.status === "in_progress") {
@@ -1000,20 +1055,6 @@ export default function (pi: ExtensionAPI) {
       } else if (item.id !== undefined && _bridgeInProgressId === item.id) {
         _bridgeInProgressId = null;
       }
-    }
-    // Garbage-collect stale _bridgeMutations entries for ids that have vanished
-    // from all branch snapshots, so the map doesn't grow without bound across
-    // many tree navigations between todo_write calls.
-    // Two-pass to avoid Map.delete() during iteration (same spec concern as the
-    // _bridgeRemovedIds cleanup above).
-    const staleMutationIds: string[] = [];
-    for (const id of _bridgeMutations.keys()) {
-      if (!restoredIds.has(id)) {
-        staleMutationIds.push(id);
-      }
-    }
-    for (const id of staleMutationIds) {
-      _bridgeMutations.delete(id);
     }
     // Re-add items that were wiped by restore. Match by id only: a restored item
     // with identical content but a different id must not cause the programmatic
@@ -1081,10 +1122,25 @@ export default function (pi: ExtensionAPI) {
     // key from before tree navigation would wrongly suppress the next
     // "All tasks complete" notification if the model writes an identical
     // all-done list (mirrors the auto-clear timer callback's re-seeding).
-    const remaining = todo.items;
+    // Compute over MODEL items only (mirrors checkAndAutoClear's doneKey) —
+    // including programmatic items would make the seeded key never match a
+    // future doneKey, spamming the notification on every tree navigation.
+    const remaining = todo.items.filter(i => !isProgrammaticItem(i));
     _lastAutoClearNotifyKey = remaining.length > 0 && remaining.every(i => i.status === "completed" || i.status === "cancelled")
       ? remaining.map(i => `${i.status}:${i.content}`).sort().join("\n")
       : null;
+
+    // Rebuild the done-notification dedup set from the restored list (mirrors
+    // session_start's seeding). Two failure modes without this:
+    //  (a) no seeding → items done in a prior session re-notify as "newly done";
+    //  (b) stale entries survive → a same-content item completed later on this
+    //      branch has its legitimate completion notification suppressed.
+    _autoCleanedContents.clear();
+    for (const item of todo.items) {
+      if (item.status === "completed" || item.status === "cancelled") {
+        _autoCleanedContents.add(item.content);
+      }
+    }
 
     checkAndAutoClear(ctx);
     renderWidget(ctx);
