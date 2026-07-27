@@ -907,21 +907,24 @@ export default function (pi: ExtensionAPI) {
     // Block any tool call with timeout >300s — model must use background mode
     const rawTimeout = (event.input as any)?.timeout;
     if (rawTimeout !== undefined && rawTimeout !== null) {
-      let ms: number | undefined;
-      if (typeof rawTimeout === "number" && Number.isFinite(rawTimeout) && rawTimeout > 0) ms = rawTimeout;
-      if (ms === undefined && typeof rawTimeout === "string") {
+      let effectiveSeconds: number | undefined;
+      if (typeof rawTimeout === "number" && Number.isFinite(rawTimeout) && rawTimeout > 0) {
+        // pi's bash tool uses seconds; ssh_exec and others use ms — normalize to seconds
+        effectiveSeconds = event.toolName === "bash" ? rawTimeout : rawTimeout / 1000;
+      }
+      if (effectiveSeconds === undefined && typeof rawTimeout === "string") {
         const m = String(rawTimeout).trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i);
         if (m) {
           const val = parseFloat(m[1]);
           if (val > 0) {
-            const mult: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
-            ms = Math.round(val * (mult[(m[2] || "ms").toLowerCase()] || 1000));
+            const unit = (m[2] || (event.toolName === "bash" ? "s" : "ms")).toLowerCase();
+            const mult: Record<string, number> = { ms: 0.001, s: 1, m: 60, h: 3600 };
+            effectiveSeconds = val * (mult[unit] || 1);
           }
         }
       }
-      if (ms !== undefined && ms > 300_000 && !(event.input as any)?.background) {
-        const seconds = Math.round(ms / 1000);
-        return { block: true, reason: `Timeout ${seconds}s exceeds max synchronous limit (300s). Use background:true or timeout<=300000.` };
+      if (effectiveSeconds !== undefined && effectiveSeconds > 300 && !(event.input as any)?.background) {
+        return { block: true, reason: `Timeout ${Math.round(effectiveSeconds)}s exceeds max synchronous limit (300s). Use background:true or timeout<=300.` };
       }
     }
 
@@ -1020,10 +1023,9 @@ export default function (pi: ExtensionAPI) {
             if (val <= 0) {
               return { content: [{ type: "text", text: `Invalid timeout: "${params.timeout}". Timeout must be a positive value like '60s' or '10000'.` }], details: {}, isError: true };
             }
-            // Default to milliseconds when no unit given — numeric paths treat values
-            // as ms, and bare strings like "30000" are more likely intended as 30s.
-            // Explicit suffixes ("10s", "5m", "2h") work as expected.
-            const unit = (m[2] || "ms").toLowerCase();
+            // Default to seconds for bare number strings (matching pi's convention).
+            // Explicit suffixes ("10s", "5m", "2h") override. Internally stored as ms.
+            const unit = (m[2] || "s").toLowerCase();
             const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
             effectiveTimeout = Math.round(val * (multipliers[unit] || 1000));
           } else {
