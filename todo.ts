@@ -922,28 +922,6 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx);
   });
 
-  // ── agent_end: cleanup completed items when model finishes working ────
-  pi.on("agent_end", async (_event, ctx) => {
-    const removable = todo.items.filter(i =>
-      (i.status === "completed" || i.status === "cancelled") && !isProgrammaticItem(i));
-    if (removable.length === 0) return;
-    const newlyDone = removable.filter(i => !_autoCleanedContents.has(i.content));
-    if (newlyDone.length > 0) {
-      const doneList = newlyDone.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
-      const parts: string[] = [];
-      const completedCt = newlyDone.filter(i => i.status === "completed").length;
-      if (completedCt > 0) parts.push(`✅ ${completedCt} completed`);
-      const cancelledCt = newlyDone.filter(i => i.status === "cancelled").length;
-      if (cancelledCt > 0) parts.push(`✗ ${cancelledCt} cancelled`);
-      const ui = resolveUi(ctx);
-      ui?.notify?.(`${parts.join(", ")}:\n${doneList}`, "info");
-    }
-    for (const i of removable) _autoCleanedContents.add(i.content);
-    todo.items = todo.items.filter(i =>
-      (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
-    renderWidget(ctx);
-  });
-
   // ── session_tree: rebuild state after tree navigation ────────────────
   pi.on("session_tree", async (_event, ctx) => {
     if (_autoClearTimer !== null) { clearTimeout(_autoClearTimer); _autoClearTimer = null; }
@@ -1083,6 +1061,26 @@ export default function (pi: ExtensionAPI) {
       : null;
 
     checkAndAutoClear(ctx);
+
+    // Clean completed items (runs after restore, so won't reappear)
+    const removable = todo.items.filter(i =>
+      (i.status === "completed" || i.status === "cancelled") && !isProgrammaticItem(i));
+    if (removable.length > 0) {
+      const newlyDone = removable.filter(i => !_autoCleanedContents.has(i.content));
+      if (newlyDone.length > 0) {
+        const doneList = newlyDone.map(i => `  ${STATUS_ICONS[i.status]} ${i.content}`).join("\n");
+        const parts: string[] = [];
+        const cct = newlyDone.filter(i => i.status === "completed").length;
+        if (cct > 0) parts.push(`✅ ${cct} completed`);
+        const cxl = newlyDone.filter(i => i.status === "cancelled").length;
+        if (cxl > 0) parts.push(`✗ ${cxl} cancelled`);
+        ui?.notify?.(`${parts.join(", ")}:\n${doneList}`, "info");
+      }
+      for (const i of removable) _autoCleanedContents.add(i.content);
+      todo.items = todo.items.filter(i =>
+        (i.status !== "completed" && i.status !== "cancelled") || isProgrammaticItem(i));
+    }
+
     renderWidget(ctx);
   });
 
