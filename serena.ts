@@ -16,7 +16,6 @@ import { join } from "node:path";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const INITIALIZE_TIMEOUT_MS = 20_000;
-const MAX_HEADER_BYTES = 8 * 1024;
 const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
 interface ServerState {
@@ -86,8 +85,8 @@ function sendMessage(state: ServerState, msg: unknown): void {
 
   const body = JSON.stringify(msg);
   if (body === undefined) throw new Error("Cannot serialize MCP message");
-  const header = `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`;
-  child.stdin.write(header + body);
+  // Stdio transport: one JSON-RPC message per line, newline-terminated.
+  child.stdin.write(body + "\n");
 }
 
 function takePending(id: number | string): PendingRequest | undefined {
@@ -236,50 +235,35 @@ function handleMessage(state: ServerState, value: unknown): void {
 }
 
 function onData(state: ServerState, chunk: Buffer | string): void {
-  if (state.closed) return;
-  const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-  state.buffer = state.buffer.length === 0 ? bytes : Buffer.concat([state.buffer, bytes]);
+	if (state.closed) return;
+	const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+	state.buffer = state.buffer.length === 0 ? bytes : Buffer.concat([state.buffer, bytes]);
 
-  while (!state.closed) {
-    const headerEnd = state.buffer.indexOf("\r\n\r\n");
-    if (headerEnd === -1) {
-      if (state.buffer.length > MAX_HEADER_BYTES) {
-        protocolFailure(state, new Error("Serena MCP response header exceeded the size limit"));
-      }
-      return;
-    }
+	// Stdio transport: newline-delimited JSON-RPC messages.
+	while (!state.closed) {
+		const nl = state.buffer.indexOf("\n");
+		if (nl === -1) {
+			if (state.buffer.length > MAX_MESSAGE_BYTES) {
+				protocolFailure(state, new Error("Serena MCP response exceeded the size limit"));
+			}
+			return;
+		}
 
-    if (headerEnd > MAX_HEADER_BYTES) {
-      protocolFailure(state, new Error("Serena MCP response header exceeded the size limit"));
-      return;
-    }
+		let line = state.buffer.subarray(0, nl).toString("utf8");
+		state.buffer = state.buffer.subarray(nl + 1);
 
-    const header = state.buffer.subarray(0, headerEnd).toString("ascii");
-    const match = header.match(/(?:^|\r\n)Content-Length:\s*(\d+)\s*(?:\r\n|$)/i);
-    if (!match) {
-      protocolFailure(state, new Error("Serena MCP response is missing Content-Length"));
-      return;
-    }
+		// Strip trailing \r if present (CRLF).
+		if (line.endsWith("\r")) line = line.slice(0, -1);
+		// Skip empty lines.
+		if (line.trim().length === 0) continue;
 
-    const length = Number(match[1]);
-    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_MESSAGE_BYTES) {
-      protocolFailure(state, new Error(`Invalid Serena MCP Content-Length: ${match[1]}`));
-      return;
-    }
-
-    const bodyStart = headerEnd + 4;
-    const bodyEnd = bodyStart + length;
-    if (state.buffer.length < bodyEnd) return;
-
-    const body = state.buffer.subarray(bodyStart, bodyEnd).toString("utf8");
-    state.buffer = state.buffer.subarray(bodyEnd);
-    try {
-      handleMessage(state, JSON.parse(body));
-    } catch (error) {
-      protocolFailure(state, asError(error, "Serena MCP server sent invalid JSON"));
-      return;
-    }
-  }
+		try {
+			handleMessage(state, JSON.parse(line));
+		} catch (error) {
+			protocolFailure(state, asError(error, "Serena MCP server sent invalid JSON"));
+			return;
+		}
+	}
 }
 
 function deactivateServerState(state: ServerState, error: Error): void {
