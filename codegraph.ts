@@ -42,7 +42,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const out = run(["search", params.query], ctx.cwd);
+        const out = run(["query", params.query], ctx.cwd);
         return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
