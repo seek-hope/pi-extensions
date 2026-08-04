@@ -99,14 +99,6 @@ const checks: Check[] = [
     description: "Documentation sync",
     skipInHome: true,
   },
-  {
-    name: "Serena",
-    icon: "🔍",
-    exists: (cwd) => existsSync(join(cwd, ".serena")),
-    init: (cwd) => sh("serena-agent project create --index", cwd),
-    description: "Semantic code tools",
-    skipInHome: true,
-  },
 ];
 
 // ── extension ───────────────────────────────────────────────────────────────

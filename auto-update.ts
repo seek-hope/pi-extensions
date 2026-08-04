@@ -66,25 +66,18 @@ export default function (pi: ExtensionAPI) {
       results.push(r3.out);
       if (!r3.ok) anyError = true;
 
-      // 4. Update serena (uv)
-      ctx.ui.notify("Updating serena...", "info");
-      results.push("\n=== Serena ===");
-      const r4 = safeSh("uv tool upgrade serena-agent 2>&1 || echo 'uv tool upgrade not available'");
+      // 4. Update gh CLI (system)
+      ctx.ui.notify("Updating gh CLI...", "info");
+      results.push("\n=== gh CLI ===");
+      const r4 = safeSh("gh --version 2>&1 && (sudo -n apt update -qq -o APT::Status-Fd=0 2>/dev/null && sudo -n apt install -y gh 2>&1) || echo 'apt not available, manual update required'");
       results.push(r4.out);
       if (!r4.ok) anyError = true;
 
-      // 5. Update gh CLI (system)
-      ctx.ui.notify("Updating gh CLI...", "info");
-      results.push("\n=== gh CLI ===");
-      const r5 = safeSh("gh --version 2>&1 && (sudo -n apt update -qq -o APT::Status-Fd=0 2>/dev/null && sudo -n apt install -y gh 2>&1) || echo 'apt not available, manual update required'");
+      // 5. Update rust-analyzer
+      results.push("\n=== rust-analyzer ===");
+      const r5 = safeSh("rustup component add rust-analyzer 2>&1 || echo 'rustup not available'");
       results.push(r5.out);
       if (!r5.ok) anyError = true;
-
-      // 6. Update rust-analyzer
-      results.push("\n=== rust-analyzer ===");
-      const r6 = safeSh("rustup component add rust-analyzer 2>&1 || echo 'rustup not available'");
-      results.push(r6.out);
-      if (!r6.ok) anyError = true;
 
       ctx.ui.notify(anyError ? "Some tools failed to update (see output)" : "All tools updated!", anyError ? "error" : "info");
       return results.join("\n");
@@ -95,9 +88,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "update_tools",
     label: "Update Tools",
-    description: "Update extension code (git pull) and all underlying official tools (npm, playwright, serena, etc.)",
+    description: "Update extension code (git pull) and all underlying official tools (npm, playwright, gh, rust-analyzer, etc.)",
     parameters: Type.Object({
-      scope: Type.Optional(Type.String({ description: "all, extensions, npm, playwright, serena, system (default: all)" })),
+      scope: Type.Optional(Type.String({ description: "all, extensions, npm, playwright, system (default: all)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const scope = params.scope || "all";
@@ -124,10 +117,6 @@ export default function (pi: ExtensionAPI) {
 
       if (scope === "all" || scope === "playwright") {
         run("Playwright Browsers", () => sh("NODE_PATH=" + (process.env.HOME || homedir()) + "/.npm/lib/node_modules npx playwright install chromium 2>&1"));
-      }
-
-      if (scope === "all" || scope === "serena") {
-        run("Serena (uv)", () => sh("uv tool upgrade serena-agent 2>&1 || echo 'uv not available, try: uv tool upgrade serena-agent'"));
       }
 
       if (scope === "all" || scope === "system") {

@@ -104,6 +104,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "codegraph_sync",
+    label: "CodeGraph Sync",
+    description: "Incrementally update the CodeGraph index since the last sync (fast; designed for post-edit freshness)",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const out = run(["sync", "-q"], ctx.cwd);
+        return { content: [{ type: "text", text: out || "CodeGraph index synced." }], details: {} };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
     name: "codegraph_impact",
     label: "CodeGraph Impact",
     description: "Analyze transitive change impact for a symbol",

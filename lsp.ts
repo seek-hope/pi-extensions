@@ -217,6 +217,69 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ---- project-wide diagnostics ---------------------------------------------
+  pi.registerTool({
+    name: "lsp_project_diagnostics",
+    label: "LSP Project Diagnostics",
+    description:
+      "Run project-wide diagnostics for a language. " +
+      "typescript: tsc --noEmit (whole project); python: pyright (whole project); " +
+      "rust: cargo check (whole project); cpp: clangd --check per file (project-wide needs compile_commands.json). " +
+      "Use after a batch of edits to catch cross-file breakage.",
+    parameters: Type.Object({
+      language: Type.String({ description: "Language: python, cpp, rust, or typescript" }),
+      path: Type.Optional(Type.String({ description: "Absolute path to a source file (used for cpp per-file check)" })),
+    }),
+    async execute(_id, params, _signal) {
+      try {
+        const lang = (params.language || "").toLowerCase();
+        const file = params.path || "";
+        let result = "";
+        switch (lang) {
+          case "python": {
+            if (!which("pyright")) {
+              return { content: [{ type: "text", text: "pyright not installed. Install with: pip install pyright" }], details: {}, isError: true };
+            }
+            result = run("pyright", [], 120_000);
+            break;
+          }
+          case "cpp":
+          case "c":
+          case "c++": {
+            if (!which("clangd")) {
+              return { content: [{ type: "text", text: "clangd not installed. Install via LLVM/clangd package." }], details: {}, isError: true };
+            }
+            if (!file) {
+              return { content: [{ type: "text", text: "C/C++ project-wide diagnostics require compile_commands.json; pass a file path for a per-file clangd --check instead." }], details: {}, isError: true };
+            }
+            result = run("clangd", [`--check=${file}`], 60_000);
+            break;
+          }
+          case "rust": {
+            if (!which("cargo")) {
+              return { content: [{ type: "text", text: "cargo not installed. Install Rust: https://rustup.rs" }], details: {}, isError: true };
+            }
+            result = run("cargo", ["check", "--message-format", "short"], 120_000);
+            break;
+          }
+          case "typescript":
+          case "ts": {
+            if (!which("tsc")) {
+              return { content: [{ type: "text", text: "tsc not installed. Install with: npm install -g typescript" }], details: {}, isError: true };
+            }
+            result = run("tsc", ["--noEmit", "--pretty", "false"], 120_000);
+            break;
+          }
+          default:
+            return { content: [{ type: "text", text: `Unknown language: ${lang}. Supported: python, cpp, rust, typescript` }], details: {}, isError: true };
+        }
+        return { content: [{ type: "text", text: result || "No diagnostics." }], details: {} };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e.message }], details: {}, isError: true };
+      }
+    },
+  });
+
   // ---- hover ---------------------------------------------------------------
   pi.registerTool({
     name: "lsp_hover",
