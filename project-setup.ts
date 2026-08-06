@@ -42,7 +42,7 @@ interface Check {
 const checks: Check[] = [
   {
     name: "Git",
-    icon: "🔀",
+    icon: "<>",
     exists: (cwd) => existsSync(join(cwd, ".git")),
     init: (cwd) => {
       const r1 = sh("git init", cwd);
@@ -85,7 +85,7 @@ const checks: Check[] = [
   },
   {
     name: "CodeGraph",
-    icon: "🧬",
+    icon: "CG",
     exists: (cwd) => existsSync(join(cwd, ".codegraph")) || existsSync(join(cwd, ".codegraph.json")),
     init: (cwd) => sh("codegraph init", cwd),
     description: "Code intelligence index",
@@ -93,7 +93,7 @@ const checks: Check[] = [
   },
   {
     name: "DocRelay",
-    icon: "📚",
+    icon: "DR",
     exists: (cwd) => existsSync(join(cwd, ".docrelay")) || existsSync(join(cwd, ".docrelay.db")),
     init: (cwd) => sh("doc-relay init --no-hooks --no-integrate", cwd),
     description: "Documentation sync",
@@ -160,18 +160,18 @@ export default function (pi: ExtensionAPI) {
 
       for (const check of checks) {
         if (check.skipInHome && resolve(ctx.cwd) === resolve(process.env.HOME || "")) {
-          lines.push(`${check.icon} ${check.name}: ⏭ skipped (home directory)`);
+          lines.push(`${check.icon} ${check.name}: >> skipped (home directory)`);
           continue;
         }
         if (check.exists(ctx.cwd)) {
-          lines.push(`${check.icon} ${check.name}: ✅ enabled`);
+          lines.push(`${check.icon} ${check.name}: ✓ enabled`);
         } else {
           const r = check.init(ctx.cwd);
           if (r.ok) {
-            lines.push(`${check.icon} ${check.name}: ⚡ auto-enabled`);
+            lines.push(`${check.icon} ${check.name}: auto-enabled`);
             lines.push(`   ${r.out.substring(0, 200)}`);
           } else {
-            lines.push(`${check.icon} ${check.name}: ❌ failed`);
+            lines.push(`${check.icon} ${check.name}: ✗ failed`);
             lines.push(`   ${r.out.substring(0, 200)}`);
             allOk = false;
           }
