@@ -59,6 +59,40 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── health ───────────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "docrelay_health",
+    label: "DocRelay Health",
+    description:
+      "Run a comprehensive DocRelay system health check (database, config, codegraph reachability, symbol/doc tracking, scan freshness). v0.3+.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const out = run(["health"], ctx.cwd);
+        return { content: [{ type: "text", text: out }], details: {} };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+      }
+    },
+  });
+
+  // ── review ───────────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "docrelay_review",
+    label: "DocRelay Review",
+    description:
+      "Audit code-doc mappings: unlinked symbols, orphaned sections, implied refs. v0.3+.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const out = run(["review"], ctx.cwd);
+        return { content: [{ type: "text", text: out }], details: {} };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };
+      }
+    },
+  });
+
   // ── check ────────────────────────────────────────────────────────────
   pi.registerTool({
     name: "docrelay_check",
@@ -150,7 +184,11 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const args = ["link", params.action];
+        // v0.3+: confirm/reject are standalone commands, not link actions.
+        const args =
+          params.action === "confirm" || params.action === "reject"
+            ? [params.action]
+            : ["link", params.action];
         if (params.symbol) args.push("--symbol", params.symbol);
         if (params.doc) args.push("--doc", params.doc);
         const out = run(args, ctx.cwd);
