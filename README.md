@@ -44,7 +44,7 @@ pi
 | `github.ts` | `gh` CLI (GitHub official) | `gh auth login` |
 | `anysearch.ts` | AnySearch REST API | `ANYSEARCH_API_KEY` |
 | `huggingface.ts` | router.huggingface.co/v1 (OpenAI-compat) | `HF_TOKEN` |
-| `playwright.ts` | Playwright (Microsoft) | none |
+| `agent-browser.ts` | agent-browser CLI (Vercel Labs) | none |
 | `paddleocr.ts` | PaddleOCR Cloud API (PaddleOCR-VL-1.6) | token embedded |
 
 ### Documentation & Project Management
@@ -78,7 +78,7 @@ pi session
   │
   ├─ AI Tools
   │   ├─ Code Intelligence:   codegraph_*, serena_*, lsp_*
-  │   ├─ Browser:             playwright_snapshot/eval/click/fill
+  │   ├─ Browser:             agent_browser_snapshot/eval/click/fill
   │   ├─ OCR:                 paddle_ocr
   │   ├─ GitHub:              github_issue/pr/search/read_file
   │   ├─ HuggingFace:         huggingface_inference/chat/translate
@@ -99,7 +99,7 @@ pi session
 | clangd | `sudo apt install clangd` |
 | rust-analyzer | `rustup component add rust-analyzer` |
 | serena | `uv tool install serena-agent` |
-| Playwright browsers | `npx playwright install chromium` |
+| agent-browser | `npm install -g agent-browser && agent-browser install` |
 | grim / ydotool / wtype | `sudo pacman -S grim ydotool wtype` (Linux/Wayland, for pi-ex computer use) |
 
 Global npm tools are auto-installed by `bootstrap.sh`. API keys go in `~/.zshrc`.
@@ -143,7 +143,7 @@ Loads automatically every session. Contains:
   ├── github.ts              GitHub issues/PRs/search
   ├── anysearch.ts           Web search
   ├── huggingface.ts         Model inference via router API
-  ├── playwright.ts          Browser automation
+  ├── agent-browser.ts   Browser automation (agent-browser CLI)
   ├── paddleocr.ts           OCR via cloud API
   ├── docrelay.ts            Code-documentation sync
   ├── project-setup.ts       Auto-enable project infra
