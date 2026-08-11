@@ -133,7 +133,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── session_start: check for updates on startup ────────────────────
+  // ── session_start: auto-update extensions on startup ─────────────
   pi.on("session_start", async (event, ctx) => {
     if (event.reason !== "startup" && event.reason !== "reload") return;
     try {
@@ -153,7 +153,15 @@ export default function (pi: ExtensionAPI) {
         sh(`git fetch origin ${defaultBranch} 2>/dev/null`, EXT_DIR);
         const behind = sh(`git rev-list HEAD..origin/${defaultBranch} --count 2>/dev/null`, EXT_DIR).trim();
         if (behind && behind !== "0" && !behind.includes("Error")) {
-          ctx.ui.notify(`Extensions: ${behind} commit(s) behind remote. Run /update-tools to sync.`, "warning");
+          // Auto-update: fast-forward only, so a dirty or diverged working
+          // tree fails cleanly and falls back to the manual command.
+          try {
+            sh(`git pull --ff-only origin ${defaultBranch} 2>&1`, EXT_DIR);
+            const latest = sh("git log --oneline -1", EXT_DIR).trim();
+            ctx.ui.notify(`Extensions: auto-updated to ${latest} (${behind} commit(s)). Run /reload to apply.`, "info");
+          } catch {
+            ctx.ui.notify(`Extensions: ${behind} commit(s) behind remote; auto-update skipped (not fast-forwardable). Run /update-tools to sync.`, "warning");
+          }
         }
       }
     } catch {
