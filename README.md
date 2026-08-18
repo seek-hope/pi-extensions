@@ -5,157 +5,128 @@
 
 Production extension suite for [@earendil-works/pi-coding-agent](https://github.com/badlogic/pi-mono). Every extension wraps an **official upstream tool** — no third-party wrappers.
 
-> **Note:** The following capabilities have graduated from this suite into the
-> [pi-ex](https://github.com/seek-hope/pi-ex) core (built-in, no extension install
-> needed): **subagent** (in-process multi-agent with git worktrees), **ssh**,
-> **computer-use**, **todo flow**, **bg-tasks**, and **/btw**. The files were
-> removed here; use pi-ex to get them. This repo now holds the remaining
-> external-service and code-intelligence extensions.
+> **Note:** `serena` is no longer bundled in this suite. If you use it, install and enable it independently (`uv tool install serena-agent`). The semantic-tooling role it played is now covered by CodeGraph + LSP.
 
-## Quick Deploy
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/seek-hope/pi-extensions/master/scripts/bootstrap.sh | bash
-```
-
-Or manually:
-
-```bash
-git clone https://github.com/seek-hope/pi-extensions ~/.pi/agent/extensions
-pi
-/reload
-```
-
-## Extensions (12 files)
+## Extensions
 
 ### Core Intelligence
 
-| Extension | Official Tool | What It Does |
-|-----------|--------------|--------------|
-| `lsp.ts` | pyright / clangd / rust-analyzer / tsc | Diagnostics, hover, go-to-definition, find references for C/C++/Python/Rust/TypeScript |
-| `serena.ts` | serena-agent (MCP) | Semantic symbol search, rename refactoring, project onboarding, diagnostics |
-| `codegraph.ts` | @colbymchenry/codegraph | Call graphs, impact analysis, symbol search, structure exploration |
-| `graphify.ts` | @sentropic/graphify | Knowledge graph: explain nodes, find shortest paths |
+| Extension | Provides | Prerequisites |
+|-----------|----------|---------------|
+| `codegraph.ts` | Project symbol index + 8 code-intelligence tools (`codegraph_explore`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_status`, `codegraph_sync`) | `npm i -g @cartographer-dev/codegraph` |
+| `docrelay.ts` | Code-doc sync tracking: `docrelay_init`, `docrelay_status`, `docrelay_health`, `docrelay_review`, `docrelay_check`, `docrelay_impact`, `docrelay_sync`, `docrelay_link`, `docrelay_diff` | `uv tool install docrelay` |
+| `lsp.ts` | Real compiler diagnostics & navigation: `lsp_diagnostics`, `lsp_project_diagnostics`, `lsp_hover`, `lsp_definition`, `lsp_references` (pyright, tsgo, rust-analyzer, clangd) | `npm i -g pyright typescript-language-server typescript` |
 
-### External Services
+### Automation & Productivity
 
-| Extension | Official Tool | Auth |
-|-----------|--------------|------|
-| `github.ts` | `gh` CLI (GitHub official) | `gh auth login` |
-| `anysearch.ts` | AnySearch REST API | `ANYSEARCH_API_KEY` |
-| `huggingface.ts` | router.huggingface.co/v1 (OpenAI-compat) | `HF_TOKEN` |
-| `agent-browser.ts` | agent-browser CLI (Vercel Labs) | none |
-| `paddleocr.ts` | PaddleOCR Cloud API (PaddleOCR-VL-1.6) | token embedded |
+| Extension | Provides | Prerequisites |
+|-----------|----------|---------------|
+| `github.ts` | GitHub issue/PR tools via `gh` CLI (`github_issue`, `github_pr`, `github_search`) + reads files from repos | `gh` CLI, authenticated |
+| `anysearch.ts` | Web search (finance/stocks/structured data focus) | None (optional `ANYSEARCH_API_KEY` for higher limits) |
+| `agent-browser.ts` | Browser automation: snapshot, eval, click, fill | `npx agent-browser` |
+| `import-repro.ts` | `/ir` — import a pi session shared as a gist by the issue-analysis CI workflow and switch to it | `gh` CLI |
+| `prompt-url-widget.ts` | Border widget that surfaces GitHub PR / issue / security-advisory URLs detected in the prompt | None |
+| `redraws.ts` | `/tui` — show TUI redraw statistics | None |
+| `tps.ts` | Post-run notification with tokens/sec and token usage (output/input/cache/total) | None |
 
-### Documentation & Project Management
+### Developer Utilities & Providers
 
-| Extension | What It Does |
-|-----------|--------------|
-| `docrelay.ts` | Code-documentation sync: impact analysis, CASCADE updates, stale doc detection |
-| `project-setup.ts` | Auto-enables git/codegraph/docrelay/serena on every session start |
-| `auto-update.ts` | `/update-tools` command: git pull + upgrade all npm/system tools |
-
-### Graduated to pi-ex core
-
-| Former extension | Now built into pi-ex as |
-|------------------|-------------------------|
-| `subagent.ts` | `subagent_*` tools (in-process AgentHarness + git worktrees) |
-| `ssh.ts` | `ssh_exec`/`ssh_status`/`scp_*` tools + `/ssh` command |
-| `computer-use.ts` | `computer_*` tools (Wayland-gated) |
-| `todo.ts` | `todo_write` tool + todo widget + `/todo` command |
-| `bg-tasks.ts` | `bg_spawn`/`bg_status` tools + `/tasks` `/fg` `/kill` `/attach` |
-| `btw.ts` | `/btw` built-in command (in-process, no subprocess) |
+| Extension | Provides | Prerequisites |
+|-----------|----------|---------------|
+| `huggingface.ts` | HF model inference/chat/translation (`huggingface_inference`, `huggingface_chat`, `huggingface_translate`) | `HF_TOKEN` |
+| `graphify.ts` | Knowledge-graph lookups (`graphify_explain`, `graphify_path`) | `GRAPHIFY_API_KEY` |
+| `paddleocr.ts` | OCR for images (`paddle_ocr`) | Local PaddleOCR v5 + ONNX Runtime |
+| `tokenrouter.ts` | Registers the TokenRouter provider (OpenAI-compatible gateway) with its model catalog | `TOKENROUTER_API_KEY` |
+| `project-setup.ts` | `project_setup` — auto-enable git, CodeGraph, DocRelay in the current project | Those tools installed |
+| `auto-update.ts` | Keeps the suite fresh (ff-only pull on session start) | `git` |
 
 ## Architecture
 
 ```
-pi session
-  │
-  ├─ Session Start
-  │   ├─ project-setup.ts → auto-enable git/codegraph/docrelay/serena
-  │   ├─ auto-update.ts   → git fetch, check for extension updates
-  │   └─ AGENTS.md        → "search before answer" rules
-  │
-  ├─ AI Tools
-  │   ├─ Code Intelligence:   codegraph_*, serena_*, lsp_*
-  │   ├─ Browser:             agent_browser_snapshot/eval/click/fill
-  │   ├─ OCR:                 paddle_ocr
-  │   ├─ GitHub:              github_issue/pr/search/read_file
-  │   ├─ HuggingFace:         huggingface_inference/chat/translate
-  │   ├─ DocSync:             docrelay_status/check/impact/sync/link/diff
-  │   └─ Knowledge:           graphify_explain/path
-  │
-  └─ User Commands
-      └─ /update-tools     → upgrade everything
+User Prompt
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  project_setup (auto-enable: git, codegraph,│
+│  docrelay)                                  │
+└─────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  Semantic Layer     │  codegraph_* tools (AST symbol graph)
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  Sync Layer         │  docrelay_* tools (code ↔ docs)
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  Compiler Layer     │  lsp_* tools (ground truth diagnostics)
+└─────────────────────┘
+    │
+    ▼
+Verified Code + Updated Docs
 ```
+
+## Design Philosophy
+
+- **No MCP framework.** External CLIs are wrapped as native extensions instead. MCP adds config files, process management, and tool-prefix indirection; a TypeScript file is simpler and faster.
+- **Official upstream tools only.** Every extension delegates to the vendor's own CLI/API (`gh`, `pyright`, `agent-browser`, codegraph, docrelay).
+- **No hand-rolled analysis.** When the vendor ships a CLI that does it, we call it instead of reimplementing.
+- **Prerequisites are explicit.** Each extension documents exactly what it needs; missing prerequisites degrade gracefully (tool hidden or clear error).
+
+## Installation
+
+The suite lives in the user-level extension directory so it is available in every project:
+
+```bash
+git clone https://github.com/seek-hope/pi-extensions ~/pi-extensions
+ln -s ~/pi-extensions ~/.pi/agent/extensions
+```
+
+`auto-update.ts` keeps it current: on session start it fast-forward pulls the repo (ff-only; local changes are never touched).
 
 ## Prerequisites
 
-| Tool | Install |
-|------|---------|
-| Node.js ≥ 20 | [nodejs.org](https://nodejs.org) |
-| pi | `npm install -g @earendil-works/pi-coding-agent` |
-| gh CLI | `sudo apt install gh && gh auth login` |
-| clangd | `sudo apt install clangd` |
-| rust-analyzer | `rustup component add rust-analyzer` |
-| serena | `uv tool install serena-agent` |
-| agent-browser | `npm install -g agent-browser && agent-browser install` |
-| grim / ydotool / wtype | `sudo pacman -S grim ydotool wtype` (Linux/Wayland, for pi-ex computer use) |
+| Tool | Install | Needed for |
+|------|---------|------------|
+| `gh` | `brew install gh` / `apt install gh` | github, import-repro |
+| `pyright` | `npm i -g pyright` | lsp (Python) |
+| `typescript-language-server` | `npm i -g typescript-language-server typescript` | lsp (TypeScript) |
+| `codegraph` | `npm i -g @cartographer-dev/codegraph` | codegraph |
+| `docrelay` | `uv tool install docrelay` | docrelay |
+| `agent-browser` | `npx agent-browser` | agent-browser |
+| `HF_TOKEN` | https://huggingface.co/settings/tokens | huggingface |
+| `ANYSEARCH_API_KEY` | https://anysearch.ai | anysearch (optional) |
+| `GRAPHIFY_API_KEY` | graphify provider | graphify |
+| `TOKENROUTER_API_KEY` | https://docs.tokenrouter.me/ | tokenrouter |
 
-Global npm tools are auto-installed by `bootstrap.sh`. API keys go in `~/.zshrc`.
-
-## Configuration
-
-### pi settings (`~/.pi/agent/settings.json`)
-
-```json
-{
-  "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-v4-pro",
-  "defaultThinkingLevel": "max",
-  "defaultProjectTrust": "always"
-}
-```
-
-### API Keys (`~/.zshrc`)
-
-```bash
-export ANYSEARCH_API_KEY="as_sk-..."       # https://anysearch.com
-export HF_TOKEN="hf_..."                   # https://huggingface.co/settings/tokens
-export ANTHROPIC_AUTH_TOKEN="sk-..."       # DeepSeek API key
-export ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic'
-export YDOTOOL_SOCKET=/tmp/.ydotool_socket # computer use
-```
-
-### Global Context (`~/.pi/agent/AGENTS.md`)
-
-Loads automatically every session. Contains:
-- Tool reference and workflow guidelines
-
-## Project Layout
+## Project Structure
 
 ```
-~/.pi/agent/extensions/
-  ├── lsp.ts                 C/C++/Python/Rust/TS language servers
-  ├── serena.ts              Semantic code tools (MCP)
-  ├── codegraph.ts           Call graphs & impact analysis
-  ├── graphify.ts            Knowledge graph
-  ├── github.ts              GitHub issues/PRs/search
-  ├── anysearch.ts           Web search
-  ├── huggingface.ts         Model inference via router API
-  ├── agent-browser.ts   Browser automation (agent-browser CLI)
-  ├── paddleocr.ts           OCR via cloud API
-  ├── docrelay.ts            Code-documentation sync
-  ├── project-setup.ts       Auto-enable project infra
-  ├── auto-update.ts         /update-tools command
-  └── scripts/
-      └── bootstrap.sh       One-command deployment
+pi-extensions/
+├── codegraph.ts        # Symbol graph + code intelligence
+├── docrelay.ts         # Code-doc sync tracking
+├── lsp.ts              # Compiler diagnostics & navigation
+├── github.ts           # GitHub operations
+├── anysearch.ts        # Web search
+├── agent-browser.ts    # Browser automation
+├── import-repro.ts     # /ir gist session import
+├── prompt-url-widget.ts# GitHub URL border widget
+├── redraws.ts          # /tui redraw stats
+├── tps.ts              # Post-run TPS/usage notification
+├── huggingface.ts      # HF inference/chat/translation
+├── graphify.ts         # Knowledge graph lookups
+├── paddleocr.ts        # OCR
+├── tokenrouter.ts      # TokenRouter provider
+├── project-setup.ts    # Auto-enable git/codegraph/docrelay
+├── auto-update.ts      # Self-updating on session start
+├── scripts/            # Helper scripts
+└── README.md
 ```
 
-## Philosophy
+## License
 
-- **Official tools only.** Every extension wraps the upstream tool directly.
-- **No MCP framework.** Serena is MCP-native; everything else uses CLI/SDK/API.
-- **Agent decides.** Prompt guidelines suggest patterns but the AI makes the final call.
-- **Batteries included.** Session start auto-enables project infra; sub-agents auto-create git repos.
-- **Search before answer.** AGENTS.md enforces Context7 → AnySearch fallback for technical questions.
+MIT
