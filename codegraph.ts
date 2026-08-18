@@ -55,13 +55,11 @@ export default function (pi: ExtensionAPI) {
     label: "CodeGraph Explore",
     description: "Explore code structure and architecture with CodeGraph",
     parameters: Type.Object({
-      query: Type.Optional(Type.String({ description: "Natural language query about code structure" })),
+      query: Type.String({ description: "Natural language query about code structure" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const args = ["explore"];
-      if (params.query) args.push(params.query);
       try {
-        const out = run(args, ctx.cwd);
+        const out = run(["explore", params.query], ctx.cwd);
         return { content: [{ type: "text", text: out }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: e.stderr || e.message }], details: {}, isError: true };

@@ -13,7 +13,7 @@ Production extension suite for [@earendil-works/pi-coding-agent](https://github.
 
 | Extension | Provides | Prerequisites |
 |-----------|----------|---------------|
-| `codegraph.ts` | Project symbol index + 8 code-intelligence tools (`codegraph_explore`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_status`, `codegraph_sync`) | `npm i -g @cartographer-dev/codegraph` |
+| `codegraph.ts` | Project symbol index + code-intelligence tools (`codegraph_explore`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_status`, `codegraph_sync`) | `codegraph` CLI (see prerequisites) |
 | `docrelay.ts` | Code-doc sync tracking: `docrelay_init`, `docrelay_status`, `docrelay_health`, `docrelay_review`, `docrelay_check`, `docrelay_impact`, `docrelay_sync`, `docrelay_link`, `docrelay_diff` | `uv tool install docrelay` |
 | `lsp.ts` | Real compiler diagnostics & navigation: `lsp_diagnostics`, `lsp_project_diagnostics`, `lsp_hover`, `lsp_definition`, `lsp_references` (pyright, tsgo, rust-analyzer, clangd) | `npm i -g pyright typescript-language-server typescript` |
 
@@ -34,7 +34,7 @@ Production extension suite for [@earendil-works/pi-coding-agent](https://github.
 | Extension | Provides | Prerequisites |
 |-----------|----------|---------------|
 | `huggingface.ts` | HF model inference/chat/translation (`huggingface_inference`, `huggingface_chat`, `huggingface_translate`) | `HF_TOKEN` |
-| `graphify.ts` | Knowledge-graph lookups (`graphify_explain`, `graphify_path`) | `GRAPHIFY_API_KEY` |
+| `graphify.ts` | Knowledge-graph lookups (`graphify_explain`, `graphify_path`) via the local `graphify` CLI | `uv tool install graphifyy` |
 | `paddleocr.ts` | OCR for images (`paddle_ocr`) | Local PaddleOCR v5 + ONNX Runtime |
 | `tokenrouter.ts` | Registers the TokenRouter provider (OpenAI-compatible gateway) with its model catalog | `TOKENROUTER_API_KEY` |
 | `project-setup.ts` | `project_setup` — auto-enable git, CodeGraph, DocRelay in the current project | Those tools installed |
@@ -95,12 +95,12 @@ ln -s ~/pi-extensions ~/.pi/agent/extensions
 | `gh` | `brew install gh` / `apt install gh` | github, import-repro |
 | `pyright` | `npm i -g pyright` | lsp (Python) |
 | `typescript-language-server` | `npm i -g typescript-language-server typescript` | lsp (TypeScript) |
-| `codegraph` | `npm i -g @cartographer-dev/codegraph` | codegraph |
+| `codegraph` | `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh \| sh` (or `npm i -g @colbymchenry/codegraph`) | codegraph |
+| `graphify` | `uv tool install graphifyy` | graphify |
 | `docrelay` | `uv tool install docrelay` | docrelay |
 | `agent-browser` | `npx agent-browser` | agent-browser |
 | `HF_TOKEN` | https://huggingface.co/settings/tokens | huggingface |
 | `ANYSEARCH_API_KEY` | https://anysearch.ai | anysearch (optional) |
-| `GRAPHIFY_API_KEY` | graphify provider | graphify |
 | `TOKENROUTER_API_KEY` | https://docs.tokenrouter.me/ | tokenrouter |
 
 ## Project Structure

@@ -1,12 +1,15 @@
 /**
- * Graphify extension — wraps the official @sentropic/graphify CLI.
+ * Graphify extension — wraps the official graphify CLI (PyPI package: graphifyy).
+ * Official upstream: https://github.com/Graphify-Labs/graphify
+ * Install: uv tool install graphifyy
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
 
-function run(args: string[]): string {
+function run(args: string[], cwd: string): string {
   const result = spawnSync("graphify", args, {
+    cwd,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
     timeout: 120_000,
@@ -34,9 +37,9 @@ export default function (pi: ExtensionAPI) {
     label: "Graphify Explain",
     description: "Explain a node and its connections in the knowledge graph",
     parameters: Type.Object({ node: Type.String({ description: "Node name or file path to explain" }) }),
-    async execute(_id, params, _signal) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const out = run(["explain", params.node]);
+        const out = run(["explain", params.node], ctx.cwd);
         return { content: [{ type: "text", text: out || "(no result)" }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: `graphify explain failed: ${e.message}` }], details: {}, isError: true };
@@ -52,9 +55,9 @@ export default function (pi: ExtensionAPI) {
       from: Type.String({ description: "Start node" }),
       to: Type.String({ description: "End node" }),
     }),
-    async execute(_id, params, _signal) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const out = run(["path", params.from, params.to]);
+        const out = run(["path", params.from, params.to], ctx.cwd);
         return { content: [{ type: "text", text: out || "(no path found)" }], details: {} };
       } catch (e: any) {
         return { content: [{ type: "text", text: `graphify path failed: ${e.message}` }], details: {}, isError: true };
