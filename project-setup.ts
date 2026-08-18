@@ -2,7 +2,7 @@
  * Project Setup extension — ensures essential project infrastructure is in place.
  *
  * On session start, checks and auto-enables:
- *   Git, CodeGraph, DocRelay, Serena
+ *   Git, CodeGraph, DocRelay
  *
  * These form the foundation for automated, intelligent code & documentation management.
  */
@@ -151,7 +151,7 @@ export default function (pi: ExtensionAPI) {
     name: "project_setup",
     label: "Project Setup",
     description:
-      "Check and auto-enable project infrastructure: Git, CodeGraph, DocRelay, Serena. " +
+      "Check and auto-enable project infrastructure: Git, CodeGraph, DocRelay. " +
       "Returns status for each and initializes any that are missing.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
