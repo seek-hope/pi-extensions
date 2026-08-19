@@ -7,7 +7,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { extractChangedIdentifiers, runPostEditScan } from "../src/core/tools/post-edit-scan.ts";
+import { extractChangedIdentifiers, runPostEditScan } from "../codegraph-scan/lib/scan.ts";
 
 describe("extractChangedIdentifiers", () => {
 	it("finds identifiers removed by the edit", () => {

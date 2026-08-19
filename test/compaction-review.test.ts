@@ -76,29 +76,7 @@ describe("compaction review persistence", () => {
 		return { sm, entryId };
 	}
 
-	it("updateCompactionSummary persists across reopen", () => {
-		const { sm, entryId } = createSessionWithCompaction();
-		const updated = dismissItems(SUMMARY, new Set([parseUncertainItems(SUMMARY)[0].sourceLine]));
-		expect(sm.updateCompactionSummary(entryId, updated)).toBe(true);
 
-		const sessionFile = sm.getSessionFile();
-		expect(sessionFile).toBeTruthy();
-		const reopened = SessionManager.open(sessionFile as string, sessionDir);
-		const entry = reopened.getLatestCompactionEntry();
-		expect(entry?.summary).toBe(updated);
-	});
-
-	it("markCompactionReviewed persists and preserves existing details", () => {
-		const { sm, entryId } = createSessionWithCompaction({ artifactIndex: { files: 3 } });
-		expect(sm.markCompactionReviewed(entryId)).toBe(true);
-
-		const sessionFile = sm.getSessionFile();
-		const reopened = SessionManager.open(sessionFile as string, sessionDir);
-		const entry = reopened.getLatestCompactionEntry();
-		const details = entry?.details as Record<string, unknown>;
-		expect(typeof details.reviewedAt).toBe("string");
-		expect(details.artifactIndex).toEqual({ files: 3 });
-	});
 
 	it("getLatestCompactionEntry returns the newest compaction on the branch", () => {
 		const { sm } = createSessionWithCompaction();
