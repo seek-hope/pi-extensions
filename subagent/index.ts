@@ -16,10 +16,10 @@ import { getForkHost } from "@earendil-works/pi-coding-agent";
 import { SubagentManager, type SubagentContext } from "./lib/manager.ts";
 import { createSubagentToolDefinitions } from "./lib/tools.ts";
 
-const managers = new WeakMap<SessionManager, SubagentManager>();
+const managers = new WeakMap<ExtensionContext["sessionManager"], SubagentManager>();
 
-function managerFor(ctx: ExtensionContext): SubagentManager | undefined {
-	const sm = ctx.sessionManager as unknown as SessionManager;
+function managerFor(ctx: ExtensionContext, send: (text: string) => void): SubagentManager | undefined {
+	const sm = ctx.sessionManager;
 	const existing = managers.get(sm);
 	if (existing) return existing;
 	const host = getForkHost(sm);
@@ -27,11 +27,11 @@ function managerFor(ctx: ExtensionContext): SubagentManager | undefined {
 	if (!host.settingsManager.getSubagentsEnabled()) return undefined;
 	const sctx: SubagentContext = {
 		cwd: ctx.cwd,
-		sessionManager: sm,
+		sessionManager: sm as SessionManager,
 		modelRuntime: host.modelRuntime,
 		extCtx: ctx,
 		getModel: () => ctx.model,
-		sendFollowUp: (text) => ctx.sendUserMessage(text, { triggerTurn: true, deliverAs: "followUp" }),
+		sendFollowUp: (text) => send(text),
 	};
 	const manager = new SubagentManager(sctx, {
 		maxDepth: host.settingsManager.getSubagentsMaxDepth(),
@@ -45,8 +45,9 @@ function managerFor(ctx: ExtensionContext): SubagentManager | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
+	const send = (text: string) => pi.sendUserMessage(text, { deliverAs: "followUp" });
 	pi.on("session_start", (_event, ctx) => {
-		const manager = managerFor(ctx);
+		const manager = managerFor(ctx, send);
 		if (!manager) return;
 		for (const definition of createSubagentToolDefinitions(manager)) {
 			pi.registerTool(definition);
@@ -54,14 +55,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		const manager = managers.get(ctx.sessionManager as unknown as SessionManager);
+		const manager = managers.get(ctx.sessionManager);
 		if (manager) void manager.shutdown();
 	});
 
 	pi.registerCommand("subagent", {
 		description: "Show the sub-agent status widget",
 		handler: async (_args, ctx) => {
-			const manager = managerFor(ctx);
+			const manager = managerFor(ctx, send);
 			if (!manager) {
 				if (ctx.hasUI) ctx.ui.notify('Sub-agents are disabled. Enable via "subagents": { "enabled": true }.', "warning");
 				return;

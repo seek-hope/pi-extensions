@@ -56,10 +56,10 @@ function timeoutToMs(input: number | string): number {
 }
 
 /** Per-session notification subscription. */
-const subscribed = new WeakSet<SessionManager>();
+const subscribed = new WeakSet<ExtensionContext["sessionManager"]>();
 
-function ensureSubscription(ctx: ExtensionContext, store: BackgroundTaskStore): void {
-	const sm = ctx.sessionManager as unknown as SessionManager;
+function ensureSubscription(ctx: ExtensionContext, store: BackgroundTaskStore, send: (text: string) => void): void {
+	const sm = ctx.sessionManager;
 	if (subscribed.has(sm)) return;
 	subscribed.add(sm);
 	const sessionId = sm.getSessionId();
@@ -92,7 +92,7 @@ function ensureSubscription(ctx: ExtensionContext, store: BackgroundTaskStore): 
 						"",
 						"Check the outputs and keep going — continue with the next step of the work; only report back to the user once everything is done.",
 					);
-					ctx.sendUserMessage(parts.join("\n"), { triggerTurn: true, deliverAs: "followUp" });
+					send(parts.join("\n"));
 				}, 1000);
 			},
 		},
@@ -113,14 +113,31 @@ async function taskOutput(
 	return { task, output };
 }
 
+
+const bgOutputSchema = Type.Object({
+	task_id: Type.String({ description: "Task ID (from bg_spawn/bg_status)." }),
+	tail_lines: Type.Optional(
+		Type.Integer({
+			description: "How many lines from the end of the log to return (default 50, max 500).",
+			minimum: 1,
+			maximum: 500,
+		}),
+	),
+});
+
+const bgKillSchema = Type.Object({
+	task_id: Type.String({ description: "Task ID to stop (from bg_spawn/bg_status)." }),
+});
+
 export default function (pi: ExtensionAPI) {
+	const send = (text: string) => pi.sendUserMessage(text, { deliverAs: "followUp" });
 	const store = getBackgroundTaskStore();
 
 	// Core bash.ts's sleep→bg conversion reads this via the fork host bridge.
 	setBgSpawner((task, cwd, timeoutMs, sessionId, label) => store.spawn(task, cwd, timeoutMs, sessionId, label));
 
 	pi.on("session_start", (_event, ctx) => {
-		ensureSubscription(ctx, store);
+		ensureSubscription(ctx, store, send);
 		void store.sync();
 	});
 
@@ -150,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 			timeout: TIMEOUT_SCHEMA,
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureSubscription(ctx, store);
+			ensureSubscription(ctx, store, send);
 			let timeoutMs: number | undefined;
 			if (params.timeout != null) {
 				try {
@@ -223,22 +240,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	pi.registerTool<typeof bgOutputSchema, { taskId?: string; status?: string }>({
 		name: "bg_output",
 		label: "Background Task Output",
 		description:
 			"Read the output of a background task (tail of its log file). " +
 			"Use after bg_status shows a task finished or when you want to check progress without reading the raw log path.",
-		parameters: Type.Object({
-			task_id: Type.String({ description: "Task ID (from bg_spawn/bg_status)." }),
-			tail_lines: Type.Optional(
-				Type.Integer({
-					description: "How many lines from the end of the log to return (default 50, max 500).",
-					minimum: 1,
-					maximum: 500,
-				}),
-			),
-		}),
+		parameters: bgOutputSchema,
 		async execute(_toolCallId, { task_id, tail_lines }) {
 			const task = store.get(task_id);
 			if (!task) {
@@ -263,15 +271,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	pi.registerTool<typeof bgKillSchema, { taskId?: string; killed?: boolean }>({
 		name: "bg_kill",
 		label: "Background Task Kill",
 		description:
 			"Stop a background task (kills its tmux session and marks it killed). " +
 			"Use to stop runaway or no-longer-needed tasks.",
-		parameters: Type.Object({
-			task_id: Type.String({ description: "Task ID to stop (from bg_spawn/bg_status)." }),
-		}),
+		parameters: bgKillSchema,
 		async execute(_toolCallId, { task_id }) {
 			const task = store.get(task_id);
 			if (!task) {
@@ -297,7 +303,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("tasks", {
 		description: "List background tasks",
 		handler: async (_args, ctx) => {
-			ensureSubscription(ctx, store);
+			ensureSubscription(ctx, store, send);
 			await store.sync();
 			const tasks = store.list();
 			if (!ctx.hasUI) return;
@@ -320,7 +326,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fg", {
 		description: "Show a background task's current output (/fg <id>)",
 		handler: async (args, ctx) => {
-			ensureSubscription(ctx, store);
+			ensureSubscription(ctx, store, send);
 			const id = args.trim();
 			if (!id) {
 				if (ctx.hasUI) ctx.ui.notify("Usage: /fg <task-id>", "warning");

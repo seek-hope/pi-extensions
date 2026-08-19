@@ -208,7 +208,7 @@ export default function (pi: ExtensionAPI) {
 		s.userTurnCount++;
 		const warning = staleWarning(s);
 		if (warning) {
-			ctx.sendUserMessage(warning, { deliverAs: "steer" });
+			pi.sendUserMessage(warning, { deliverAs: "steer" });
 		}
 	});
 
@@ -224,7 +224,7 @@ export default function (pi: ExtensionAPI) {
 		s.refreshActive = true;
 		s.retriggerCompaction = true;
 		s.lastRefreshedAtTurn = s.lastActivityTurn;
-		ctx.sendUserMessage(TODO_COMPACTION_REMINDER, { triggerTurn: true, deliverAs: "followUp" });
+		pi.sendUserMessage(TODO_COMPACTION_REMINDER, { deliverAs: "followUp" });
 		return { cancel: true };
 	});
 

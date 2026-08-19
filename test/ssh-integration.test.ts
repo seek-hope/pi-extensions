@@ -142,12 +142,8 @@ describe("SshIntegration.onToolCall", () => {
 		const ctx: CoreIntegrationContext = {
 			cwd: dir,
 			sessionManager: SessionManager.inMemory(dir),
-			settingsManager: SettingsManager.create(dir, join(dir, "agent")),
-			modelRuntime: undefined as unknown as CoreIntegrationContext["modelRuntime"],
-			getUI: () => undefined,
-			getModel: () => undefined,
-			getIntegration: () => undefined,
-		};
+					getUI: () => undefined,
+				};
 		return {
 			integration: new SshIntegration(ctx),
 			cleanup: () => rmSync(dir, { recursive: true, force: true }),

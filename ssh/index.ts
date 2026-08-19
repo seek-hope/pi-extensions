@@ -12,17 +12,17 @@ import { TimeoutParamSchema } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { SshIntegration, type SshIntegrationContext, SSH_TOOL_META } from "./lib/integration.ts";
 
-const instances = new WeakMap<SessionManager, SshIntegration>();
+const instances = new WeakMap<ExtensionContext["sessionManager"], SshIntegration>();
 
-function instanceFor(ctx: ExtensionContext): SshIntegration {
-	const sm = ctx.sessionManager as unknown as SessionManager;
+function instanceFor(ctx: ExtensionContext, send: (text: string) => void): SshIntegration {
+	const sm = ctx.sessionManager;
 	let inst = instances.get(sm);
 	if (!inst) {
 		const ictx: SshIntegrationContext = {
 			cwd: ctx.cwd,
 			sessionManager: ctx.sessionManager,
 			getUI: () => (ctx.hasUI ? ctx.ui : undefined),
-			sendFollowUp: (text) => ctx.sendUserMessage(text, { triggerTurn: true, deliverAs: "followUp" }),
+			sendFollowUp: (text) => send(text),
 		};
 		inst = new SshIntegration(ictx);
 		instances.set(sm, inst);
@@ -31,13 +31,14 @@ function instanceFor(ctx: ExtensionContext): SshIntegration {
 }
 
 export default function (pi: ExtensionAPI) {
+	const send = (text: string) => pi.sendUserMessage(text, { deliverAs: "followUp" });
 	pi.on("session_start", (_event, ctx) => {
 		// Construct eagerly so notifications route to this session immediately.
-		instanceFor(ctx);
+		instanceFor(ctx, send);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		instanceFor(ctx).onShutdown();
+		instanceFor(ctx, send).onShutdown();
 	});
 
 	const toolNames = ["ssh_exec", "ssh_status", "scp_to_remote", "scp_from_remote"] as const;
@@ -74,8 +75,8 @@ export default function (pi: ExtensionAPI) {
 			promptSnippet: "promptSnippet" in meta ? meta.promptSnippet : undefined,
 			promptGuidelines: "promptGuidelines" in meta ? [...meta.promptGuidelines] : undefined,
 			parameters: schemas[name],
-			execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-				const def = instanceFor(ctx).getToolDefinitions().find((d) => d.name === name);
+			execute: async (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: never, ctx: ExtensionContext) => {
+				const def = instanceFor(ctx, send).getToolDefinitions().find((d) => d.name === name);
 				if (!def) throw new Error(`ssh tool ${name} unavailable`);
 				return def.execute(toolCallId, params as never, signal, onUpdate, ctx as never);
 			},
@@ -85,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("ssh", {
 		description: "SSH connection manager: /ssh user@host [command] | status | sudo <host> | close <host>",
 		handler: async (args, ctx) => {
-			await instanceFor(ctx).handleCommand(args);
+			await instanceFor(ctx, send).handleCommand(args);
 		},
 	});
 

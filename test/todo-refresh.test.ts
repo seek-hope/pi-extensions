@@ -13,23 +13,23 @@ type Handler = (event: never, ctx: ExtensionContext) => unknown;
 
 function harness() {
 	const handlers = new Map<string, Handler>();
+	const sent: Array<{ text: string; options?: unknown }> = [];
 	const pi = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerTool: () => {},
 		registerCommand: () => {},
+		sendUserMessage: vi.fn((text: string, options?: unknown) => {
+			sent.push({ text, options });
+		}),
 	} as unknown as ExtensionAPI;
 	forkTodo(pi);
 
 	const sessionManager = SessionManagerImpl.inMemory();
-	const sent: Array<{ text: string; options?: unknown }> = [];
 	const compacts: unknown[] = [];
 	const ctx = {
 		hasUI: false,
 		sessionManager: sessionManager as unknown as SessionManager,
 		ui: {},
-		sendUserMessage: vi.fn((text: string, options?: unknown) => {
-			sent.push({ text, options });
-		}),
 		compact: vi.fn((opts: unknown) => compacts.push(opts)),
 	} as unknown as ExtensionContext;
 	return { handlers, ctx, sent, compacts };

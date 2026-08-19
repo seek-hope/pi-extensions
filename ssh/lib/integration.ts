@@ -19,6 +19,7 @@ export interface SshUi {
 	input(title: string, placeholder?: string, opts?: { masked?: boolean }): Promise<string | undefined>;
 	notify(message: string, level: "info" | "warning" | "error"): void;
 	setStatus(key: string, text: string | undefined): void;
+	setWidget(key: string, content: unknown, options?: unknown): void;
 }
 
 /** Per-session context the extension adapter provides. */

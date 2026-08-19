@@ -102,14 +102,16 @@ export interface WaitState {
 	timer: NodeJS.Timeout | undefined;
 	headlessCount: number;
 	ctx: ExtensionContext | undefined;
+	/** Bound at registration: delivers the wake-up (pi.sendUserMessage). */
+	send: ((text: string, deliverAs: "steer" | "followUp") => void) | undefined;
 }
 
-const waitStates = new WeakMap<SessionManager, WaitState>();
+const waitStates = new WeakMap<ExtensionContext["sessionManager"], WaitState>();
 
-export function stateFor(sm: SessionManager): WaitState {
+export function stateFor(sm: ExtensionContext["sessionManager"]): WaitState {
 	let s = waitStates.get(sm);
 	if (!s) {
-		s = { timer: undefined, headlessCount: 0, ctx: undefined };
+		s = { timer: undefined, headlessCount: 0, ctx: undefined, send: undefined };
 		waitStates.set(sm, s);
 	}
 	return s;
@@ -169,6 +171,7 @@ export function scheduleWait(seconds: number, clamp: boolean, ctx: ExtensionCont
 	}
 	cancelWait(state);
 	state.ctx = ctx;
+	state.send = state.send ?? null as never;
 	state.timer = setTimeout(() => {
 		state.timer = undefined;
 		const { text: tasks, stillRunning } = listRunningBgTasks();
@@ -176,10 +179,7 @@ export function scheduleWait(seconds: number, clamp: boolean, ctx: ExtensionCont
 			? "Tasks still running — you can wait again to rest until they finish."
 			: "Check their outputs and continue; start new background tasks as needed.";
 		const deliverAs = ctx.isIdle() ? "followUp" : "steer";
-		ctx.sendUserMessage(`${WAIT_WAKEUP_MESSAGE}\nCurrent background tasks:\n${tasks}\n\n${guidance}`, {
-			triggerTurn: true,
-			deliverAs,
-		});
+		state.send?.(`${WAIT_WAKEUP_MESSAGE}\nCurrent background tasks:\n${tasks}\n\n${guidance}`, deliverAs);
 	}, seconds * 1000);
 	const clampNote = clamped ? ` (capped at ${max}s — the wait limit for this session)` : "";
 	return {

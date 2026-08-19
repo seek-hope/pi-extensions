@@ -24,34 +24,34 @@ export interface TodoState {
 	onStoreChange?: (ctx: ExtensionContext, s: TodoState) => void;
 }
 
-const states = new WeakMap<SessionManager, TodoState>();
+const states = new WeakMap<ExtensionContext["sessionManager"], TodoState>();
 
 export function stateFor(ctx: ExtensionContext): TodoState {
-	const sm = ctx.sessionManager as unknown as SessionManager;
-	let s = states.get(sm);
-	if (!s) {
-		s = {
-			store: undefined as unknown as TodoStore,
-			detailWidgetActive: false,
-			detailPage: 1,
-			userTurnCount: 0,
-			lastActivityTurn: 0,
-			lastStaleWarnTurn: -1,
-			refreshActive: false,
-			retriggerCompaction: false,
-			lastRefreshedAtTurn: -1,
-		};
-		s.store = new TodoStore(sm, {
-			onChange: () => {
-				s.lastActivityTurn = s.userTurnCount;
-				s.onStoreChange?.(ctx, s);
-			},
-			notify: (message, level) => {
-				if (ctx.hasUI) ctx.ui.notify(message, level);
-			},
-		});
-		states.set(sm, s);
-	}
+	const sm = ctx.sessionManager;
+	const existing = states.get(sm);
+	if (existing) return existing;
+	const s: TodoState = {
+		store: undefined as unknown as TodoStore,
+		detailWidgetActive: false,
+		detailPage: 1,
+		userTurnCount: 0,
+		lastActivityTurn: 0,
+		lastStaleWarnTurn: -1,
+		refreshActive: false,
+		retriggerCompaction: false,
+		lastRefreshedAtTurn: -1,
+		onStoreChange: undefined,
+	};
+	s.store = new TodoStore(sm as SessionManager, {
+		onChange: () => {
+			s.lastActivityTurn = s.userTurnCount;
+			s.onStoreChange?.(ctx, s);
+		},
+		notify: (message, level) => {
+			if (ctx.hasUI) ctx.ui.notify(message, level);
+		},
+	});
+	states.set(sm, s);
 	return s;
 }
 

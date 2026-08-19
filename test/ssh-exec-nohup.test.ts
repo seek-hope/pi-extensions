@@ -73,7 +73,7 @@ function runTool(tool: ReturnType<typeof execTool>, id: string, params: Record<s
 		params as never,
 		undefined,
 		undefined,
-		{} as import("../src/core/extensions/types.ts").ExtensionContext,
+		{} as import("@earendil-works/pi-coding-agent").ExtensionContext,
 	);
 }
 

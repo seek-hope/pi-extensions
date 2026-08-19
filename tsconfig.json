@@ -1,0 +1,23 @@
+{
+	"compilerOptions": {
+		"target": "esnext",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"noEmit": true,
+		"strict": true,
+		"skipLibCheck": true,
+		"paths": {
+			"@earendil-works/pi-coding-agent": ["../pi-ex/packages/coding-agent/src/index.ts"],
+			"@earendil-works/pi-agent-core": ["../pi-ex/packages/agent/src/index.ts"],
+			"@earendil-works/pi-agent-core/node": ["../pi-ex/packages/agent/src/node.ts"],
+			"@earendil-works/pi-ai": ["../pi-ex/packages/ai/src/index.ts"],
+			"@earendil-works/pi-ai/compat": ["../pi-ex/packages/ai/src/compat.ts"],
+			"@earendil-works/pi-ai/oauth": ["../pi-ex/packages/ai/src/oauth.ts"],
+			"@earendil-works/pi-ai/providers/all": ["../pi-ex/packages/ai/src/providers/all.ts"],
+			"@earendil-works/pi-tui": ["../pi-ex/packages/tui/src/index.ts"],
+			"typebox": ["../pi-ex/node_modules/typebox"]
+		}
+	},
+	"include": ["context", "todo", "shared", "ask-wait", "bash-gate", "bg-tasks", "ssh", "subagent", "computer-use", "test"]
+}

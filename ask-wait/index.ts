@@ -28,6 +28,7 @@ export default function (pi: ExtensionAPI) {
 		description: WAIT_DESCRIPTION,
 		parameters: waitParameters,
 		execute: async (_toolCallId, { timeout }, _signal, _onUpdate, ctx) => {
+			stateFor(ctx.sessionManager).send = (text, deliverAs) => pi.sendUserMessage(text, { deliverAs });
 			const result = scheduleWait(timeout, false, ctx);
 			if (!result.ok) {
 				return { content: [{ type: "text", text: result.error! }], details: undefined };
