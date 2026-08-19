@@ -112,13 +112,15 @@ pi 里 prune 是**按调用的出站变换**：存档永远全量，只有发给
   **未验证**——若 pruner 是破坏性覆写，需要在剪除前把原文 `session.append` 到自定义
   存档条目（recall 插件读自己的存档），反而比 pi 的实现更干净（存档与上下文彻底分离）。
 
-### 3.2 需要 DSH 核心补丁/上游请求的点
+### 3.2 纯插件覆盖不了的缺口（只能等上游，不动 DSH 源码）
+
+移植约束：**全部功能以插件形式实现，不修改 DSH 源码**。下表是纯插件路径走不通、只能向上游提需求（或接受退化）的项目。注意 DSH 连 agent-loop 本身都是可替换 bundle 插件（cordis.yml 换个实现即可），所以“替换 loop”也算插件手段、不算改源码。
 
 | 缺口 | 影响 | 应对 |
 |------|------|------|
-| masked 密码输入 | ssh sudo 流程 | 退化方案：sudo 密码只经终端内 `read -s` 式手动 prime，不走插件对话框；或给 DSH 提 `userQuestions` masked intent |
+| masked 密码输入 | ssh sudo 流程 | 退化方案：sudo 密码只经终端内 `read -s` 式手动 prime，不走插件对话框；长期等上游给 `userQuestions` 加 masked intent |
 | 最大轮数无内建 | MAX_LOOP_TURNS=50 防死循环 | 插件用 `agent/turn-stopping` 计数取消（官方推荐路径，够用） |
-| 批级并行工具超时 | 20min 批超时 | `timeout-policy` 逐工具 `timeoutMs` 近似（协作式）；批级语义需 patch agent-loop |
+| 批级并行工具超时 | 20min 批超时 | `timeout-policy` 逐工具 `timeoutMs` 近似（协作式）；真要批级语义可以插件形式替换 agent-loop bundle，仍不动源码 |
 | tool 参数不可改写 | 无影响 | bash-gate/file-state 都只需 deny |
 | API 无稳定性保证（developer preview） | 升级维护成本 | 锁版本 + 把对 DSH API 的依赖收敛到一个 adapter 文件 per 插件 |
 
