@@ -1,0 +1,14 @@
+{
+	"name": "pi-extensions",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "file:../pi-ex/packages/agent",
+		"@earendil-works/pi-ai": "file:../pi-ex/packages/ai",
+		"@earendil-works/pi-coding-agent": "file:../pi-ex/packages/coding-agent",
+		"vitest": "^3.0.0"
+	}
+}
