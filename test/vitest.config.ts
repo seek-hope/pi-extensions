@@ -7,8 +7,11 @@ export default defineConfig({
 	resolve: {
 		alias: {
 			"@earendil-works/pi-coding-agent": path.join(piEx, "coding-agent/src/index.ts"),
+			"@earendil-works/pi-agent-core/node": path.join(piEx, "agent/src/node.ts"),
 			"@earendil-works/pi-agent-core": path.join(piEx, "agent/src/index.ts"),
+			"@earendil-works/pi-ai/providers/all": path.join(piEx, "ai/src/providers/all.ts"),
 			"@earendil-works/pi-ai/compat": path.join(piEx, "ai/src/compat.ts"),
+			"@earendil-works/pi-ai/oauth": path.join(piEx, "ai/src/oauth.ts"),
 			"@earendil-works/pi-ai": path.join(piEx, "ai/src/index.ts"),
 		},
 	},

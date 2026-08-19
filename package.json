@@ -10,5 +10,8 @@
 		"@earendil-works/pi-ai": "file:../pi-ex/packages/ai",
 		"@earendil-works/pi-coding-agent": "file:../pi-ex/packages/coding-agent",
 		"vitest": "^3.0.0"
+	},
+	"dependencies": {
+		"typebox": "^1.3.16"
 	}
 }
