@@ -33,6 +33,7 @@ import { DEFAULT_PRUNE_SETTINGS, pruneContextMessages, type PruneSettings } from
 import { createRecallToolDefinitions } from "./lib/recall.ts";
 import { autoReviewSummaryItems } from "./lib/summary-review.ts";
 import { UNCERTAINTY_PROTOCOL_PROMPT, UncertaintyStore } from "./lib/uncertainty.ts";
+import { WORK_LOOP_GUIDANCE } from "./lib/work-loop-guidance.ts";
 
 // ── per-session state ────────────────────────────────────────────────────────
 
@@ -205,9 +206,9 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool(definition);
 	}
 
-	// ── uncertainty protocol prompt (chained per turn) ──
+	// ── uncertainty protocol + work-loop guidance prompts (chained per turn) ──
 	pi.on("before_agent_start", (event) => {
-		return { systemPrompt: event.systemPrompt + "\n\n" + UNCERTAINTY_PROTOCOL_PROMPT };
+		return { systemPrompt: event.systemPrompt + "\n\n" + WORK_LOOP_GUIDANCE + "\n\n" + UNCERTAINTY_PROTOCOL_PROMPT };
 	});
 
 	// ── uncertainty scanning + conflict detection ──
