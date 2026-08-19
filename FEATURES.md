@@ -211,7 +211,7 @@ pi-ex 核心侧唯一的新机制是 `fork-host.ts` bridge（约 60 行）：以
 - `modelRuntime`：getModel/getProviders/streamSimple/getAuth（子代理循环与压缩摘要调用）；
 - `BgSpawner` 注册位（扩展注册、核心调用）。
 
-DSH 移植时：需要一个等价物，或确认 DSH 的插件上下文原生提供这些（见 DSH 能力分析）。
+DSH 移植时：需要一个等价物，或确认 DSH 的插件上下文原生提供这些（见 [DSH-ANALYSIS.md](DSH-ANALYSIS.md) §2.10——结论：原生都有，bridge 可删）。
 
 ---
 
