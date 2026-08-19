@@ -1,7 +1,7 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
-const piEx = path.resolve(__dirname, "../pi-ex/packages");
+const piEx = path.resolve(__dirname, "../../pi-ex/packages");
 
 export default defineConfig({
 	resolve: {
@@ -13,6 +13,6 @@ export default defineConfig({
 		},
 	},
 	test: {
-		include: ["test/**/*.test.ts"],
+		include: [__dirname + "/**/*.test.ts"],
 	},
 });
