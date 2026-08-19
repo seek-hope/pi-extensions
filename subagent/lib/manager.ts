@@ -36,6 +36,8 @@ export interface SubagentContext {
 	readonly modelRuntime: ModelRuntime;
 	/** The live extension context (todo bus, UI). */
 	readonly extCtx: ExtensionContext;
+	/** Settings-driven default model ref ("provider/id"); spawns without a model override use it. */
+	readonly defaultModelRef?: string;
 	getModel(): Model<any> | undefined;
 	sendFollowUp?(text: string): void;
 }
@@ -68,17 +70,18 @@ export class SubagentManager extends CoreSubagentManager {
 	// ========================================================================
 
 	private resolveConcreteModel(modelRef?: string) {
-		if (!modelRef) return this.ctx.getModel();
-		const slash = modelRef.indexOf("/");
+		const ref = modelRef ?? this.ctx.defaultModelRef;
+		if (!ref) return this.ctx.getModel();
+		const slash = ref.indexOf("/");
 		if (slash > 0) {
-			const exact = this.ctx.modelRuntime.getModel(modelRef.slice(0, slash), modelRef.slice(slash + 1));
+			const exact = this.ctx.modelRuntime.getModel(ref.slice(0, slash), ref.slice(slash + 1));
 			if (exact) return exact;
 			// Fall through: some catalog ids contain a slash themselves
 			// (vendor/name) — try the whole string as a bare id.
 		}
 		// Bare id: search every provider
 		for (const provider of this.ctx.modelRuntime.getProviders()) {
-			const model = this.ctx.modelRuntime.getModel(provider.id, modelRef);
+			const model = this.ctx.modelRuntime.getModel(provider.id, ref);
 			if (model) return model;
 		}
 		return undefined;

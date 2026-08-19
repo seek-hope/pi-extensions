@@ -30,6 +30,7 @@ function managerFor(ctx: ExtensionContext, send: (text: string) => void): Subage
 		sessionManager: sm as SessionManager,
 		modelRuntime: host.modelRuntime,
 		extCtx: ctx,
+		defaultModelRef: host.settingsManager.getSubagentsModel(),
 		getModel: () => ctx.model,
 		sendFollowUp: (text) => send(text),
 	};

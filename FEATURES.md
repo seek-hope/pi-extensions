@@ -192,7 +192,7 @@ pi-ex 核心侧唯一的新机制是 `fork-host.ts` bridge（约 60 行）：以
 - **运行**：子代模型循环经宿主 ModelRuntime.streamSimple（bridge 暴露）；模型解析
   `provider/id` 引用；深度/并发/超时由设置控制。
 - **通知**：完成经 followUp 批合；todo 进度项经 shared/todo-state 总线写入。
-- **设置**：`subagents.{enabled,maxDepth=5,maxConcurrent=5,timeout=7200,gitName,gitEmail}`。
+- **设置**：`subagents.{enabled,maxDepth=5,maxConcurrent=5,timeout=7200,gitName,gitEmail,model}`（`model` 为 spawn 无显式覆盖时的默认模型 ref，如 `lulab/Qwen3.8-27B-FP8-DFlash2`；未设置则继承主会话模型）。
 - **源码**：`subagent/lib/core/`（管理器 + worktree，~1700 行，自包含无外部依赖）、
   `manager.ts`、`runner.ts`、`tools.ts`。
 
