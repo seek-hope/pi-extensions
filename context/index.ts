@@ -1,5 +1,5 @@
 /**
- * fork-context (pi-ex): context-window stewardship extension.
+ * context (pi-ex): context-window stewardship extension.
  *
  * Currently provides context pruning (bulky old read-only tool outputs are
  * replaced with metadata-only stubs before each LLM call); the fork

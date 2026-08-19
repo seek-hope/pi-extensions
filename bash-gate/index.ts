@@ -1,5 +1,5 @@
 /**
- * fork-bash-gate (pi-ex): block bash commands that duplicate pi's proper
+ * bash-gate (pi-ex): block bash commands that duplicate pi's proper
  * tools (cat → read, grep -r → grep, etc.), migrated from pi-ex core's
  * bash.ts gate.
  *

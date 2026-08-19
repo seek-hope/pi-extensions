@@ -23,7 +23,7 @@
  * session archive.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { estimateTextTokens } from "./fork-utils.ts";
+import { estimateTextTokens } from "./utils.ts";
 
 export interface PruneSettings {
 	enabled?: boolean; // default: true

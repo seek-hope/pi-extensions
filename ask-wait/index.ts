@@ -1,5 +1,5 @@
 /**
- * fork-ask-wait (pi-ex): the ask_user and wait tools (see lib/ask-wait.ts).
+ * ask-wait (pi-ex): the ask_user and wait tools (see lib/ask-wait.ts).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {

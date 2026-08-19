@@ -1,9 +1,9 @@
 /**
- * Tests for the fork-ask-wait extension's ask_user and wait tools.
+ * Tests for the ask-wait extension's ask_user and wait tools.
  */
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
-import { executeAskUser, scheduleWait, stateFor } from "../fork-ask-wait/lib/ask-wait.ts";
+import { executeAskUser, scheduleWait, stateFor } from "../ask-wait/lib/ask-wait.ts";
 
 function makeCtx(overrides: Partial<ExtensionContext> = {}): ExtensionContext {
 	return {

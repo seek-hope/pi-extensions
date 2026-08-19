@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { archivedEntries, createRecallToolDefinitions } from "../fork-context/lib/recall.ts";
+import { archivedEntries, createRecallToolDefinitions } from "../context/lib/recall.ts";
 
 function makeCtx(sessionManager: SessionManager): ExtensionContext {
 	return { sessionManager } as unknown as ExtensionContext;

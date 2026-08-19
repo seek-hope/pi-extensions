@@ -3,7 +3,7 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
-import { pruneContextMessages } from "../fork-context/lib/prune.ts";
+import { pruneContextMessages } from "../context/lib/prune.ts";
 
 let nextId = 0;
 function toolResult(toolName: string, text: string, isError = false): AgentMessage {

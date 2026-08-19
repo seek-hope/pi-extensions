@@ -2,7 +2,7 @@
  * Tests for bash gate (bash-gate.ts).
  */
 import { describe, expect, it } from "vitest";
-import { checkBashGate, formatGateResponse } from "../fork-bash-gate/lib/bash-gate.ts";
+import { checkBashGate, formatGateResponse } from "../bash-gate/lib/bash-gate.ts";
 
 // ============================================================================
 // Bash Gate tests

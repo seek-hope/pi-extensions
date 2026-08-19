@@ -1,5 +1,5 @@
 /**
- * fork-ask-wait (pi-ex): the ask_user and wait tools, migrated from pi-ex core.
+ * ask-wait (pi-ex): the ask_user and wait tools, migrated from pi-ex core.
  *
  * - ask_user: dialog prompts to the user via the extension UI (headless
  *   sessions get the flagged-assumption fallback).
