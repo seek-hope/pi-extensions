@@ -17,10 +17,18 @@ export default function (pi: ExtensionAPI) {
 		const command = (event.input as { command?: string }).command ?? "";
 		const match = checkBashGate(command);
 		if (!match) return;
-		// Let bg-convertible commands through: core's spawnBg conversion turns
-		// them into background tasks instead of blocking.
+		// Sleep-like commands (leading sleep, polling loops, watch) point at the
+		// task/wait tools instead of blocking with the generic gate response.
 		const classification = classifyBashGateCommand(command, match.rule.name);
-		if (classification.kind === "bg") return;
+		if (classification.kind === "bg") {
+			return {
+				block: true,
+				reason:
+					"[BLOCKED] Long-running or polling command. " +
+					"Run it as a background task with bg_spawn (you get a task ID + log file, and the completion notice wakes you), " +
+					"or use the wait tool to rest the turn until it finishes.",
+			};
+		}
 		return { block: true, reason: formatGateResponse(match) };
 	});
 }
