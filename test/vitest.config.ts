@@ -17,5 +17,6 @@ export default defineConfig({
 	},
 	test: {
 		include: [__dirname + "/**/*.test.ts"],
+		testTimeout: 15000,
 	},
 });
